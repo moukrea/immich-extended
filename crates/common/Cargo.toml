@@ -11,5 +11,20 @@ repository.workspace = true
 name = "common"
 path = "src/lib.rs"
 
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "macros",
+    "migrate",
+    "chrono",
+    "uuid",
+] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
 [lints]
 workspace = true

@@ -1,12 +1,18 @@
 //! Server configuration loaded from environment variables.
 
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use thiserror::Error;
 
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:8080";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_DATA_DIR: &str = "./data";
+const DEFAULT_DB_FILENAME: &str = "immich-extended.sqlite";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -18,6 +24,8 @@ pub enum ConfigError {
     },
     #[error("invalid DATA_DIR {value:?}: empty path")]
     InvalidDataDir { value: String },
+    #[error("invalid DATABASE_URL: empty")]
+    EmptyDatabaseUrl,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +33,7 @@ pub struct Config {
     pub http_bind: SocketAddr,
     pub log_level: String,
     pub data_dir: PathBuf,
+    pub database_url: String,
 }
 
 impl Config {
@@ -50,12 +59,28 @@ impl Config {
         }
         let data_dir = PathBuf::from(&data_dir_raw);
 
+        let database_url = match env::var("DATABASE_URL") {
+            Ok(v) => {
+                if v.is_empty() {
+                    return Err(ConfigError::EmptyDatabaseUrl);
+                }
+                v
+            }
+            Err(_) => default_database_url(&data_dir),
+        };
+
         Ok(Self {
             http_bind,
             log_level,
             data_dir,
+            database_url,
         })
     }
+}
+
+fn default_database_url(data_dir: &Path) -> String {
+    let db_path = data_dir.join(DEFAULT_DB_FILENAME);
+    format!("sqlite://{}?mode=rwc", db_path.display())
 }
 
 #[cfg(test)]
@@ -90,38 +115,69 @@ mod tests {
         }
     }
 
+    const ALL_KEYS: &[&str] = &["HTTP_BIND", "LOG_LEVEL", "DATA_DIR", "DATABASE_URL"];
+
     #[test]
     fn defaults_when_env_unset() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g = EnvGuard::new(&["HTTP_BIND", "LOG_LEVEL", "DATA_DIR"]);
+        let _g = EnvGuard::new(ALL_KEYS);
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.http_bind.to_string(), "0.0.0.0:8080");
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.data_dir, PathBuf::from("./data"));
+        assert_eq!(
+            cfg.database_url,
+            "sqlite://./data/immich-extended.sqlite?mode=rwc"
+        );
     }
 
     #[test]
     fn overrides_from_env() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g = EnvGuard::new(&["HTTP_BIND", "LOG_LEVEL", "DATA_DIR"]);
+        let _g = EnvGuard::new(ALL_KEYS);
         env::set_var("HTTP_BIND", "127.0.0.1:9090");
         env::set_var("LOG_LEVEL", "debug");
         env::set_var("DATA_DIR", "/tmp/iet");
+        env::set_var("DATABASE_URL", "sqlite::memory:");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.http_bind.to_string(), "127.0.0.1:9090");
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.data_dir, PathBuf::from("/tmp/iet"));
+        assert_eq!(cfg.database_url, "sqlite::memory:");
+    }
+
+    #[test]
+    fn database_url_default_follows_data_dir() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        env::set_var("DATA_DIR", "/var/lib/iet");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(
+            cfg.database_url,
+            "sqlite:///var/lib/iet/immich-extended.sqlite?mode=rwc"
+        );
     }
 
     #[test]
     fn rejects_malformed_http_bind() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g = EnvGuard::new(&["HTTP_BIND", "LOG_LEVEL", "DATA_DIR"]);
+        let _g = EnvGuard::new(ALL_KEYS);
         env::set_var("HTTP_BIND", "not-a-socket");
 
         let err = Config::from_env().unwrap_err();
         assert!(matches!(err, ConfigError::InvalidHttpBind { .. }));
+    }
+
+    #[test]
+    fn rejects_empty_database_url() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        env::set_var("DATABASE_URL", "");
+
+        let err = Config::from_env().unwrap_err();
+        assert!(matches!(err, ConfigError::EmptyDatabaseUrl));
     }
 }

@@ -6,12 +6,20 @@ use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
 };
+use common::db;
 use http_body_util::BodyExt;
+use server::AppState;
 use tower::ServiceExt;
+
+async fn test_state() -> AppState {
+    let pool = db::open_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    AppState { db: pool }
+}
 
 #[tokio::test]
 async fn health_returns_ok_with_version() {
-    let app = server::router();
+    let app = server::router(test_state().await);
 
     let response = app
         .oneshot(
@@ -41,11 +49,12 @@ async fn health_returns_ok_with_version() {
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["status"], "ok");
     assert_eq!(body["version"], server::version());
+    assert_eq!(body["db"], "ok");
 }
 
 #[tokio::test]
 async fn unknown_route_returns_404() {
-    let app = server::router();
+    let app = server::router(test_state().await);
 
     let response = app
         .oneshot(

@@ -3,7 +3,8 @@
 use std::io;
 
 use anyhow::{Context, Result};
-use server::config::Config;
+use common::db;
+use server::{config::Config, AppState};
 use tokio::{net::TcpListener, signal};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -18,6 +19,7 @@ async fn main() -> Result<()> {
         version = server::version(),
         http_bind = %cfg.http_bind,
         data_dir = %cfg.data_dir.display(),
+        database_url = %cfg.database_url,
         engine_version = engine::version(),
         immich_client_version = immich_client::version(),
         yolo_version = yolo::version(),
@@ -25,7 +27,20 @@ async fn main() -> Result<()> {
         "immich-extended starting"
     );
 
-    let app = server::router();
+    tokio::fs::create_dir_all(&cfg.data_dir)
+        .await
+        .with_context(|| format!("creating data dir {}", cfg.data_dir.display()))?;
+
+    let pool = db::open_pool(&cfg.database_url)
+        .await
+        .with_context(|| format!("opening sqlite pool at {}", cfg.database_url))?;
+    db::run_migrations(&pool)
+        .await
+        .context("running sqlx migrations")?;
+    info!("migrations applied");
+
+    let state = AppState { db: pool.clone() };
+    let app = server::router(state);
 
     let listener = TcpListener::bind(cfg.http_bind)
         .await
@@ -42,6 +57,7 @@ async fn main() -> Result<()> {
         .context("axum::serve terminated with an error")?;
 
     info!("immich-extended stopped");
+    pool.close().await;
     Ok(())
 }
 

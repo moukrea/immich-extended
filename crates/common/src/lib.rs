@@ -1,5 +1,7 @@
 //! Shared types, utilities, and database access for immich-extended.
 
+pub mod db;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns the crate version at compile time.
