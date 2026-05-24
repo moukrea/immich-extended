@@ -1,0 +1,15 @@
+# Harness operational state (never committed)
+.ralph/
+
+# Build artifacts
+target/
+node_modules/
+dist/
+
+# Local env / DB / logs
+.env
+.env.local
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
