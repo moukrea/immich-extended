@@ -1,6 +1,7 @@
 //! Shared types, utilities, and database access for immich-extended.
 
 pub mod db;
+pub mod users;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
