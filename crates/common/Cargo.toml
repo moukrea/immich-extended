@@ -1,0 +1,15 @@
+[package]
+name = "immich-extended-common"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "common"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

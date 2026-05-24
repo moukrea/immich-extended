@@ -1,0 +1,18 @@
+[package]
+name = "immich-extended-yolo"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "yolo"
+path = "src/lib.rs"
+
+[dependencies]
+common = { package = "immich-extended-common", path = "../common" }
+
+[lints]
+workspace = true

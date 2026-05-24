@@ -1,0 +1,25 @@
+[package]
+name = "immich-extended-server"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "immich-extended"
+path = "src/main.rs"
+
+[lib]
+name = "server"
+path = "src/lib.rs"
+
+[dependencies]
+common = { package = "immich-extended-common", path = "../common" }
+engine = { package = "immich-extended-engine", path = "../engine" }
+immich-client = { package = "immich-extended-immich-client", path = "../immich-client" }
+yolo = { package = "immich-extended-yolo", path = "../yolo" }
+
+[lints]
+workspace = true

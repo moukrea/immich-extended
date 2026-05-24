@@ -1,0 +1,18 @@
+[package]
+name = "immich-extended-immich-client"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "immich_client"
+path = "src/lib.rs"
+
+[dependencies]
+common = { package = "immich-extended-common", path = "../common" }
+
+[lints]
+workspace = true

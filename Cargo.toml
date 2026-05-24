@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/server",
+    "crates/engine",
+    "crates/immich-client",
+    "crates/yolo",
+    "crates/common",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.91"
+version = "0.1.0"
+authors = ["Emeric Commenge"]
+license = "MIT"
+repository = "https://github.com/moukrea/immich-extended"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
