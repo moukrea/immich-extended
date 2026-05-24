@@ -8,13 +8,19 @@ use axum::{
 };
 use common::db;
 use http_body_util::BodyExt;
-use server::AppState;
+use server::{config::SessionConfig, AppState};
 use tower::ServiceExt;
 
 async fn test_state() -> AppState {
     let pool = db::open_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
-    AppState { db: pool }
+    AppState {
+        db: pool,
+        session: SessionConfig {
+            cookie_name: "iext_session_dev".to_string(),
+            cookie_secure: false,
+        },
+    }
 }
 
 #[tokio::test]

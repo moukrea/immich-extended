@@ -111,7 +111,10 @@ async fn run_serve(cfg: Config) -> Result<()> {
         .context("running sqlx migrations")?;
     info!("migrations applied");
 
-    let state = AppState { db: pool.clone() };
+    let state = AppState {
+        db: pool.clone(),
+        session: cfg.session.clone(),
+    };
     let app = server::router(state);
 
     let listener = TcpListener::bind(cfg.http_bind)

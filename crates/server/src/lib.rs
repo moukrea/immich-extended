@@ -1,9 +1,11 @@
 //! HTTP server, configuration, and wiring of the engine + clients into axum routes.
 
 pub mod admin;
+pub mod auth;
 pub mod config;
 
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::State, middleware, routing::get, Json, Router};
+use config::SessionConfig;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tower_http::trace::TraceLayer;
@@ -19,6 +21,7 @@ pub fn version() -> &'static str {
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub db: SqlitePool,
+    pub session: SessionConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,9 +34,22 @@ pub struct HealthResponse {
 /// Build the application router. The router carries `AppState` so handlers can
 /// reach the SQLite pool and (in later milestones) the immich clients, secret
 /// store, etc.
+///
+/// The session middleware is applied globally so every handler can extract
+/// `AuthenticatedUser` without re-wiring per-route. Handlers that don't care
+/// about auth (`/health`) simply don't extract it; handlers that require it
+/// get a 401 short-circuit from the extractor when the request carries no
+/// (valid) session cookie.
 pub fn router(state: AppState) -> Router {
+    let api_v1 = Router::new().nest("/auth", auth::routes::router());
+
     Router::new()
         .route("/health", get(health))
+        .nest("/api/v1", api_v1)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::middleware::auth_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
