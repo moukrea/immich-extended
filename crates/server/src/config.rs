@@ -7,6 +7,7 @@ use std::{
     str::FromStr,
 };
 
+use common::crypto::{MasterKey, MasterKeyError};
 use thiserror::Error;
 
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:8080";
@@ -27,6 +28,8 @@ pub enum ConfigError {
     InvalidDataDir { value: String },
     #[error("invalid DATABASE_URL: empty")]
     EmptyDatabaseUrl,
+    #[error("master key: {0}")]
+    MasterKey(#[from] MasterKeyError),
 }
 
 /// Cookie-session knobs derived from `SESSION_COOKIE_NAME` / `SESSION_COOKIE_SECURE`.
@@ -49,12 +52,16 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub database_url: String,
     pub session: SessionConfig,
+    pub master_key: MasterKey,
 }
 
 impl Config {
     /// Load the configuration from process environment, applying defaults
     /// for any unset variable. Returns an error if a value is present but
     /// fails to parse.
+    ///
+    /// `IMMICH_EXT_MASTER_KEY` is mandatory and has no default — per PRD §6
+    /// the server refuses to boot if it's missing or malformed.
     pub fn from_env() -> Result<Self, ConfigError> {
         let http_bind_raw = env::var("HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.to_string());
         let http_bind = SocketAddr::from_str(&http_bind_raw).map_err(|source| {
@@ -85,6 +92,7 @@ impl Config {
         };
 
         let session = SessionConfig::from_env();
+        let master_key = MasterKey::from_env()?;
 
         Ok(Self {
             http_bind,
@@ -92,6 +100,7 @@ impl Config {
             data_dir,
             database_url,
             session,
+            master_key,
         })
     }
 }
@@ -157,12 +166,22 @@ mod tests {
         "DATABASE_URL",
         "SESSION_COOKIE_NAME",
         "SESSION_COOKIE_SECURE",
+        "IMMICH_EXT_MASTER_KEY",
     ];
+
+    /// 64 hex chars = 32 bytes — the format `MasterKey::from_env` accepts.
+    const TEST_MASTER_KEY: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn with_master_key() {
+        env::set_var("IMMICH_EXT_MASTER_KEY", TEST_MASTER_KEY);
+    }
 
     #[test]
     fn defaults_when_env_unset() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.http_bind.to_string(), "0.0.0.0:8080");
@@ -180,6 +199,7 @@ mod tests {
     fn session_overrides_from_env() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
         env::set_var("SESSION_COOKIE_NAME", "iext_session_dev");
         env::set_var("SESSION_COOKIE_SECURE", "false");
 
@@ -192,6 +212,7 @@ mod tests {
     fn overrides_from_env() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
         env::set_var("HTTP_BIND", "127.0.0.1:9090");
         env::set_var("LOG_LEVEL", "debug");
         env::set_var("DATA_DIR", "/tmp/iet");
@@ -208,6 +229,7 @@ mod tests {
     fn database_url_default_follows_data_dir() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
         env::set_var("DATA_DIR", "/var/lib/iet");
 
         let cfg = Config::from_env().unwrap();
@@ -221,6 +243,7 @@ mod tests {
     fn rejects_malformed_http_bind() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
         env::set_var("HTTP_BIND", "not-a-socket");
 
         let err = Config::from_env().unwrap_err();
@@ -231,9 +254,20 @@ mod tests {
     fn rejects_empty_database_url() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
         env::set_var("DATABASE_URL", "");
 
         let err = Config::from_env().unwrap_err();
         assert!(matches!(err, ConfigError::EmptyDatabaseUrl));
+    }
+
+    #[test]
+    fn rejects_missing_master_key() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        // Deliberately do NOT call with_master_key — the env var is unset.
+
+        let err = Config::from_env().unwrap_err();
+        assert!(matches!(err, ConfigError::MasterKey(_)));
     }
 }

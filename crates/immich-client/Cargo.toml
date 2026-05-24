@@ -14,5 +14,10 @@ path = "src/lib.rs"
 [dependencies]
 common = { package = "immich-extended-common", path = "../common" }
 
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+url = "2"
+
 [lints]
 workspace = true

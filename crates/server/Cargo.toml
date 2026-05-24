@@ -40,6 +40,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net
 tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
@@ -47,6 +48,7 @@ assert_cmd = "2"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
 
 [lints]
 workspace = true

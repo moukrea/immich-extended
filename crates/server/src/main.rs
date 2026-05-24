@@ -114,6 +114,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
     let state = AppState {
         db: pool.clone(),
         session: cfg.session.clone(),
+        master_key: cfg.master_key.clone(),
     };
     let app = server::router(state);
 

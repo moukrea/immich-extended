@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     http::{header, HeaderValue, Method, Request, StatusCode},
 };
+use common::crypto::MasterKey;
 use common::db;
 use http_body_util::BodyExt;
 use server::{admin::create_user, config::SessionConfig, AppState};
@@ -28,6 +29,7 @@ async fn fresh_state() -> (AppState, SqlitePool) {
             cookie_name: COOKIE_NAME.to_string(),
             cookie_secure: false,
         },
+        master_key: MasterKey::from_bytes([0u8; 32]),
     };
     (state, pool)
 }

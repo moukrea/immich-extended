@@ -12,7 +12,9 @@ name = "common"
 path = "src/lib.rs"
 
 [dependencies]
+aes-gcm = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
+hex = "0.4"
 password-hash = { version = "0.5", features = ["alloc"] }
 rand = "0.8"
 sqlx = { version = "0.8", default-features = false, features = [

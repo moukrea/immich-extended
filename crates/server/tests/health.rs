@@ -6,6 +6,7 @@ use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
 };
+use common::crypto::MasterKey;
 use common::db;
 use http_body_util::BodyExt;
 use server::{config::SessionConfig, AppState};
@@ -20,6 +21,7 @@ async fn test_state() -> AppState {
             cookie_name: "iext_session_dev".to_string(),
             cookie_secure: false,
         },
+        master_key: MasterKey::from_bytes([0u8; 32]),
     }
 }
 

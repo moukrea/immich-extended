@@ -1,0 +1,6 @@
+//! `/api/v1/me/*` — per-user settings owned by the caller's session. Today this
+//! is just the Immich API key paste flow; future iterations (rule prefs, OIDC
+//! linking, etc.) will live here too.
+
+pub mod immich_key;
+pub mod routes;

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM immich_api_keys WHERE user_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "a69e3196f48f3c24a868d86b201053fe8b8835d561287a46ec693e7ddc0b9ed6"
+}

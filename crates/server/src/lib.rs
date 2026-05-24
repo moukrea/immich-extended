@@ -3,8 +3,10 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod me;
 
 use axum::{extract::State, middleware, routing::get, Json, Router};
+use common::crypto::MasterKey;
 use config::SessionConfig;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -17,11 +19,13 @@ pub fn version() -> &'static str {
 }
 
 /// Application-wide shared state. Cloned per-handler — `SqlitePool` is `Arc`-backed
-/// internally so cloning is cheap and safe.
+/// internally so cloning is cheap and safe. `MasterKey` is a 32-byte newtype
+/// (clone = cheap byte copy, `Debug` elides the key value).
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub db: SqlitePool,
     pub session: SessionConfig,
+    pub master_key: MasterKey,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,7 +45,9 @@ pub struct HealthResponse {
 /// get a 401 short-circuit from the extractor when the request carries no
 /// (valid) session cookie.
 pub fn router(state: AppState) -> Router {
-    let api_v1 = Router::new().nest("/auth", auth::routes::router());
+    let api_v1 = Router::new()
+        .nest("/auth", auth::routes::router())
+        .nest("/me", me::routes::router());
 
     Router::new()
         .route("/health", get(health))

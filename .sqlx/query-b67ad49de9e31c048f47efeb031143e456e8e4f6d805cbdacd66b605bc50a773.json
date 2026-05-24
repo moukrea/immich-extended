@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO immich_api_keys (user_id, base_url, ciphertext, nonce, immich_user_id, created_at, last_validated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET base_url = excluded.base_url, ciphertext = excluded.ciphertext, nonce = excluded.nonce, immich_user_id = excluded.immich_user_id, last_validated_at = excluded.last_validated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "b67ad49de9e31c048f47efeb031143e456e8e4f6d805cbdacd66b605bc50a773"
+}
