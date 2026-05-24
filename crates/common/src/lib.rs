@@ -1,5 +1,6 @@
 //! Shared types, utilities, and database access for immich-extended.
 
+pub mod auth;
 pub mod db;
 pub mod users;
 

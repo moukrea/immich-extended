@@ -1,5 +1,6 @@
 //! HTTP server, configuration, and wiring of the engine + clients into axum routes.
 
+pub mod admin;
 pub mod config;
 
 use axum::{extract::State, routing::get, Json, Router};

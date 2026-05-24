@@ -237,6 +237,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrations_add_is_admin_to_users() {
+        let pool = fresh_pool().await;
+        let cols = columns(&pool, "users").await;
+        let is_admin = cols
+            .iter()
+            .find(|c| c.name == "is_admin")
+            .expect("is_admin column should exist after 0003 migration");
+        assert_eq!(is_admin.notnull, 1, "'is_admin' should be NOT NULL");
+        assert_eq!(
+            is_admin._dflt.as_deref(),
+            Some("0"),
+            "'is_admin' should default to 0"
+        );
+
+        // existing rows + new rows without explicit value get is_admin = 0
+        sqlx::query("INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)")
+            .bind("u-default")
+            .bind("default@example.com")
+            .bind(Option::<String>::None)
+            .bind(0_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let admin_flag: i64 =
+            sqlx::query_scalar("SELECT is_admin FROM users WHERE id = 'u-default'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(admin_flag, 0, "default is_admin should be 0");
+    }
+
+    #[tokio::test]
     async fn local_credentials_fk_cascades_on_user_delete() {
         let pool = fresh_pool().await;
         sqlx::query("PRAGMA foreign_keys = ON")

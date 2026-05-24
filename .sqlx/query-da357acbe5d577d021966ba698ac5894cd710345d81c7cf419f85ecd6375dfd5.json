@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO local_credentials (user_id, password_hash, created_at) VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "da357acbe5d577d021966ba698ac5894cd710345d81c7cf419f85ecd6375dfd5"
+}
