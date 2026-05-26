@@ -1,0 +1,32 @@
+{
+  "name": "immich-extended-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint . --ext .ts,.tsx",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solidjs/router": "0.14.10",
+    "solid-js": "1.9.3"
+  },
+  "devDependencies": {
+    "@solidjs/testing-library": "0.8.10",
+    "@typescript-eslint/eslint-plugin": "7.18.0",
+    "@typescript-eslint/parser": "7.18.0",
+    "autoprefixer": "10.4.20",
+    "eslint": "8.57.1",
+    "eslint-plugin-solid": "0.14.5",
+    "jsdom": "25.0.1",
+    "postcss": "8.4.49",
+    "tailwindcss": "3.4.15",
+    "typescript": "5.6.3",
+    "vite": "6.0.3",
+    "vite-plugin-solid": "2.11.0",
+    "vitest": "3.2.4"
+  }
+}
