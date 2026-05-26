@@ -13,10 +13,19 @@ path = "src/lib.rs"
 
 [dependencies]
 common = { package = "immich-extended-common", path = "../common" }
+async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[features]
+# Exposes `engine::rule::testing::FakeResourceResolver` to dependent crates'
+# integration tests. Off by default — production builds don't ship the fake.
+test-util = []
 
 [lints]
 workspace = true

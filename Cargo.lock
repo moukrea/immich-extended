@@ -1402,11 +1402,13 @@ dependencies = [
 name = "immich-extended-engine"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "immich-extended-common",
  "serde",
  "serde_yaml",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
