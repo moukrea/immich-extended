@@ -1,0 +1,492 @@
+//! HTTP handlers for `/api/v1/rules/*`.
+//!
+//! All handlers require an authenticated session and scope every read/write
+//! to `owner_user_id = $auth_uid`. PATCH and DELETE on a foreign rule id
+//! return **404**, not 403, so the API does not leak the existence of other
+//! users' rules. DELETE is idempotent: a no-op delete returns 204 whether
+//! the row was absent, owned by someone else (left intact), or actually
+//! deleted.
+//!
+//! ### Error envelope
+//!
+//! All non-2xx responses share the shape `{"error": "<slug>", "detail": "..."}`
+//! (the `detail` is omitted for the bare 404). Slugs are stable contract
+//! surface — the SolidJS frontend maps them to user-facing strings.
+//!
+//! ### Validation status mapping
+//!
+//! - `ParseError` (malformed YAML)               → 400 `invalid_yaml`.
+//! - `ValidationError::*` (semantic failures)    → 400 with the variant's
+//!   slug (`empty_match`, `foreign_person_id`, …).
+//! - `ValidationError::Resolver(_)` (transport)  → 502 `resolver_error`. The
+//!   v0 `NullResourceResolver` never returns these, but the live
+//!   `ImmichResourceResolver` (M2-T5) will, and a 502 carries the right
+//!   "try again later" semantics.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
+use engine::rule::{
+    parse_rule, validate_rule, ParseError, RuleStatus, TargetAlbum, ValidationError,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::{
+    auth::{extractor::AuthenticatedUser, UserId},
+    AppState,
+};
+
+type ErrorResponse = (StatusCode, Json<serde_json::Value>);
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRuleRequest {
+    pub yaml_source: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRuleRequest {
+    #[serde(default)]
+    pub yaml_source: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuleSummary {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub target_album_strategy: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuleDetail {
+    pub id: String,
+    pub name: String,
+    pub yaml_source: String,
+    pub status: String,
+    pub target_album_strategy: String,
+    pub target_album_id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListRulesResponse {
+    pub rules: Vec<RuleSummary>,
+}
+
+/// `POST /api/v1/rules` — parse, validate, insert.
+///
+/// `yaml_source.id` is optional; when absent we mint a UUIDv4 (always a valid
+/// slug under the validator's `^[a-z0-9][a-z0-9-]{0,63}$` rule). Duplicate ids
+/// map to 409 `id_conflict` so the user can pick a different slug rather than
+/// quietly overwriting an existing rule.
+pub(super) async fn create_rule(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Json(req): Json<CreateRuleRequest>,
+) -> Result<(StatusCode, Json<RuleSummary>), ErrorResponse> {
+    let mut rule = parse_rule(&req.yaml_source).map_err(parse_error_response)?;
+
+    // Generate an id if the YAML didn't carry one. We do this BEFORE validation
+    // so that any validator id-shape check covers both author-supplied and
+    // server-generated ids uniformly.
+    if rule.id.is_none() {
+        rule.id = Some(uuid::Uuid::new_v4().to_string());
+    }
+
+    validate_rule(&rule, &uid, state.resolver.as_ref())
+        .await
+        .map_err(validation_error_response)?;
+
+    let id = match rule.id.as_deref() {
+        Some(id) => id.to_string(),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    let parsed_predicates = serde_json::to_string(&rule.match_).map_err(|err| {
+        tracing::error!(error = %err, "failed to serialize parsed_predicates");
+        internal_error()
+    })?;
+    let target_album_strategy = rule.target_album.kind().as_str();
+    let target_album_id_str = match &rule.target_album {
+        TargetAlbum::Existing { album_id } => album_id.clone(),
+        TargetAlbum::Managed { .. } => String::new(),
+    };
+    let status_db = rule.status.as_str();
+    let now = now_unix_seconds();
+
+    sqlx::query!(
+        "INSERT INTO rules \
+            (id, owner_user_id, name, yaml_source, parsed_predicates, \
+             target_album_id, target_album_strategy, status, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        id,
+        uid,
+        rule.name,
+        req.yaml_source,
+        parsed_predicates,
+        target_album_id_str,
+        target_album_strategy,
+        status_db,
+        now,
+        now,
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|err| {
+        if is_unique_violation(&err) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "id_conflict",
+                    "detail": format!("a rule with id {id:?} already exists"),
+                })),
+            );
+        }
+        tracing::warn!(error = %err, "failed to insert rule row");
+        internal_error()
+    })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RuleSummary {
+            id,
+            name: rule.name,
+            status: status_db.to_string(),
+            target_album_strategy: target_album_strategy.to_string(),
+            updated_at: now,
+        }),
+    ))
+}
+
+/// `GET /api/v1/rules` — list the caller's rules, newest-updated first.
+pub(super) async fn list_rules(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+) -> Result<Json<ListRulesResponse>, ErrorResponse> {
+    let rows = sqlx::query!(
+        "SELECT id, name, status, target_album_strategy, updated_at \
+         FROM rules WHERE owner_user_id = ? \
+         ORDER BY updated_at DESC, id ASC",
+        uid,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to list rules");
+        internal_error()
+    })?;
+
+    let rules = rows
+        .into_iter()
+        .map(|row| RuleSummary {
+            id: row.id,
+            name: row.name,
+            status: row.status,
+            target_album_strategy: row.target_album_strategy,
+            updated_at: row.updated_at,
+        })
+        .collect();
+
+    Ok(Json(ListRulesResponse { rules }))
+}
+
+/// `GET /api/v1/rules/:id` — full detail or 404.
+pub(super) async fn get_rule(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Path(id): Path<String>,
+) -> Result<Json<RuleDetail>, ErrorResponse> {
+    let row = sqlx::query!(
+        "SELECT id, name, yaml_source, status, target_album_strategy, \
+                target_album_id, created_at, updated_at \
+         FROM rules WHERE id = ? AND owner_user_id = ?",
+        id,
+        uid,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to read rule row");
+        internal_error()
+    })?;
+
+    let row = row.ok_or_else(not_found)?;
+
+    Ok(Json(RuleDetail {
+        id: row.id,
+        name: row.name,
+        yaml_source: row.yaml_source,
+        status: row.status,
+        target_album_strategy: row.target_album_strategy,
+        target_album_id: row.target_album_id,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }))
+}
+
+/// `PATCH /api/v1/rules/:id` — update yaml_source and/or status.
+///
+/// Body accepts either or both of `yaml_source` and `status`. When
+/// `yaml_source` is present we re-parse + re-validate the whole rule (and
+/// reject a YAML id that disagrees with the path id, since the path is the
+/// authoritative key); a body carrying only `status` toggles the lifecycle
+/// without touching the predicates. 404 on a foreign or missing id — we
+/// don't differentiate so the API can't leak the existence of other users'
+/// rules.
+pub(super) async fn update_rule(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateRuleRequest>,
+) -> Result<Json<RuleSummary>, ErrorResponse> {
+    if req.yaml_source.is_none() && req.status.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "empty_patch",
+                "detail": "request must include yaml_source or status",
+            })),
+        ));
+    }
+
+    // Establish that the row exists and belongs to the caller. The actual
+    // UPDATE below also filters by owner, but we need the existence check
+    // separately to distinguish 404 (no such rule for this caller) from
+    // 200 (UPDATE matched 1 row).
+    let existing = sqlx::query!(
+        "SELECT id FROM rules WHERE id = ? AND owner_user_id = ?",
+        id,
+        uid,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to read rule for patch");
+        internal_error()
+    })?;
+    if existing.is_none() {
+        return Err(not_found());
+    }
+
+    let now = now_unix_seconds();
+
+    if let Some(yaml_source) = req.yaml_source.clone() {
+        let mut rule = parse_rule(&yaml_source).map_err(parse_error_response)?;
+
+        // The path id is authoritative. If the YAML carries a different id
+        // the request is malformed — reject with a stable slug.
+        match rule.id.as_deref() {
+            Some(yaml_id) if yaml_id != id => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "id_mismatch",
+                        "detail": format!(
+                            "path id {id:?} does not match yaml id {yaml_id:?}",
+                        ),
+                    })),
+                ));
+            }
+            None => rule.id = Some(id.clone()),
+            _ => {}
+        }
+
+        validate_rule(&rule, &uid, state.resolver.as_ref())
+            .await
+            .map_err(validation_error_response)?;
+
+        // A status field in the body wins over whatever the YAML says — the
+        // body is the explicit lifecycle signal.
+        if let Some(status_str) = req.status.as_deref() {
+            rule.status = parse_status_str(status_str).ok_or_else(|| invalid_status(status_str))?;
+        }
+
+        let parsed_predicates = serde_json::to_string(&rule.match_).map_err(|err| {
+            tracing::error!(error = %err, "failed to serialize parsed_predicates");
+            internal_error()
+        })?;
+        let target_album_strategy = rule.target_album.kind().as_str();
+        let target_album_id_str = match &rule.target_album {
+            TargetAlbum::Existing { album_id } => album_id.clone(),
+            TargetAlbum::Managed { .. } => String::new(),
+        };
+        let status_db = rule.status.as_str();
+
+        sqlx::query!(
+            "UPDATE rules SET \
+                name = ?, yaml_source = ?, parsed_predicates = ?, \
+                target_album_id = ?, target_album_strategy = ?, \
+                status = ?, updated_at = ? \
+             WHERE id = ? AND owner_user_id = ?",
+            rule.name,
+            yaml_source,
+            parsed_predicates,
+            target_album_id_str,
+            target_album_strategy,
+            status_db,
+            now,
+            id,
+            uid,
+        )
+        .execute(&state.db)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "failed to update rule");
+            internal_error()
+        })?;
+
+        return Ok(Json(RuleSummary {
+            id,
+            name: rule.name,
+            status: status_db.to_string(),
+            target_album_strategy: target_album_strategy.to_string(),
+            updated_at: now,
+        }));
+    }
+
+    // Status-only update path. `req.status` is `Some` here — the
+    // none-both early-return at the top of the function rules out
+    // both being absent.
+    let status_str = req.status.as_deref().unwrap_or("");
+    let new_status = parse_status_str(status_str).ok_or_else(|| invalid_status(status_str))?;
+    let status_db = new_status.as_str();
+
+    sqlx::query!(
+        "UPDATE rules SET status = ?, updated_at = ? \
+         WHERE id = ? AND owner_user_id = ?",
+        status_db,
+        now,
+        id,
+        uid,
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to update rule status");
+        internal_error()
+    })?;
+
+    let row = sqlx::query!(
+        "SELECT name, target_album_strategy FROM rules \
+         WHERE id = ? AND owner_user_id = ?",
+        id,
+        uid,
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to re-read rule after status patch");
+        internal_error()
+    })?;
+
+    Ok(Json(RuleSummary {
+        id,
+        name: row.name,
+        status: status_db.to_string(),
+        target_album_strategy: row.target_album_strategy,
+        updated_at: now,
+    }))
+}
+
+/// `DELETE /api/v1/rules/:id` — idempotent.
+///
+/// Returns 204 in three cases: row was deleted, row never existed, or row
+/// existed but belongs to a different user (the owner-scoped WHERE clause
+/// leaves it untouched). We deliberately don't distinguish so that another
+/// user's rule's existence isn't observable from outside.
+pub(super) async fn delete_rule(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ErrorResponse> {
+    sqlx::query!(
+        "DELETE FROM rules WHERE id = ? AND owner_user_id = ?",
+        id,
+        uid,
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to delete rule");
+        internal_error()
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_error_response(err: ParseError) -> ErrorResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "invalid_yaml", "detail": err.to_string()})),
+    )
+}
+
+fn validation_error_response(err: ValidationError) -> ErrorResponse {
+    let detail = err.to_string();
+    let slug = err.slug();
+    let status = match err {
+        // Resolver transport failures are upstream issues: surface them with
+        // a 502 so clients can treat them as retryable. Semantic 4xx faults
+        // are the user's request fault — they need to fix the rule.
+        ValidationError::Resolver(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (status, Json(json!({"error": slug, "detail": detail})))
+}
+
+fn parse_status_str(s: &str) -> Option<RuleStatus> {
+    match s {
+        "active" => Some(RuleStatus::Active),
+        "paused" => Some(RuleStatus::Paused),
+        "archived" => Some(RuleStatus::Archived),
+        _ => None,
+    }
+}
+
+fn invalid_status(s: &str) -> ErrorResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "invalid_status",
+            "detail": format!("status must be active|paused|archived, got {s:?}"),
+        })),
+    )
+}
+
+fn not_found() -> ErrorResponse {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
+}
+
+fn internal_error() -> ErrorResponse {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "internal_error"})),
+    )
+}
+
+fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// SQLite returns a generic constraint error for both NOT NULL and UNIQUE
+/// violations. We narrow with a substring match on the message — sqlx
+/// surfaces `"UNIQUE constraint failed: rules.id"` for an id collision.
+/// (`code` returns the broader SQLITE_CONSTRAINT family code; not specific
+/// enough on its own to distinguish unique from NOT NULL.)
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = err {
+        let msg = db_err.message();
+        return msg.contains("UNIQUE constraint failed");
+    }
+    false
+}

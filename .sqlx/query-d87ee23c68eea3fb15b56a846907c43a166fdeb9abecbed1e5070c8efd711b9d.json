@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM rules WHERE id = ? AND owner_user_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "d87ee23c68eea3fb15b56a846907c43a166fdeb9abecbed1e5070c8efd711b9d"
+}

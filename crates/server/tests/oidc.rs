@@ -218,6 +218,7 @@ async fn fresh_state_with_oidc(issuer: &str) -> (AppState, SqlitePool) {
         },
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: Arc::new(Some(client)),
+        resolver: Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
     };
     (state, pool)
 }

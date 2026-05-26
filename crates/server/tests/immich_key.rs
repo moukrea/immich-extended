@@ -42,6 +42,7 @@ async fn fresh_state() -> (AppState, SqlitePool) {
         },
         master_key: MasterKey::from_bytes(TEST_KEY_BYTES),
         oidc: std::sync::Arc::new(None),
+        resolver: std::sync::Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
     };
     (state, pool)
 }

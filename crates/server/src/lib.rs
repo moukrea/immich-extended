@@ -4,6 +4,7 @@ pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod me;
+pub mod rules;
 pub mod setup;
 
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use axum::response::IntoResponse;
 use axum::{extract::State, middleware, routing::get, Json, Router};
 use common::crypto::MasterKey;
 use config::SessionConfig;
+use engine::rule::RuleResourceResolver;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
@@ -31,12 +33,28 @@ pub fn version() -> &'static str {
 /// (clone = cheap byte copy, `Debug` elides the key value). `oidc` is
 /// `Arc<Option<OidcClient>>` so the disabled case is a single cheap clone of
 /// an Arc-wrapped `None`, and the OIDC router can be mounted unconditionally.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
     pub session: SessionConfig,
     pub master_key: MasterKey,
     pub oidc: Arc<Option<OidcClient>>,
+    /// Source of truth for owner-scoped Immich resources used by the rule
+    /// validator. Production wires this to an Immich-backed implementation
+    /// (M2-T5); tests inject `engine::rule::testing::FakeResourceResolver`.
+    pub resolver: Arc<dyn RuleResourceResolver>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("db", &self.db)
+            .field("session", &self.session)
+            .field("master_key", &self.master_key)
+            .field("oidc", &self.oidc)
+            .field("resolver", &"Arc<dyn RuleResourceResolver>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +88,7 @@ pub fn router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
     let api_v1 = Router::new()
         .nest("/auth", auth_routes)
         .nest("/me", me::routes::router())
+        .nest("/rules", rules::routes::router())
         .nest("/setup", setup::routes::router())
         // Explicit JSON 404 for unmatched `/api/v1/*` paths. Without this,
         // axum's `nest` bubbles unmatched sub-routes to the parent router's

@@ -9,9 +9,13 @@ use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use common::db;
+use engine::rule::{ResolverError, RuleResourceResolver};
 use server::{
     admin::{create_user, CreateUserError},
     auth::oidc::OidcClient,
@@ -21,6 +25,35 @@ use server::{
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// Fail-closed placeholder resolver used until M2-T5 wires in the real
+/// Immich-backed implementation. Reports no known persons and no writable
+/// albums, so any rule referencing a `person_id` or an `existing` album
+/// target will be rejected at validation time. This is correct behavior:
+/// without an Immich-backed resolver we cannot confirm those references,
+/// and a 400 is preferable to a 502 mid-evaluation in M3.
+//
+// TODO M2-T5: replace with `ImmichResourceResolver { db, master_key }`.
+#[derive(Debug, Default)]
+struct NullResourceResolver;
+
+#[async_trait]
+impl RuleResourceResolver for NullResourceResolver {
+    async fn known_person_ids(
+        &self,
+        _owner_user_id: &str,
+    ) -> Result<HashSet<String>, ResolverError> {
+        Ok(HashSet::new())
+    }
+
+    async fn is_album_writable(
+        &self,
+        _owner_user_id: &str,
+        _album_id: &str,
+    ) -> Result<bool, ResolverError> {
+        Ok(false)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -137,6 +170,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
         session: cfg.session.clone(),
         master_key: cfg.master_key.clone(),
         oidc: Arc::new(oidc_client),
+        resolver: Arc::new(NullResourceResolver),
     };
     let app = server::router(state, cfg.web_dist_dir.clone());
 

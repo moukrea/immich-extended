@@ -38,6 +38,7 @@ async fn test_state() -> AppState {
         },
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: std::sync::Arc::new(None),
+        resolver: std::sync::Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
     }
 }
 
