@@ -109,7 +109,7 @@ async fn login_fresh_user(
     create_user(pool, email, password, None, false)
         .await
         .unwrap();
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(post(
             "/api/v1/auth/login",
             serde_json::json!({"email": email, "password": password}),
@@ -146,7 +146,7 @@ async fn mock_immich(expected_key: &str, immich_user_id: &str, email: &str) -> M
 #[tokio::test]
 async fn upsert_without_cookie_returns_401() {
     let (state, _pool) = fresh_state().await;
-    let resp = server::router(state)
+    let resp = server::router(state, None)
         .oneshot(post(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": "https://example.invalid", "api_key": "x"}),
@@ -164,7 +164,7 @@ async fn upsert_with_valid_key_stores_encrypted_row() {
     let key = "valid-immich-key-abcdef";
     let mock = mock_immich(key, "immich-user-1", "alice@immich").await;
 
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": mock.uri(), "api_key": key}),
@@ -213,7 +213,7 @@ async fn upsert_with_rejected_key_returns_400_and_stores_nothing() {
     let real_key = "the-only-key-mock-accepts";
     let mock = mock_immich(real_key, "immich-user-2", "bob@immich").await;
 
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": mock.uri(), "api_key": "wrong-key"}),
@@ -239,7 +239,7 @@ async fn upsert_with_unreachable_base_url_returns_502() {
 
     // Loopback on a port we explicitly do not bind — reqwest will fail to
     // connect, which validates the Transport-error branch of the handler.
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({
@@ -260,7 +260,7 @@ async fn upsert_with_malformed_base_url_returns_400() {
     let (state, pool) = fresh_state().await;
     let cookie = login_fresh_user(&state, &pool, "dave@example.com", "pw").await;
 
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": "not a url", "api_key": "x"}),
@@ -278,7 +278,7 @@ async fn get_returns_404_before_any_paste_then_200_after() {
     let (state, pool) = fresh_state().await;
     let cookie = login_fresh_user(&state, &pool, "erin@example.com", "pw").await;
 
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(get_with_cookie("/api/v1/me/immich-key", &cookie))
         .await
         .unwrap();
@@ -286,7 +286,7 @@ async fn get_returns_404_before_any_paste_then_200_after() {
 
     let key = "erins-key";
     let mock = mock_immich(key, "immich-erin", "erin@immich").await;
-    let post_resp = server::router(state.clone())
+    let post_resp = server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": mock.uri(), "api_key": key}),
@@ -296,7 +296,7 @@ async fn get_returns_404_before_any_paste_then_200_after() {
         .unwrap();
     assert_eq!(post_resp.status(), StatusCode::OK);
 
-    let get_resp = server::router(state)
+    let get_resp = server::router(state, None)
         .oneshot(get_with_cookie("/api/v1/me/immich-key", &cookie))
         .await
         .unwrap();
@@ -318,7 +318,7 @@ async fn delete_wipes_row_and_is_idempotent() {
 
     let key = "franks-key";
     let mock = mock_immich(key, "immich-frank", "frank@immich").await;
-    server::router(state.clone())
+    server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": mock.uri(), "api_key": key}),
@@ -327,7 +327,7 @@ async fn delete_wipes_row_and_is_idempotent() {
         .await
         .unwrap();
 
-    let del = server::router(state.clone())
+    let del = server::router(state.clone(), None)
         .oneshot(delete_with_cookie("/api/v1/me/immich-key", &cookie))
         .await
         .unwrap();
@@ -340,7 +340,7 @@ async fn delete_wipes_row_and_is_idempotent() {
     assert_eq!(n, 0);
 
     // Second DELETE — still 204, no error (idempotent).
-    let del2 = server::router(state)
+    let del2 = server::router(state, None)
         .oneshot(delete_with_cookie("/api/v1/me/immich-key", &cookie))
         .await
         .unwrap();
@@ -354,7 +354,7 @@ async fn upsert_then_re_upsert_replaces_in_place() {
 
     let key1 = "key-version-1";
     let mock1 = mock_immich(key1, "immich-gina-a", "gina@immich").await;
-    server::router(state.clone())
+    server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": mock1.uri(), "api_key": key1}),
@@ -365,7 +365,7 @@ async fn upsert_then_re_upsert_replaces_in_place() {
 
     let key2 = "key-version-2";
     let mock2 = mock_immich(key2, "immich-gina-b", "gina@immich").await;
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/me/immich-key",
             serde_json::json!({"base_url": mock2.uri(), "api_key": key2}),

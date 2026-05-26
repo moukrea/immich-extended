@@ -238,7 +238,7 @@ fn callback_uri(state: &str, code: &str) -> String {
 }
 
 async fn call_login(app_state: &AppState) -> axum::response::Response {
-    server::router(app_state.clone())
+    server::router(app_state.clone(), None)
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -251,7 +251,7 @@ async fn call_login(app_state: &AppState) -> axum::response::Response {
 }
 
 async fn call_callback(app_state: &AppState, state: &str, code: &str) -> axum::response::Response {
-    server::router(app_state.clone())
+    server::router(app_state.clone(), None)
         .oneshot(
             Request::builder()
                 .method(Method::GET)

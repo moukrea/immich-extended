@@ -4,7 +4,8 @@
 # Stage 1: cargo-chef base image used by planner and builder.
 # Stage 2: planner extracts a dependency-only recipe.
 # Stage 3: builder cooks the deps from the recipe, then compiles the binary.
-# Stage 4: minimal Debian runtime image with the binary + migrations.
+# Stage 4: frontend bundles the SolidJS app via Vite (node:22-alpine).
+# Stage 5: minimal Debian runtime image with the binary + migrations + dist.
 
 FROM rust:1.91-slim AS chef
 WORKDIR /app
@@ -16,12 +17,21 @@ COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
+ENV SQLX_OFFLINE=true
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
+COPY .sqlx ./.sqlx
 RUN cargo build --release -p immich-extended-server --bin immich-extended
+
+FROM node:22-alpine AS frontend
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -30,8 +40,10 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /app/target/release/immich-extended /usr/local/bin/immich-extended
 COPY migrations/ /app/migrations/
+COPY --from=frontend /web/dist /app/web/dist
 ENV DATA_DIR=/data \
-    HTTP_BIND=0.0.0.0:8080
+    HTTP_BIND=0.0.0.0:8080 \
+    WEB_DIST_DIR=/app/web/dist
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8080/health || exit 1

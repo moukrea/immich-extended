@@ -109,7 +109,7 @@ async fn mock_immich(expected_key: &str, immich_user_id: &str, email: &str) -> M
 #[tokio::test]
 async fn state_reports_needs_setup_on_empty_db() {
     let (state, _pool) = fresh_state().await;
-    let resp = server::router(state)
+    let resp = server::router(state, None)
         .oneshot(get("/api/v1/setup/state"))
         .await
         .unwrap();
@@ -123,7 +123,7 @@ async fn state_reports_needs_setup_on_empty_db() {
 async fn initial_creates_admin_and_session_local_only() {
     let (state, pool) = fresh_state().await;
 
-    let resp = server::router(state.clone())
+    let resp = server::router(state.clone(), None)
         .oneshot(post(
             "/api/v1/setup/initial",
             serde_json::json!({
@@ -188,7 +188,7 @@ async fn initial_creates_admin_and_session_local_only() {
     assert_eq!(s, 1);
 
     // /state now reports setup done.
-    let state_resp = server::router(state)
+    let state_resp = server::router(state, None)
         .oneshot(get("/api/v1/setup/state"))
         .await
         .unwrap();
@@ -203,7 +203,7 @@ async fn initial_with_valid_immich_stores_encrypted_key() {
     let api_key = "valid-key-12345";
     let mock = mock_immich(api_key, "immich-uid-1", "admin@immich").await;
 
-    let resp = server::router(state)
+    let resp = server::router(state, None)
         .oneshot(post(
             "/api/v1/setup/initial",
             serde_json::json!({
@@ -256,7 +256,7 @@ async fn initial_with_invalid_immich_rolls_back_user() {
     let real_key = "the-only-key-the-mock-accepts";
     let mock = mock_immich(real_key, "immich-uid-2", "admin@immich").await;
 
-    let resp = server::router(state)
+    let resp = server::router(state, None)
         .oneshot(post(
             "/api/v1/setup/initial",
             serde_json::json!({
@@ -307,7 +307,7 @@ async fn initial_after_setup_returns_409() {
         .await
         .unwrap();
 
-    let resp = server::router(state)
+    let resp = server::router(state, None)
         .oneshot(post(
             "/api/v1/setup/initial",
             serde_json::json!({

@@ -72,6 +72,12 @@ pub struct Config {
     pub session: SessionConfig,
     pub master_key: MasterKey,
     pub oidc: Option<OidcConfig>,
+    /// Optional path to a pre-built SolidJS bundle. When `Some` AND the path
+    /// exists at startup, the server mounts it as a SPA-friendly static fallback
+    /// at `/`. When `None` (the env var is unset or empty), the server runs in
+    /// API-only mode — useful for tests and for running the Vite dev server
+    /// separately during frontend development.
+    pub web_dist_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -113,6 +119,10 @@ impl Config {
         let session = SessionConfig::from_env();
         let master_key = MasterKey::from_env()?;
         let oidc = OidcConfig::from_env()?;
+        let web_dist_dir = env::var("WEB_DIST_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         Ok(Self {
             http_bind,
@@ -122,6 +132,7 @@ impl Config {
             session,
             master_key,
             oidc,
+            web_dist_dir,
         })
     }
 }
@@ -234,6 +245,7 @@ mod tests {
         "OIDC_CLIENT_ID",
         "OIDC_CLIENT_SECRET",
         "OIDC_REDIRECT_URL",
+        "WEB_DIST_DIR",
     ];
 
     /// 64 hex chars = 32 bytes — the format `MasterKey::from_env` accepts.
@@ -404,5 +416,37 @@ mod tests {
             cfg.oidc.is_none(),
             "empty OIDC_ISSUER_URL must disable OIDC, not error"
         );
+    }
+
+    #[test]
+    fn web_dist_dir_unset_yields_none() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
+
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.web_dist_dir.is_none());
+    }
+
+    #[test]
+    fn web_dist_dir_set_yields_some_path() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
+        env::set_var("WEB_DIST_DIR", "/srv/iet/web/dist");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.web_dist_dir, Some(PathBuf::from("/srv/iet/web/dist")));
+    }
+
+    #[test]
+    fn web_dist_dir_empty_string_treated_as_unset() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
+        env::set_var("WEB_DIST_DIR", "");
+
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.web_dist_dir.is_none());
     }
 }

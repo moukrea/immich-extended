@@ -96,7 +96,7 @@ async fn login_with_valid_credentials_returns_200_and_sets_cookie() {
         .await
         .unwrap();
 
-    let app = server::router(state);
+    let app = server::router(state, None);
     let resp = app
         .oneshot(post(
             "/api/v1/auth/login",
@@ -146,7 +146,7 @@ async fn login_with_wrong_password_returns_401_and_no_cookie() {
         .await
         .unwrap();
 
-    let app = server::router(state);
+    let app = server::router(state, None);
     let resp = app
         .oneshot(post(
             "/api/v1/auth/login",
@@ -173,7 +173,7 @@ async fn login_with_wrong_password_returns_401_and_no_cookie() {
 #[tokio::test]
 async fn login_with_unknown_email_returns_same_shape_as_wrong_password() {
     let (state, _pool) = fresh_state().await;
-    let app = server::router(state);
+    let app = server::router(state, None);
     let resp = app
         .oneshot(post(
             "/api/v1/auth/login",
@@ -197,7 +197,7 @@ async fn me_returns_user_info_with_valid_cookie() {
         .await
         .unwrap();
 
-    let login_resp = server::router(state.clone())
+    let login_resp = server::router(state.clone(), None)
         .oneshot(post(
             "/api/v1/auth/login",
             serde_json::json!({"email": "carol@example.com", "password": "pw"}),
@@ -208,7 +208,7 @@ async fn me_returns_user_info_with_valid_cookie() {
     let set_cookie = login_resp.headers().get(header::SET_COOKIE).unwrap();
     let cookie_pair = extract_cookie_pair(set_cookie, COOKIE_NAME);
 
-    let me_resp = server::router(state)
+    let me_resp = server::router(state, None)
         .oneshot(get_with_cookie("/api/v1/auth/me", &cookie_pair))
         .await
         .unwrap();
@@ -222,7 +222,7 @@ async fn me_returns_user_info_with_valid_cookie() {
 #[tokio::test]
 async fn me_without_cookie_returns_401() {
     let (state, _pool) = fresh_state().await;
-    let resp = server::router(state)
+    let resp = server::router(state, None)
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -244,7 +244,7 @@ async fn logout_then_me_with_same_cookie_returns_401() {
         .await
         .unwrap();
 
-    let login_resp = server::router(state.clone())
+    let login_resp = server::router(state.clone(), None)
         .oneshot(post(
             "/api/v1/auth/login",
             serde_json::json!({"email": "dave@example.com", "password": "pw"}),
@@ -256,7 +256,7 @@ async fn logout_then_me_with_same_cookie_returns_401() {
         COOKIE_NAME,
     );
 
-    let logout_resp = server::router(state.clone())
+    let logout_resp = server::router(state.clone(), None)
         .oneshot(post_with_cookie(
             "/api/v1/auth/logout",
             serde_json::json!({}),
@@ -280,7 +280,7 @@ async fn logout_then_me_with_same_cookie_returns_401() {
     assert_eq!(n, 0);
 
     // Same cookie value no longer authenticates.
-    let me_resp = server::router(state)
+    let me_resp = server::router(state, None)
         .oneshot(get_with_cookie("/api/v1/auth/me", &cookie_pair))
         .await
         .unwrap();
@@ -290,7 +290,7 @@ async fn logout_then_me_with_same_cookie_returns_401() {
 #[tokio::test]
 async fn logout_without_session_returns_401() {
     let (state, _pool) = fresh_state().await;
-    let resp = server::router(state)
+    let resp = server::router(state, None)
         .oneshot(post("/api/v1/auth/logout", serde_json::json!({})))
         .await
         .unwrap();

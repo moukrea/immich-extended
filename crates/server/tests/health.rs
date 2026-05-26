@@ -28,7 +28,7 @@ async fn test_state() -> AppState {
 
 #[tokio::test]
 async fn health_returns_ok_with_version() {
-    let app = server::router(test_state().await);
+    let app = server::router(test_state().await, None);
 
     let response = app
         .oneshot(
@@ -63,7 +63,7 @@ async fn health_returns_ok_with_version() {
 
 #[tokio::test]
 async fn unknown_route_returns_404() {
-    let app = server::router(test_state().await);
+    let app = server::router(test_state().await, None);
 
     let response = app
         .oneshot(

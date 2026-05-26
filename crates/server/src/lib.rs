@@ -6,14 +6,18 @@ pub mod config;
 pub mod me;
 pub mod setup;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use auth::oidc::OidcClient;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::{extract::State, middleware, routing::get, Json, Router};
 use common::crypto::MasterKey;
 use config::SessionConfig;
 use serde::Serialize;
 use sqlx::SqlitePool;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -51,23 +55,76 @@ pub struct HealthResponse {
 /// about auth (`/health`) simply don't extract it; handlers that require it
 /// get a 401 short-circuit from the extractor when the request carries no
 /// (valid) session cookie.
-pub fn router(state: AppState) -> Router {
+///
+/// `web_dist_dir`, when `Some` AND the path exists at startup, mounts a
+/// SPA-friendly static fallback at `/` serving the built SolidJS bundle.
+/// Critically, the API routes (`/health`, `/api/v1/*`) are registered as the
+/// `nest`/`route` items on the parent router so that unmatched `/api/v1/...`
+/// paths return a 404 from the nested API router rather than falling through
+/// to the SPA fallback (which would silently serve `index.html` for missing
+/// API endpoints and mask client bugs). The fallback only catches paths the
+/// API router doesn't claim — exactly the right shape for a SPA.
+pub fn router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
     let auth_routes = auth::routes::router().nest("/oidc", auth::oidc::router(state.oidc.clone()));
 
     let api_v1 = Router::new()
         .nest("/auth", auth_routes)
         .nest("/me", me::routes::router())
-        .nest("/setup", setup::routes::router());
+        .nest("/setup", setup::routes::router())
+        // Explicit JSON 404 for unmatched `/api/v1/*` paths. Without this,
+        // axum's `nest` bubbles unmatched sub-routes to the parent router's
+        // fallback — which, when the SPA mount is active, would silently
+        // serve `index.html` for misspelled API endpoints and mask client
+        // bugs. Pinning the fallback here keeps API errors JSON-shaped.
+        .fallback(api_not_found);
 
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
-        .nest("/api/v1", api_v1)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::middleware::auth_middleware,
-        ))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .nest("/api/v1", api_v1);
+
+    app = match web_dist_dir {
+        Some(dir) if dir.exists() => {
+            let index_html = dir.join("index.html");
+            tracing::info!(
+                web_dist_dir = %dir.display(),
+                index_html = %index_html.display(),
+                "serving frontend from WEB_DIST_DIR"
+            );
+            // `.fallback()` (not `.not_found_service()`) — the latter rewrites
+            // the response status to 404, which would break SPA routing: the
+            // browser would receive `index.html` with a 404 and render an
+            // error page or refuse caching. `.fallback()` preserves ServeFile's
+            // 200 OK so client-side routes (e.g. `/setup`, `/login`) render
+            // normally on first paint.
+            let serve_dir = ServeDir::new(&dir).fallback(ServeFile::new(index_html));
+            app.fallback_service(serve_dir)
+        }
+        Some(dir) => {
+            tracing::info!(
+                web_dist_dir = %dir.display(),
+                "WEB_DIST_DIR set but path does not exist; running in API-only mode"
+            );
+            app
+        }
+        None => {
+            tracing::info!("API-only mode (WEB_DIST_DIR unset)");
+            app
+        }
+    };
+
+    app.layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::middleware::auth_middleware,
+    ))
+    .layer(TraceLayer::new_for_http())
+    .with_state(state)
+}
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "not_found"})),
+    )
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

@@ -138,7 +138,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
         master_key: cfg.master_key.clone(),
         oidc: Arc::new(oidc_client),
     };
-    let app = server::router(state);
+    let app = server::router(state, cfg.web_dist_dir.clone());
 
     let listener = TcpListener::bind(cfg.http_bind)
         .await
