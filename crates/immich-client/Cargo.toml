@@ -14,12 +14,15 @@ path = "src/lib.rs"
 [dependencies]
 common = { package = "immich-extended-common", path = "../common" }
 
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "1"
 url = "2"
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"

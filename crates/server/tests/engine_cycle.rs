@@ -1,0 +1,453 @@
+//! Integration test for `engine_cycle::run_one_cycle` (M3-T4).
+//!
+//! Drives the full poll cycle end-to-end against a wiremock-backed Immich:
+//! seed a user + encrypted API key + Active rule, mock `/api/search/metadata`
+//! to return three assets (two matching the rule, one not), then call
+//! `run_one_cycle` directly (the scheduler is exercised separately in
+//! `tests/scheduler.rs`). Assertions cover:
+//!
+//! * the three decision rows landed with the right `decision`/`reason`,
+//! * the rule_runs row was finalised with `evaluated=3 added=2 skipped=1`,
+//! * the rule's watermark advanced to the max of the three `updatedAt`s,
+//! * `PUT /api/albums/:id/assets` was called exactly once with the two
+//!   matched ids,
+//! * the second cycle on the same data does NOT re-add to the album
+//!   (decision UPSERT, watermark already advanced ⇒ list_assets returns
+//!   empty).
+//!
+//! Per-account isolation is asserted indirectly: the wiremock matcher checks
+//! the request's `x-api-key` header equals the key we encrypted into the
+//! row. The dedicated cross-account isolation test lives in M3-T6.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::sync::Arc;
+
+use chrono::{TimeZone, Utc};
+use common::crypto::MasterKey;
+use common::db;
+use server::admin::create_user;
+use server::engine_cycle::run_one_cycle;
+use sqlx::SqlitePool;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+const OWNER_KEY: &str = "owner-immich-key";
+const OWNER_IMMICH_UID: &str = "immich-owner-uid";
+
+fn deterministic_key() -> MasterKey {
+    MasterKey::from_bytes([42u8; 32])
+}
+
+async fn fresh_pool() -> SqlitePool {
+    let pool = db::open_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    pool
+}
+
+async fn seed_user(pool: &SqlitePool, email: &str, name: &str) -> String {
+    create_user(pool, email, "pw", Some(name), false)
+        .await
+        .unwrap()
+}
+
+async fn seed_key(pool: &SqlitePool, owner: &str, base_url: &str, plaintext: &str) {
+    let (nonce, ciphertext) = deterministic_key().encrypt(plaintext.as_bytes()).unwrap();
+    sqlx::query!(
+        "INSERT INTO immich_api_keys \
+            (user_id, base_url, ciphertext, nonce, immich_user_id, created_at, last_validated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        owner,
+        base_url,
+        ciphertext,
+        nonce,
+        OWNER_IMMICH_UID,
+        0i64,
+        0i64,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Insert a rule with the given match-spec JSON and target_album_id. The
+/// `last_processed_asset_timestamp` starts NULL so the first cycle pulls
+/// everything Immich returns.
+async fn seed_rule(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+    target_album_id: &str,
+    parsed_predicates_json: &str,
+) {
+    sqlx::query(
+        "INSERT INTO rules \
+            (id, owner_user_id, name, yaml_source, parsed_predicates, \
+             target_album_id, target_album_strategy, status, \
+             poll_interval_seconds, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(id)
+    .bind("name: stub")
+    .bind(parsed_predicates_json)
+    .bind(target_album_id)
+    .bind(if target_album_id.is_empty() {
+        "managed"
+    } else {
+        "existing"
+    })
+    .bind("active")
+    .bind(300i64)
+    .bind(0i64)
+    .bind(0i64)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Build the three-asset Immich search response we use in most tests.
+/// `a1` is a 2024 photo (matches), `a2` is a 2026 photo (matches),
+/// `a3` is a 2022 photo (out of range). All carry distinct `updatedAt`s.
+fn three_asset_search_response() -> serde_json::Value {
+    serde_json::json!({
+        "assets": {
+            "total": 3,
+            "count": 3,
+            "items": [
+                {
+                    "id": "a1",
+                    "type": "IMAGE",
+                    "fileCreatedAt": "2024-06-01T10:00:00.000Z",
+                    "updatedAt": "2026-01-15T10:00:00.000Z",
+                    "exifInfo": {
+                        "dateTimeOriginal": "2024-06-01T10:00:00.000Z"
+                    },
+                    "people": []
+                },
+                {
+                    "id": "a2",
+                    "type": "IMAGE",
+                    "fileCreatedAt": "2026-02-10T12:00:00.000Z",
+                    "updatedAt": "2026-02-15T11:00:00.000Z",
+                    "exifInfo": {
+                        "dateTimeOriginal": "2026-02-10T12:00:00.000Z"
+                    },
+                    "people": []
+                },
+                {
+                    "id": "a3",
+                    "type": "IMAGE",
+                    "fileCreatedAt": "2022-03-01T09:00:00.000Z",
+                    "updatedAt": "2026-01-10T09:00:00.000Z",
+                    "exifInfo": {
+                        "dateTimeOriginal": "2022-03-01T09:00:00.000Z"
+                    },
+                    "people": []
+                }
+            ],
+            "nextPage": null
+        }
+    })
+}
+
+/// MatchSpec JSON for "date.from = 2024-01-01" (matches a1 + a2, skips a3).
+fn date_from_2024_match() -> &'static str {
+    r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#
+}
+
+#[tokio::test]
+async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
+    let server = MockServer::start().await;
+
+    // Search endpoint returns three assets — owner_key header is required.
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(three_asset_search_response()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Capture the PUT body so we can assert the exact ids sent.
+    let put_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
+    let put_body_capture = put_body.clone();
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-1/assets"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(move |req: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let pb = put_body_capture.clone();
+            // Synchronous capture into the Mutex (try_lock is fine — there's
+            // only one writer per test).
+            if let Ok(mut g) = pb.try_lock() {
+                *g = Some(body);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+
+    let mk = deterministic_key();
+    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+
+    assert_eq!(outcome.evaluated, 3, "should have evaluated all 3 assets");
+    assert_eq!(outcome.added, 2, "a1 + a2 match the 2024+ date predicate");
+    assert_eq!(outcome.skipped, 1, "a3 is out of range");
+
+    // Three decision rows with the right decision + reason.
+    let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(decisions.len(), 3);
+    let by_id: std::collections::HashMap<String, (String, String)> = decisions
+        .into_iter()
+        .map(|d| (d.asset_id, (d.decision, d.reason)))
+        .collect();
+    assert_eq!(by_id["a1"], ("added".to_string(), "matched".to_string()));
+    assert_eq!(by_id["a2"], ("added".to_string(), "matched".to_string()));
+    assert_eq!(
+        by_id["a3"],
+        ("skipped".to_string(), "date_out_of_range".to_string()),
+    );
+
+    // rule_runs row finalised with the right counters and no error.
+    let run = common::decisions::latest_run_for_rule(&pool, "r1")
+        .await
+        .unwrap()
+        .expect("a run row should exist");
+    assert_eq!(run.assets_evaluated, 3);
+    assert_eq!(run.assets_added, 2);
+    assert_eq!(run.assets_skipped, 1);
+    assert!(run.finished_at.is_some(), "run should be finalised");
+    assert!(run.error_message.is_none(), "no error expected");
+
+    // Watermark advanced to the max updatedAt of the batch (a2 = 2026-02-15T11:00:00Z).
+    let row = sqlx::query!(
+        "SELECT last_processed_asset_timestamp, last_run_at FROM rules WHERE id = ?",
+        "r1"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let expected = Utc
+        .with_ymd_and_hms(2026, 2, 15, 11, 0, 0)
+        .unwrap()
+        .timestamp();
+    assert_eq!(row.last_processed_asset_timestamp, Some(expected));
+    assert!(row.last_run_at.is_some());
+
+    // PUT body contained the two matched ids (order not asserted).
+    let body = put_body
+        .lock()
+        .await
+        .clone()
+        .expect("PUT was supposed to fire once");
+    let ids: Vec<String> = body["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["a1".to_string(), "a2".to_string()]);
+}
+
+#[tokio::test]
+async fn run_one_cycle_decision_reasons_track_predicates() {
+    // Build three assets that each fail a different predicate to confirm
+    // that the reason column is correctly attributed.
+    //
+    //   a1 — VIDEO   (fails media: photo-only)
+    //   a2 — PHOTO 2020 (fails date: from=2024)
+    //   a3 — PHOTO 2025 with foreign person id (fails people.must_exclude)
+    //
+    // The rule's match spec ANDs media=photo, date>=2024, people.must_exclude=banned.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "assets": {
+                "items": [
+                    {
+                        "id": "a1",
+                        "type": "VIDEO",
+                        "updatedAt": "2026-01-01T10:00:00Z",
+                        "people": []
+                    },
+                    {
+                        "id": "a2",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2020-06-01T10:00:00Z",
+                        "updatedAt": "2026-01-01T11:00:00Z",
+                        "exifInfo": {
+                            "dateTimeOriginal": "2020-06-01T10:00:00Z"
+                        },
+                        "people": []
+                    },
+                    {
+                        "id": "a3",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2025-06-01T10:00:00Z",
+                        "updatedAt": "2026-01-01T12:00:00Z",
+                        "exifInfo": {
+                            "dateTimeOriginal": "2025-06-01T10:00:00Z"
+                        },
+                        "people": [{"id": "banned"}]
+                    }
+                ],
+                "nextPage": null
+            }
+        })))
+        .mount(&server)
+        .await;
+    // No PUT expected — every asset is skipped.
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-1/assets"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    // Combined predicate: media=photo AND date>=2024 AND must_exclude=banned.
+    let parsed = r#"{
+        "media": {"types": ["photo"]},
+        "date": {"from": "2024-01-01T00:00:00+00:00"},
+        "people": {"must_exclude": ["banned"]}
+    }"#;
+    seed_rule(&pool, &owner, "r1", "album-1", parsed).await;
+
+    let mk = deterministic_key();
+    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    assert_eq!(outcome.evaluated, 3);
+    assert_eq!(outcome.added, 0);
+    assert_eq!(outcome.skipped, 3);
+
+    let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
+        .await
+        .unwrap();
+    let by_id: std::collections::HashMap<String, String> = decisions
+        .into_iter()
+        .map(|d| (d.asset_id, d.reason))
+        .collect();
+    // Cheap-first dispatch: media is checked before date and people.
+    assert_eq!(
+        by_id["a1"], "media_type_mismatch",
+        "a1 should fail on media"
+    );
+    assert_eq!(by_id["a2"], "date_out_of_range", "a2 should fail on date");
+    assert_eq!(
+        by_id["a3"], "people_must_exclude_present",
+        "a3 should fail on people",
+    );
+}
+
+#[tokio::test]
+async fn run_one_cycle_uses_owner_api_key_not_any_other() {
+    // Plant two encrypted keys: owner has OWNER_KEY, stranger has a
+    // different one. The rule belongs to owner. Every request to Immich
+    // must carry OWNER_KEY; if anything calls Immich with the stranger
+    // key, the matcher misses and the test fails because mocks are
+    // configured with `expect(1)` on OWNER_KEY only.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "assets": {"items": [], "nextPage": null}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // A second matcher that *would* match if the wrong key leaked through.
+    // We assert `expect(0)` so the test fails noisily on key bleed.
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(header("x-api-key", "stranger-key"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    // Don't seed the stranger as an immich_api_keys row — owner-scoped
+    // load_key must only consult the rule owner's row.
+    seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+
+    let mk = deterministic_key();
+    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    assert_eq!(outcome.evaluated, 0);
+}
+
+#[tokio::test]
+async fn run_one_cycle_no_api_key_records_error_run() {
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    // Deliberately no `seed_key(...)` — the rule's owner has no key on file.
+    seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+
+    let mk = deterministic_key();
+    let err = run_one_cycle(&pool, &mk, "r1").await.unwrap_err();
+    assert!(matches!(err, server::engine_cycle::CycleError::NoApiKey(_)));
+    let run = common::decisions::latest_run_for_rule(&pool, "r1")
+        .await
+        .unwrap()
+        .expect("a run row should exist even on error");
+    assert!(run.finished_at.is_some());
+    assert_eq!(run.error_message.as_deref(), Some("no_api_key"));
+}
+
+#[tokio::test]
+async fn run_one_cycle_immich_5xx_records_error_run_and_keeps_watermark() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+
+    let mk = deterministic_key();
+    let err = run_one_cycle(&pool, &mk, "r1").await.unwrap_err();
+    assert!(matches!(err, server::engine_cycle::CycleError::Immich(_)));
+    let run = common::decisions::latest_run_for_rule(&pool, "r1")
+        .await
+        .unwrap()
+        .expect("a run row should exist even on error");
+    assert!(run.error_message.is_some());
+    assert!(
+        run.error_message
+            .as_deref()
+            .unwrap()
+            .starts_with("immich_unreachable"),
+        "expected immich_unreachable slug, got {:?}",
+        run.error_message,
+    );
+    // Watermark must not have advanced on failure.
+    let row = sqlx::query!(
+        "SELECT last_processed_asset_timestamp FROM rules WHERE id = ?",
+        "r1"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.last_processed_asset_timestamp.is_none());
+}

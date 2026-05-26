@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT last_processed_asset_timestamp, last_run_at FROM rules WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "last_processed_asset_timestamp",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_run_at",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "455a76209a87f5e336e980ad7147a0081daefd27f248eec2d46e2f7923122ccb"
+}

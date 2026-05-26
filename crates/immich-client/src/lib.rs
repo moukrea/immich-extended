@@ -10,6 +10,11 @@
 //!   * `get_album` / `is_album_writable` — `/api/albums/:id` lookup +
 //!     writability inference. Backs the validator's `unwritable_album`
 //!     check for `target_album: {existing: ...}` rules.
+//!   * `list_assets` / `get_album_asset_ids` / `add_assets_to_album` —
+//!     poll-cycle surface (M3-T4). Walks `POST /api/search/metadata` pages
+//!     newer than a watermark; reads an album's existing asset id set so the
+//!     cycle can diff before PUT; pushes new ids via
+//!     `PUT /api/albums/:id/assets`.
 //!
 //! Immich quirks worth knowing while reading this module:
 //!   * **404 doesn't exist.** Album lookups on a missing or
@@ -21,9 +26,15 @@
 //!     30 and uses `?page=N` to walk further pages. We loop until
 //!     `hasNextPage` is false (or we hit `MAX_PEOPLE_PAGES` as a runaway
 //!     guard so a misbehaving Immich can't pin a request open forever).
+//!   * **Search pagination uses `nextPage` as a string** — Immich returns
+//!     `{"assets": {"items": [...], "nextPage": "2"}}` (or `null` when no
+//!     more pages). `list_assets` walks until `nextPage` is null or until
+//!     a caller-supplied page cap.
 
+use chrono::{DateTime, Utc};
 use reqwest::{header, StatusCode};
 use serde::Deserialize;
+use std::collections::HashSet;
 use thiserror::Error;
 use url::Url;
 
@@ -123,6 +134,128 @@ impl From<RawAlbum> for ImmichAlbum {
 /// Album role indicating write access. Immich uses `"editor"` for editors
 /// and `"viewer"` for read-only collaborators; only the former is writable.
 const ALBUM_ROLE_EDITOR: &str = "editor";
+
+/// Immich's asset `type` discriminator, normalized to the variants the engine
+/// reasons about. Any unknown string maps to [`ImmichAssetType::Other`] so a
+/// future Immich asset kind doesn't crash the poll cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImmichAssetType {
+    Image,
+    Video,
+    Other,
+}
+
+impl ImmichAssetType {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "IMAGE" => ImmichAssetType::Image,
+            "VIDEO" => ImmichAssetType::Video,
+            _ => ImmichAssetType::Other,
+        }
+    }
+}
+
+/// Minimum asset shape the engine's predicate evaluators need. Built from
+/// `POST /api/search/metadata` with `withExif: true, withPeople: true` and
+/// flattened from Immich's nested `exifInfo` block.
+///
+/// We keep `updated_at` non-optional because Immich always stamps it, and the
+/// poll cycle needs it as the watermark anchor. Every other timestamp is
+/// optional because EXIF can legitimately be missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImmichAsset {
+    pub id: String,
+    pub asset_type: ImmichAssetType,
+    pub file_created_at: Option<DateTime<Utc>>,
+    pub exif_date_time_original: Option<DateTime<Utc>>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub people_ids: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawExifInfo {
+    #[serde(rename = "dateTimeOriginal", default)]
+    date_time_original: Option<DateTime<Utc>>,
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPerson {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAsset {
+    id: String,
+    #[serde(rename = "type", default)]
+    type_: String,
+    #[serde(rename = "fileCreatedAt", default)]
+    file_created_at: Option<DateTime<Utc>>,
+    #[serde(rename = "updatedAt")]
+    updated_at: DateTime<Utc>,
+    #[serde(rename = "exifInfo", default)]
+    exif_info: Option<RawExifInfo>,
+    #[serde(default)]
+    people: Vec<RawPerson>,
+}
+
+impl From<RawAsset> for ImmichAsset {
+    fn from(r: RawAsset) -> Self {
+        let (exif_dt, lat, lon) = match r.exif_info {
+            Some(e) => (e.date_time_original, e.latitude, e.longitude),
+            None => (None, None, None),
+        };
+        Self {
+            id: r.id,
+            asset_type: ImmichAssetType::from_str(&r.type_),
+            file_created_at: r.file_created_at,
+            exif_date_time_original: exif_dt,
+            latitude: lat,
+            longitude: lon,
+            people_ids: r.people.into_iter().map(|p| p.id).collect(),
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchAssetsBlock {
+    #[serde(default)]
+    items: Vec<RawAsset>,
+    #[serde(rename = "nextPage", default)]
+    next_page: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    assets: SearchAssetsBlock,
+}
+
+/// Hard ceiling on how many `/api/search/metadata` pages we'll walk inside a
+/// single `list_assets` call. The cycle is also expected to cap pages per
+/// tick (PRD: "bounded work per tick") — this ceiling is the safety net for
+/// a misbehaving server returning a `nextPage` forever. 250/page × 200 pages
+/// = 50k assets, well above any single tick's realistic batch.
+const MAX_SEARCH_PAGES: u32 = 200;
+
+/// Album shape used by [`ImmichClient::get_album_asset_ids`]. Only carries
+/// the asset id list; the full asset payload is large and unnecessary for
+/// the idempotent-diff use case.
+#[derive(Debug, Deserialize)]
+struct AlbumWithAssets {
+    #[serde(default)]
+    assets: Vec<AlbumAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumAsset {
+    id: String,
+}
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -321,6 +454,161 @@ impl ImmichClient {
         Ok(editor)
     }
 
+    /// Page through `POST /api/search/metadata` collecting assets newer than
+    /// `since` (Immich's `updatedAfter` filter). `max_pages` caps the walk —
+    /// the caller passes a per-tick budget so a backfill of a huge library
+    /// doesn't pin one cycle open. Page size is fixed at 250 (Immich's cap on
+    /// `size`).
+    ///
+    /// `withExif: true` + `withPeople: true` are baked into the body so the
+    /// returned [`ImmichAsset`] carries everything the engine's predicate
+    /// evaluators need without a second round trip per asset.
+    ///
+    /// Errors mirror [`Self::validate_key`]: 401/403 → `Unauthorized`, other
+    /// non-2xx → `Upstream`, transport → `Transport`, malformed body →
+    /// `BadResponse`.
+    pub async fn list_assets(
+        &self,
+        api_key: &str,
+        since: Option<DateTime<Utc>>,
+        max_pages: u32,
+    ) -> Result<Vec<ImmichAsset>, ValidationError> {
+        let url = self
+            .base_url
+            .join("api/search/metadata")
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let mut out: Vec<ImmichAsset> = Vec::new();
+        let cap = max_pages.clamp(1, MAX_SEARCH_PAGES);
+        let mut page: u32 = 1;
+        for _ in 0..cap {
+            let mut body = serde_json::Map::new();
+            body.insert("size".into(), serde_json::Value::from(250));
+            body.insert("order".into(), serde_json::Value::from("asc"));
+            body.insert("withExif".into(), serde_json::Value::from(true));
+            body.insert("withPeople".into(), serde_json::Value::from(true));
+            body.insert("page".into(), serde_json::Value::from(page));
+            if let Some(after) = since {
+                // `to_rfc3339()` emits the millisecond-precision ISO-8601 form
+                // Immich expects (e.g. `2026-05-24T13:25:42.862+00:00`).
+                body.insert(
+                    "updatedAfter".into(),
+                    serde_json::Value::from(after.to_rfc3339()),
+                );
+            }
+
+            let resp = self
+                .http
+                .post(url.clone())
+                .header("x-api-key", api_key)
+                .header(header::ACCEPT, "application/json")
+                .json(&serde_json::Value::Object(body))
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                    return Err(ValidationError::Unauthorized(status));
+                }
+                return Err(ValidationError::Upstream { status });
+            }
+            let parsed = resp
+                .json::<SearchResponse>()
+                .await
+                .map_err(|e| ValidationError::BadResponse(e.to_string()))?;
+            for raw in parsed.assets.items {
+                out.push(raw.into());
+            }
+            match parsed.assets.next_page {
+                Some(s) if !s.is_empty() => {
+                    page = match s.parse::<u32>() {
+                        Ok(n) => n,
+                        Err(_) => return Ok(out),
+                    };
+                }
+                _ => return Ok(out),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read the set of asset ids currently in `album_id`. Used by the
+    /// idempotent-diff in M3-T5 so the cycle only PUTs newly matched ids.
+    ///
+    /// Returns `Ok(empty set)` when the album is missing or invisible (Immich
+    /// answers 400 — see [`Self::get_album`] for the quirk).
+    pub async fn get_album_asset_ids(
+        &self,
+        api_key: &str,
+        album_id: &str,
+    ) -> Result<HashSet<String>, ValidationError> {
+        let path = format!("api/albums/{album_id}");
+        let url = self
+            .base_url
+            .join(&path)
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let resp = self
+            .http
+            .get(url)
+            .header("x-api-key", api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            let raw = resp
+                .json::<AlbumWithAssets>()
+                .await
+                .map_err(|e| ValidationError::BadResponse(e.to_string()))?;
+            return Ok(raw.assets.into_iter().map(|a| a.id).collect());
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ValidationError::Unauthorized(status));
+        }
+        if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND) {
+            return Ok(HashSet::new());
+        }
+        Err(ValidationError::Upstream { status })
+    }
+
+    /// Push asset ids into `album_id` via `PUT /api/albums/:id/assets`.
+    /// No-op (no HTTP call) when `asset_ids` is empty.
+    ///
+    /// Immich itself is idempotent for already-present ids, so the engine can
+    /// pass a superset without harm. We still diff client-side (M3-T5) to
+    /// keep the PUT body small and observable.
+    pub async fn add_assets_to_album(
+        &self,
+        api_key: &str,
+        album_id: &str,
+        asset_ids: &[String],
+    ) -> Result<(), ValidationError> {
+        if asset_ids.is_empty() {
+            return Ok(());
+        }
+        let path = format!("api/albums/{album_id}/assets");
+        let url = self
+            .base_url
+            .join(&path)
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let body = serde_json::json!({"ids": asset_ids});
+        let resp = self
+            .http
+            .put(url)
+            .header("x-api-key", api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ValidationError::Unauthorized(status));
+        }
+        Err(ValidationError::Upstream { status })
+    }
+
     /// Exposed so tests can assert what base URL the client targets.
     pub fn base_url(&self) -> &Url {
         &self.base_url
@@ -348,5 +636,56 @@ mod tests {
     fn validation_error_unauthorized_is_typed() {
         let err = ValidationError::Unauthorized(StatusCode::UNAUTHORIZED);
         assert!(matches!(err, ValidationError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn immich_asset_type_normalizes_known_strings() {
+        assert_eq!(ImmichAssetType::from_str("IMAGE"), ImmichAssetType::Image);
+        assert_eq!(ImmichAssetType::from_str("VIDEO"), ImmichAssetType::Video);
+        assert_eq!(ImmichAssetType::from_str(""), ImmichAssetType::Other);
+        assert_eq!(ImmichAssetType::from_str("AUDIO"), ImmichAssetType::Other);
+    }
+
+    #[test]
+    fn raw_asset_to_immich_asset_flattens_exif() {
+        // Use a representative Immich JSON shape (matches the live probe).
+        let body = serde_json::json!({
+            "id": "a1",
+            "type": "IMAGE",
+            "fileCreatedAt": "2025-06-01T10:00:00.000Z",
+            "updatedAt": "2025-06-01T10:05:00.000Z",
+            "exifInfo": {
+                "dateTimeOriginal": "2025-06-01T10:00:00.000Z",
+                "latitude": 48.85,
+                "longitude": 2.35
+            },
+            "people": [{"id": "p1"}, {"id": "p2"}]
+        });
+        let raw: RawAsset = serde_json::from_value(body).unwrap();
+        let asset: ImmichAsset = raw.into();
+        assert_eq!(asset.id, "a1");
+        assert_eq!(asset.asset_type, ImmichAssetType::Image);
+        assert!(asset.file_created_at.is_some());
+        assert!(asset.exif_date_time_original.is_some());
+        assert_eq!(asset.latitude, Some(48.85));
+        assert_eq!(asset.longitude, Some(2.35));
+        assert_eq!(asset.people_ids, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(asset.updated_at.to_rfc3339(), "2025-06-01T10:05:00+00:00",);
+    }
+
+    #[test]
+    fn raw_asset_handles_missing_exif_and_people() {
+        let body = serde_json::json!({
+            "id": "a2",
+            "type": "VIDEO",
+            "updatedAt": "2025-07-01T00:00:00Z",
+        });
+        let raw: RawAsset = serde_json::from_value(body).unwrap();
+        let asset: ImmichAsset = raw.into();
+        assert_eq!(asset.asset_type, ImmichAssetType::Video);
+        assert!(asset.file_created_at.is_none());
+        assert!(asset.exif_date_time_original.is_none());
+        assert!(asset.latitude.is_none());
+        assert!(asset.people_ids.is_empty());
     }
 }

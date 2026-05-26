@@ -12,7 +12,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use common::db;
-use immich_client::ImmichClient;
 use server::{
     admin::{create_user, CreateUserError},
     auth::oidc::OidcClient,
@@ -24,7 +23,6 @@ use server::{
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use url::Url;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -136,19 +134,11 @@ async fn run_serve(cfg: Config) -> Result<()> {
         }
     };
 
-    // The scheduler holds a default `ImmichClient` to keep the call-site
-    // forward-compatible with M3-T4 (which will use it to run the real
-    // poll cycle). v0 per-user requests still build their own client from
-    // the URL stored in `immich_api_keys.base_url`, so the URL given here
-    // is a placeholder that the default tick stub never dereferences.
-    let placeholder_immich = Arc::new(ImmichClient::new(
-        Url::parse("http://immich.invalid/").context("parsing placeholder Immich URL")?,
-    ));
-    let scheduler = Arc::new(Scheduler::new(
-        pool.clone(),
-        placeholder_immich,
-        cfg.master_key.clone(),
-    ));
+    // Per-rule Immich clients are built inside the poll cycle from each
+    // rule owner's stored `immich_api_keys.base_url`, so the scheduler
+    // doesn't need a global Immich URL — it just needs the master key to
+    // decrypt the stored secret.
+    let scheduler = Arc::new(Scheduler::new(pool.clone(), cfg.master_key.clone()));
 
     let state = AppState {
         db: pool.clone(),

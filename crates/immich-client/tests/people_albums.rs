@@ -418,3 +418,267 @@ async fn is_album_writable_unauthorized_bubbles() {
         .unwrap_err();
     assert!(matches!(err, ValidationError::Unauthorized(_)));
 }
+
+// --- M3-T4 surface: list_assets, get_album_asset_ids, add_assets_to_album ---
+
+#[tokio::test]
+async fn list_assets_single_page_parses_exif_and_people() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(header("x-api-key", API_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {
+                "total": 2,
+                "count": 2,
+                "items": [
+                    {
+                        "id": "a1",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2025-06-01T10:00:00.000Z",
+                        "updatedAt": "2025-06-01T10:05:00.000Z",
+                        "exifInfo": {
+                            "dateTimeOriginal": "2025-06-01T10:00:00.000Z",
+                            "latitude": 48.85,
+                            "longitude": 2.35
+                        },
+                        "people": [{"id": "p1", "name": "Alice"}]
+                    },
+                    {
+                        "id": "a2",
+                        "type": "VIDEO",
+                        "updatedAt": "2025-06-02T09:00:00.000Z",
+                        "people": []
+                    }
+                ],
+                "nextPage": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let assets = client.list_assets(API_KEY, None, 5).await.unwrap();
+    assert_eq!(assets.len(), 2);
+    assert_eq!(assets[0].id, "a1");
+    assert_eq!(assets[0].asset_type, immich_client::ImmichAssetType::Image);
+    assert_eq!(assets[0].latitude, Some(48.85));
+    assert_eq!(assets[0].people_ids, vec!["p1".to_string()]);
+    assert_eq!(assets[1].asset_type, immich_client::ImmichAssetType::Video);
+    assert!(assets[1].latitude.is_none());
+    assert!(assets[1].people_ids.is_empty());
+}
+
+#[tokio::test]
+async fn list_assets_walks_next_page_until_null() {
+    let server = MockServer::start().await;
+    // Page 1: nextPage = "2"
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(wiremock::matchers::body_partial_json(json!({"page": 1})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {
+                "items": [{"id": "a1", "type": "IMAGE", "updatedAt": "2025-06-01T00:00:00Z"}],
+                "nextPage": "2"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Page 2: nextPage = null
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(wiremock::matchers::body_partial_json(json!({"page": 2})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {
+                "items": [{"id": "a2", "type": "IMAGE", "updatedAt": "2025-06-02T00:00:00Z"}],
+                "nextPage": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let assets = client.list_assets(API_KEY, None, 5).await.unwrap();
+    assert_eq!(assets.len(), 2);
+    assert_eq!(assets[0].id, "a1");
+    assert_eq!(assets[1].id, "a2");
+}
+
+#[tokio::test]
+async fn list_assets_respects_max_pages_cap() {
+    let server = MockServer::start().await;
+    // Always return nextPage = "2" so the only thing stopping the walk is the cap.
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {
+                "items": [{"id": "loop", "type": "IMAGE", "updatedAt": "2025-06-01T00:00:00Z"}],
+                "nextPage": "2"
+            }
+        })))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let assets = client.list_assets(API_KEY, None, 3).await.unwrap();
+    assert_eq!(
+        assets.len(),
+        3,
+        "should have walked exactly 3 pages then stopped"
+    );
+}
+
+#[tokio::test]
+async fn list_assets_passes_updated_after_when_set() {
+    use chrono::TimeZone;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "updatedAfter": "2025-01-01T00:00:00+00:00"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {"items": [], "nextPage": null}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let since = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let assets = client.list_assets(API_KEY, Some(since), 5).await.unwrap();
+    assert!(assets.is_empty());
+}
+
+#[tokio::test]
+async fn list_assets_401_maps_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let err = client.list_assets(API_KEY, None, 5).await.unwrap_err();
+    assert!(matches!(err, ValidationError::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn list_assets_500_maps_upstream() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let err = client.list_assets(API_KEY, None, 5).await.unwrap_err();
+    assert!(
+        matches!(err, ValidationError::Upstream { status } if status == StatusCode::INTERNAL_SERVER_ERROR),
+    );
+}
+
+#[tokio::test]
+async fn get_album_asset_ids_returns_set() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/albums/al-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "al-1",
+            "ownerId": "u",
+            "albumUsers": [],
+            "assets": [
+                {"id": "x1"},
+                {"id": "x2"},
+                {"id": "x3"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let ids = client.get_album_asset_ids(API_KEY, "al-1").await.unwrap();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains("x1"));
+    assert!(ids.contains("x2"));
+    assert!(ids.contains("x3"));
+}
+
+#[tokio::test]
+async fn get_album_asset_ids_400_returns_empty_set() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/albums/ghost"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "message": "Not found or no album.read access",
+            "statusCode": 400
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let ids = client.get_album_asset_ids(API_KEY, "ghost").await.unwrap();
+    assert!(ids.is_empty());
+}
+
+#[tokio::test]
+async fn add_assets_to_album_sends_ids_array() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/al-1/assets"))
+        .and(header("x-api-key", API_KEY))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "ids": ["a", "b"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    client
+        .add_assets_to_album(API_KEY, "al-1", &["a".to_string(), "b".to_string()])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn add_assets_to_album_empty_is_noop() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/al-1/assets"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    // No HTTP call should be made even though the mock would 500 if it were.
+    client
+        .add_assets_to_album(API_KEY, "al-1", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn add_assets_to_album_401_maps_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/al-1/assets"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let err = client
+        .add_assets_to_album(API_KEY, "al-1", &["a".to_string()])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ValidationError::Unauthorized(_)));
+}

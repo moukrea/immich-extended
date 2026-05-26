@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT base_url, ciphertext, nonce FROM immich_api_keys WHERE user_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "base_url",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "ciphertext",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "nonce",
+        "ordinal": 2,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "88686542e8ddb3bacc8eae0d3105d307f9cafa51f3c4801d56a63750a65f127b"
+}

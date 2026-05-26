@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod engine_cycle;
 pub mod engine_scheduler;
 pub mod me;
 pub mod rules;

@@ -18,10 +18,10 @@
 //! respect cancellation between ticks, so a paused rule would still tick
 //! once before the loop noticed the cancellation.
 //!
-//! The Immich-backed cycle body lives behind the [`RunCycleFn`] seam. M3-T3
-//! wires the harness only — the default tick function logs and exits Ok.
-//! M3-T4 swaps in the real cycle. The same seam is used by the integration
-//! test to inject a counter-incrementing stub that fires every 30 ms.
+//! The Immich-backed cycle body lives behind the [`RunCycleFn`] seam.
+//! Production wires [`crate::engine_cycle::production_tick_fn`] (M3-T4);
+//! integration tests inject a counter-incrementing stub via
+//! [`Scheduler::new_with`].
 //!
 //! `SchedulerConfig::tick_interval_override` is a test seam: when `Some`,
 //! every spawned task uses that interval instead of the rule's own
@@ -36,12 +36,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::crypto::MasterKey;
-use immich_client::ImmichClient;
 use sqlx::SqlitePool;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use crate::engine_cycle;
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
@@ -102,12 +103,13 @@ impl std::fmt::Debug for Scheduler {
 }
 
 impl Scheduler {
-    /// Production constructor. The default tick closure captures the shared
-    /// [`ImmichClient`] and [`MasterKey`] so M3-T4 can flip the body to the
-    /// real Immich-backed cycle without rewiring `main.rs` or the
-    /// [`Scheduler`] struct.
-    pub fn new(pool: SqlitePool, immich: Arc<ImmichClient>, master_key: MasterKey) -> Self {
-        let tick_fn = default_tick_fn(immich, master_key);
+    /// Production constructor. Wires
+    /// [`crate::engine_cycle::production_tick_fn`] as the per-tick body so
+    /// every spawned task runs the real Immich-backed poll cycle. The
+    /// per-rule Immich client is built *inside* the cycle from the owner's
+    /// stored credentials, so the scheduler itself never sees an Immich URL.
+    pub fn new(pool: SqlitePool, master_key: MasterKey) -> Self {
+        let tick_fn = engine_cycle::production_tick_fn(pool.clone(), master_key);
         Self::new_with(pool, SchedulerConfig::default(), tick_fn)
     }
 
@@ -254,23 +256,6 @@ impl Scheduler {
 async fn cancel_and_join(task: RunningTask) {
     task.cancel.cancel();
     let _ = task.join.await;
-}
-
-/// Build the production default tick function. Captures `immich` + key so
-/// M3-T4 can flip the closure body from "log and Ok" to "fetch assets,
-/// evaluate, record decisions, push album" without changing call sites or
-/// the [`Scheduler`] struct shape.
-fn default_tick_fn(immich: Arc<ImmichClient>, master_key: MasterKey) -> RunCycleFn {
-    Arc::new(move |rule_id: String| {
-        // Keep deps alive for the future. M3-T4 will move them into a
-        // proper `EngineDeps` and stop sneaking them through the closure.
-        let _immich = immich.clone();
-        let _master_key = master_key.clone();
-        Box::pin(async move {
-            tracing::debug!(%rule_id, "scheduler tick (stub — M3-T4 wires the real cycle)");
-            Ok(())
-        })
-    })
 }
 
 #[cfg(test)]

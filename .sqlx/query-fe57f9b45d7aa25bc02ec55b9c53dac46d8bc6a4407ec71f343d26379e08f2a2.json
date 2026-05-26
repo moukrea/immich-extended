@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE rules SET last_processed_asset_timestamp = ?, last_run_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "fe57f9b45d7aa25bc02ec55b9c53dac46d8bc6a4407ec71f343d26379e08f2a2"
+}
