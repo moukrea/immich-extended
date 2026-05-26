@@ -1,5 +1,6 @@
 //! Rule engine: predicates, scheduler, per-rule poll loops, decision recording.
 
+pub mod predicate;
 pub mod rule;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
