@@ -4,11 +4,10 @@
 //! the M3-T4 poll cycle from Immich's metadata) and a predicate, and return a
 //! [`PredicateOutcome`]. No I/O, no async — only data math.
 //!
-//! Geo (location) and the YOLO sub-rule of [`PeoplePredicate::no_unidentified_humans`]
-//! are stubbed in M3 with explicit "Unimplemented" decision reasons so that
-//! the dispatch loop in [`evaluate_match`] handles every predicate variant.
-//! M4 implements geo; M5 wires real YOLO inference and populates
-//! [`AssetSnapshot::yolo_person_count`].
+//! The YOLO sub-rule of [`PeoplePredicate::no_unidentified_humans`] is stubbed
+//! in M3 with an explicit "Unimplemented" decision reason; M5 wires real YOLO
+//! inference and populates [`AssetSnapshot::yolo_person_count`]. Geo (location)
+//! landed in M4 as a real haversine evaluator.
 //!
 //! Per PRD §7, [`evaluate_match`] dispatches predicates **cheap-first**
 //! (media → date → location → people) and short-circuits on the first
@@ -58,12 +57,12 @@ pub enum DecisionReason {
     DateOutOfRange,
     MediaTypeMismatch,
     LocationOutOfRange,
+    LocationMissingGps,
     PeopleMustIncludeMissing { missing_id: String },
     PeopleMustIncludeAnyOfMissing,
     PeopleMustExcludePresent { id: String },
     PeopleOtherIdentifiablePresent { id: String },
     PeopleUnidentifiedHumanPresent { yolo_count: u32, identified: u32 },
-    LocationUnimplemented,
     YoloUnimplemented,
 }
 
@@ -74,6 +73,7 @@ impl DecisionReason {
             DecisionReason::DateOutOfRange => "date_out_of_range",
             DecisionReason::MediaTypeMismatch => "media_type_mismatch",
             DecisionReason::LocationOutOfRange => "location_out_of_range",
+            DecisionReason::LocationMissingGps => "location_missing_gps",
             DecisionReason::PeopleMustIncludeMissing { .. } => "people_must_include_missing",
             DecisionReason::PeopleMustIncludeAnyOfMissing => "people_must_include_any_of_missing",
             DecisionReason::PeopleMustExcludePresent { .. } => "people_must_exclude_present",
@@ -83,7 +83,6 @@ impl DecisionReason {
             DecisionReason::PeopleUnidentifiedHumanPresent { .. } => {
                 "people_unidentified_human_present"
             }
-            DecisionReason::LocationUnimplemented => "location_unimplemented",
             DecisionReason::YoloUnimplemented => "yolo_unimplemented",
         }
     }
@@ -146,10 +145,34 @@ pub fn eval_media(p: &MediaPredicate, asset: &AssetSnapshot) -> PredicateOutcome
     }
 }
 
-/// M3 stub. M4 will compute haversine `(_asset.gps, _p.center) <= _p.radius_km`.
-/// Any rule with a location predicate currently skips every asset.
-pub fn eval_location(_p: &LocationPredicate, _asset: &AssetSnapshot) -> PredicateOutcome {
-    PredicateOutcome::skipped(DecisionReason::LocationUnimplemented)
+/// Mean Earth radius in km (used by the haversine distance).
+const R_EARTH_KM: f64 = 6371.0;
+
+/// Haversine great-circle distance between two `(lat, lon)` points in degrees,
+/// returning km. The inner `sqrt` is clamped to `1.0` to avoid `NaN` from
+/// floating-point overshoot on near-antipodal pairs.
+pub(crate) fn haversine_km((lat1, lon1): (f64, f64), (lat2, lon2): (f64, f64)) -> f64 {
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * R_EARTH_KM * a.sqrt().min(1.0).asin()
+}
+
+/// Geo-fence: matches when the asset's GPS lies within `p.radius_km` of
+/// `p.center`. Boundary is inclusive (PRD §6 "within"). Skips with
+/// [`DecisionReason::LocationMissingGps`] when the asset has no EXIF GPS
+/// (PRD §6: "Assets with no GPS data do not match").
+pub fn eval_location(p: &LocationPredicate, asset: &AssetSnapshot) -> PredicateOutcome {
+    let Some((lat, lon)) = asset.gps else {
+        return PredicateOutcome::skipped(DecisionReason::LocationMissingGps);
+    };
+    let distance_km = haversine_km((p.center[0], p.center[1]), (lat, lon));
+    if distance_km <= p.radius_km {
+        PredicateOutcome::matched()
+    } else {
+        PredicateOutcome::skipped(DecisionReason::LocationOutOfRange)
+    }
 }
 
 /// Evaluates all five identified-people sub-rules plus the yolo-gated
@@ -613,17 +636,106 @@ mod tests {
         );
     }
 
-    // ---- location stub ----
+    // ---- location ----
+
+    fn paris() -> (f64, f64) {
+        (48.8566, 2.3522)
+    }
+
+    fn lyon() -> (f64, f64) {
+        (45.7640, 4.8357)
+    }
 
     #[test]
-    fn location_stub_always_skips_with_unimplemented() {
+    fn location_at_center_matches() {
+        let (lat, lon) = paris();
+        let p = LocationPredicate {
+            center: [lat, lon],
+            radius_km: 1.0,
+        };
+        let asset = AssetSnapshot {
+            gps: Some((lat, lon)),
+            ..photo()
+        };
+        let outcome = eval_location(&p, &asset);
+        assert!(outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::Matched);
+    }
+
+    #[test]
+    fn location_inside_radius_matches() {
+        let (clat, clon) = paris();
+        let p = LocationPredicate {
+            center: [clat, clon],
+            radius_km: 500.0,
+        };
+        let (alat, alon) = lyon();
+        let asset = AssetSnapshot {
+            gps: Some((alat, alon)),
+            ..photo()
+        };
+        let outcome = eval_location(&p, &asset);
+        assert!(outcome.matched, "Lyon ~393 km < 500 km radius from Paris");
+    }
+
+    #[test]
+    fn location_outside_radius_skips() {
+        let (clat, clon) = paris();
+        let p = LocationPredicate {
+            center: [clat, clon],
+            radius_km: 10.0,
+        };
+        let (alat, alon) = lyon();
+        let asset = AssetSnapshot {
+            gps: Some((alat, alon)),
+            ..photo()
+        };
+        let outcome = eval_location(&p, &asset);
+        assert!(!outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::LocationOutOfRange);
+    }
+
+    #[test]
+    fn location_missing_gps_skips() {
         let p = LocationPredicate {
             center: [48.85, 2.35],
             radius_km: 5.0,
         };
-        let outcome = eval_location(&p, &photo());
+        let asset = AssetSnapshot {
+            gps: None,
+            ..photo()
+        };
+        let outcome = eval_location(&p, &asset);
         assert!(!outcome.matched);
-        assert_eq!(outcome.reason, DecisionReason::LocationUnimplemented);
+        assert_eq!(outcome.reason, DecisionReason::LocationMissingGps);
+    }
+
+    #[test]
+    fn location_boundary_inclusive() {
+        let (clat, clon) = paris();
+        let (alat, alon) = lyon();
+        let distance = haversine_km((clat, clon), (alat, alon));
+        let p = LocationPredicate {
+            center: [clat, clon],
+            radius_km: distance,
+        };
+        let asset = AssetSnapshot {
+            gps: Some((alat, alon)),
+            ..photo()
+        };
+        let outcome = eval_location(&p, &asset);
+        assert!(
+            outcome.matched,
+            "radius == distance must match (<= boundary)"
+        );
+    }
+
+    #[test]
+    fn location_haversine_pole_to_equator() {
+        // Quarter great-circle (90°) ≈ pi/2 * R_EARTH ≈ 10007.5 km. Tolerance
+        // is loose because PRD §16 acknowledges geo accuracy is "tens of km".
+        let d = haversine_km((90.0, 0.0), (0.0, 0.0));
+        assert!((d - 10007.5).abs() < 5.0, "expected ~10007.5 km, got {d}");
     }
 
     // ---- evaluate_match ----
@@ -705,8 +817,9 @@ mod tests {
 
     #[test]
     fn evaluate_match_location_short_circuits_before_people() {
-        // Location stub always skips with LocationUnimplemented — people
-        // (which would match here) must not be reached.
+        // Location is deterministically out-of-range (asset has GPS in Paris,
+        // predicate is centered on the equator with a 1 km radius). People
+        // (which would otherwise match here) must NOT be consulted.
         let spec = MatchSpec {
             location: Some(LocationPredicate {
                 center: [0.0, 0.0],
@@ -720,12 +833,13 @@ mod tests {
             media: None,
         };
         let asset = AssetSnapshot {
+            gps: Some(paris()),
             face_person_ids: vec!["paloma".into()],
             ..photo()
         };
         let outcome = evaluate_match(&spec, &asset);
         assert!(!outcome.matched);
-        assert_eq!(outcome.reason, DecisionReason::LocationUnimplemented);
+        assert_eq!(outcome.reason, DecisionReason::LocationOutOfRange);
     }
 
     // ---- slug stability ----
@@ -741,6 +855,10 @@ mod tests {
         assert_eq!(
             DecisionReason::LocationOutOfRange.slug(),
             "location_out_of_range"
+        );
+        assert_eq!(
+            DecisionReason::LocationMissingGps.slug(),
+            "location_missing_gps"
         );
         assert_eq!(
             DecisionReason::PeopleMustIncludeMissing {
@@ -768,10 +886,6 @@ mod tests {
             }
             .slug(),
             "people_unidentified_human_present"
-        );
-        assert_eq!(
-            DecisionReason::LocationUnimplemented.slug(),
-            "location_unimplemented"
         );
         assert_eq!(
             DecisionReason::YoloUnimplemented.slug(),
