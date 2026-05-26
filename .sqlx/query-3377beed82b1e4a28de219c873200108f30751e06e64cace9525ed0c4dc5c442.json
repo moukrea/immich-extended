@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE rule_runs SET finished_at = ?, assets_evaluated = ?, assets_added = ?, assets_skipped = ?, error_message = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "3377beed82b1e4a28de219c873200108f30751e06e64cace9525ed0c4dc5c442"
+}

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id, rule_id, started_at, finished_at, assets_evaluated, assets_added, assets_skipped, error_message FROM rule_runs WHERE rule_id = ? ORDER BY started_at DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "rule_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "started_at",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "finished_at",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "assets_evaluated",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "assets_added",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "assets_skipped",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "error_message",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "88604071ebf5b77d28b7713b9c154950d7e402561ac9c297ababfc93cb4aa703"
+}

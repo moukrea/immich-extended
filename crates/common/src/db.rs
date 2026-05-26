@@ -425,6 +425,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrations_create_asset_decisions() {
+        let pool = fresh_pool().await;
+        let cols = columns(&pool, "asset_decisions").await;
+        for c in [
+            "rule_id",
+            "asset_id",
+            "decision",
+            "reason",
+            "run_id",
+            "decided_at",
+        ] {
+            assert_has(&cols, c);
+        }
+
+        let rule_id = cols.iter().find(|c| c.name == "rule_id").unwrap();
+        let asset_id = cols.iter().find(|c| c.name == "asset_id").unwrap();
+        assert!(
+            rule_id.pk > 0 && asset_id.pk > 0,
+            "(rule_id, asset_id) should be the composite PK"
+        );
+        assert_eq!(rule_id.notnull, 1, "'rule_id' should be NOT NULL");
+        assert_eq!(asset_id.notnull, 1, "'asset_id' should be NOT NULL");
+
+        for required_notnull in ["decision", "reason", "decided_at"] {
+            let col = cols.iter().find(|c| c.name == required_notnull).unwrap();
+            assert_eq!(col.notnull, 1, "'{required_notnull}' should be NOT NULL");
+        }
+
+        let run_id = cols.iter().find(|c| c.name == "run_id").unwrap();
+        assert_eq!(
+            run_id.notnull, 0,
+            "'run_id' should be NULL-able (backfill case)"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrations_create_asset_decisions_index() {
+        let pool = fresh_pool().await;
+        let indexes: Vec<PragmaIndex> = sqlx::query_as("PRAGMA index_list('asset_decisions')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let names: Vec<&str> = indexes.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            names.contains(&"asset_decisions_rule_id_decided_at_idx"),
+            "missing asset_decisions_rule_id_decided_at_idx: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrations_create_rule_runs() {
+        let pool = fresh_pool().await;
+        let cols = columns(&pool, "rule_runs").await;
+        for c in [
+            "id",
+            "rule_id",
+            "started_at",
+            "finished_at",
+            "assets_evaluated",
+            "assets_added",
+            "assets_skipped",
+            "error_message",
+        ] {
+            assert_has(&cols, c);
+        }
+
+        let id = cols.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id.pk, 1, "'id' should be PRIMARY KEY");
+        assert_eq!(
+            id.notnull, 1,
+            "'id' should be NOT NULL (explicit, to avoid the SELECT id AS \"id!\" cast)"
+        );
+
+        for required_notnull in [
+            "rule_id",
+            "started_at",
+            "assets_evaluated",
+            "assets_added",
+            "assets_skipped",
+        ] {
+            let col = cols.iter().find(|c| c.name == required_notnull).unwrap();
+            assert_eq!(col.notnull, 1, "'{required_notnull}' should be NOT NULL");
+        }
+
+        for nullable in ["finished_at", "error_message"] {
+            let col = cols.iter().find(|c| c.name == nullable).unwrap();
+            assert_eq!(col.notnull, 0, "'{nullable}' should be NULL-able");
+        }
+
+        for (counter, default) in [
+            ("assets_evaluated", "0"),
+            ("assets_added", "0"),
+            ("assets_skipped", "0"),
+        ] {
+            let col = cols.iter().find(|c| c.name == counter).unwrap();
+            assert_eq!(
+                col._dflt.as_deref(),
+                Some(default),
+                "'{counter}' should default to {default}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migrations_create_rule_runs_index() {
+        let pool = fresh_pool().await;
+        let indexes: Vec<PragmaIndex> = sqlx::query_as("PRAGMA index_list('rule_runs')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let names: Vec<&str> = indexes.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            names.contains(&"rule_runs_rule_id_started_at_idx"),
+            "missing rule_runs_rule_id_started_at_idx: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_state_fks_cascade_on_rule_delete() {
+        let pool = fresh_pool().await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)")
+            .bind("u-eng")
+            .bind("eng@example.com")
+            .bind(Option::<String>::None)
+            .bind(0_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO rules (\
+                id, owner_user_id, name, yaml_source, parsed_predicates, \
+                target_album_id, target_album_strategy, status, \
+                poll_interval_seconds, created_at, updated_at\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("rule-eng")
+        .bind("u-eng")
+        .bind("Engine rule")
+        .bind("name: Engine rule\nmatch:\n  date:\n    from: 2024-01-01\n")
+        .bind("{}")
+        .bind("")
+        .bind("managed")
+        .bind("active")
+        .bind(300_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO asset_decisions \
+                (rule_id, asset_id, decision, reason, run_id, decided_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("rule-eng")
+        .bind("asset-1")
+        .bind("added")
+        .bind("matched")
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO rule_runs (id, rule_id, started_at, finished_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind("run-1")
+        .bind("rule-eng")
+        .bind(1000_i64)
+        .bind(Option::<i64>::None)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM rules WHERE id = ?")
+            .bind("rule-eng")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let dec_remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset_decisions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(dec_remaining, 0, "asset_decisions should cascade-delete");
+        let run_remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_remaining, 0, "rule_runs should cascade-delete");
+    }
+
+    #[tokio::test]
     async fn local_credentials_fk_cascades_on_user_delete() {
         let pool = fresh_pool().await;
         sqlx::query("PRAGMA foreign_keys = ON")

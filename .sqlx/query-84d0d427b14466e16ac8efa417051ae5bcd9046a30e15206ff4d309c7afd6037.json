@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT rule_id AS \"rule_id!\", asset_id AS \"asset_id!\", decision, reason, run_id, decided_at FROM asset_decisions WHERE rule_id = ? ORDER BY decided_at DESC LIMIT ? OFFSET ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "rule_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "asset_id!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "decision",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "reason",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "run_id",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "decided_at",
+        "ordinal": 5,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "84d0d427b14466e16ac8efa417051ae5bcd9046a30e15206ff4d309c7afd6037"
+}

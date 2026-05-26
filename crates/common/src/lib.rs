@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod crypto;
 pub mod db;
+pub mod decisions;
 pub mod users;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

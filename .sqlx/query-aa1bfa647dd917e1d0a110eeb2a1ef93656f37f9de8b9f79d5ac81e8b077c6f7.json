@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO asset_decisions (rule_id, asset_id, decision, reason, run_id, decided_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(rule_id, asset_id) DO UPDATE SET decision = excluded.decision, reason = excluded.reason, run_id = excluded.run_id, decided_at = excluded.decided_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "aa1bfa647dd917e1d0a110eeb2a1ef93656f37f9de8b9f79d5ac81e8b077c6f7"
+}
