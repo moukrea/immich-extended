@@ -96,6 +96,16 @@ pub(super) async fn upsert_key(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "invalid_base_url", "detail": e})),
             ),
+            ValidationError::BadResponse(detail) => {
+                tracing::warn!(%detail, "immich response malformed during validation");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "upstream_unreachable",
+                        "detail": detail,
+                    })),
+                )
+            }
         }
     })?;
 

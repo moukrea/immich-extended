@@ -293,6 +293,16 @@ fn map_validation_error(err: ValidationError) -> ErrorResponse {
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "invalid_base_url", "detail": e})),
         ),
+        ValidationError::BadResponse(detail) => {
+            tracing::warn!(%detail, "setup: immich response malformed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "upstream_unreachable",
+                    "detail": detail,
+                })),
+            )
+        }
     }
 }
 

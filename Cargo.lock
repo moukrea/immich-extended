@@ -1418,8 +1418,11 @@ dependencies = [
  "immich-extended-common",
  "reqwest",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "url",
+ "wiremock",
 ]
 
 [[package]]

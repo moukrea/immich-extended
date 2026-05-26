@@ -8,6 +8,10 @@
 //! Submodules:
 //!   * [`handlers`] — the five HTTP handlers (create/list/get/update/delete).
 //!   * [`routes`] — wiring that lays them out under `/api/v1/rules`.
+//!   * [`resolver`] — `ImmichResourceResolver` (M2-T5): the production
+//!     [`engine::rule::RuleResourceResolver`] implementation that loads the
+//!     caller's encrypted Immich key + dispatches to the live Immich API.
 
 pub mod handlers;
+pub mod resolver;
 pub mod routes;

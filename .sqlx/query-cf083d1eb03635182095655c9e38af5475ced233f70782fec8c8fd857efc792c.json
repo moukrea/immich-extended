@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT base_url, ciphertext, nonce, immich_user_id FROM immich_api_keys WHERE user_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "base_url",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "ciphertext",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "nonce",
+        "ordinal": 2,
+        "type_info": "Blob"
+      },
+      {
+        "name": "immich_user_id",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "cf083d1eb03635182095655c9e38af5475ced233f70782fec8c8fd857efc792c"
+}
