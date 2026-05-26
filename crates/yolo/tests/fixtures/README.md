@@ -21,6 +21,23 @@ Grand Canyon view from Pima Point, March 2010. Photographer: Murray Foubister.
 - **Processing**: downscaled from the 2848×4288 original via
   `ffmpeg -i original.jpg -vf scale=400:-1 -q:v 6 empty_landscape.jpg`.
 
+## `10s_one_person.mp4` (40 KB, 640×480 H.264)
+
+10-second synthesised clip looping `one_person.jpg`. Used by
+`crates/yolo/tests/video.rs` to exercise the ffmpeg frame extractor and the
+end-to-end video person count. Same provenance / licence as `one_person.jpg`
+(U.S. federal-government public domain).
+
+Re-synthesis recipe (Fedora 43 ffmpeg ships `libopenh264` but not `libx264`):
+
+```bash
+ffmpeg -y -loop 1 -i one_person.jpg -t 10 \
+  -vf "scale=640:480,format=yuv420p" -r 25 \
+  -c:v libopenh264 -pix_fmt yuv420p 10s_one_person.mp4
+```
+
+At `fps=0.5` this clip yields exactly **5 extracted frames** (t = 0, 2, 4, 6, 8 s).
+
 ## `yolo11n.onnx` (≈5 MB, optional)
 
 Ultralytics YOLOv11n nano model, exported to ONNX with `imgsz=640`. AGPL-3.0; we use it

@@ -7,6 +7,7 @@ pub mod model;
 pub mod postprocess;
 pub mod preprocess;
 pub mod session;
+pub mod video;
 
 pub use error::YoloError;
 pub use model::{
@@ -16,6 +17,7 @@ pub use model::{
 pub use postprocess::count_persons;
 pub use preprocess::{letterbox, letterbox_to_tensor, to_input_tensor, LetterboxMeta};
 pub use session::session;
+pub use video::{count_people_in_video, MAX_FRAMES_PER_VIDEO, VIDEO_SAMPLE_FPS};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
