@@ -25,13 +25,13 @@ import {
 import {
   defaultBuilderState,
   formStateToYaml,
-  peopleValueToYaml,
-  peopleYamlToValue,
   yamlToFormState,
   type RuleBuilderState,
   type TargetAlbumState,
 } from "../../lib/ruleYaml";
 import ConfirmDialog from "../../components/ConfirmDialog";
+import PeopleMultiSelect from "../../components/PeopleMultiSelect";
+import { PeopleProvider } from "../../components/PeopleContext";
 import { humanRuleError } from "./errors";
 
 const MapPicker = lazy(() => import("../../components/MapPicker"));
@@ -59,8 +59,6 @@ const RuleBuilder: Component = () => {
   );
   const [yamlError, setYamlError] = createSignal<string | null>(null);
   const [untouched, setUntouched] = createSignal<string[]>([]);
-  const [peopleYaml, setPeopleYaml] = createSignal<string>("");
-  const [peopleError, setPeopleError] = createSignal<string | null>(null);
   const [showMap, setShowMap] = createSignal(false);
   const [showAdvanced, setShowAdvanced] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
@@ -104,7 +102,6 @@ const RuleBuilder: Component = () => {
       batch(() => {
         setState(next);
         setYamlText(formStateToYaml(next));
-        setPeopleYaml(peopleValueToYaml(next.people_raw));
         setOriginalName(result.data.name);
         setLoaded(true);
       });
@@ -142,8 +139,6 @@ const RuleBuilder: Component = () => {
       // but keep the merge pattern in place for future extensions.
       setState({ ...parsed.state, id: state().id ?? parsed.state.id });
       setUntouched(parsed.untouched);
-      setPeopleYaml(peopleValueToYaml(parsed.state.people_raw));
-      setPeopleError(null);
     });
   };
 
@@ -190,13 +185,22 @@ const RuleBuilder: Component = () => {
 
   const onTogglePeople = (enabled: boolean) =>
     mutateForm((s) => ({ ...s, people_enabled: enabled }));
-  const onPeopleTextareaInput = (text: string) => {
-    setPeopleYaml(text);
-    const { value, error: peErr } = peopleYamlToValue(text);
-    setPeopleError(peErr);
-    if (peErr !== null) return;
-    mutateForm((s) => ({ ...s, people_raw: value }));
-  };
+
+  const setPeopleField = (
+    key:
+      | "people_must_include"
+      | "people_must_include_any_of"
+      | "people_may_include"
+      | "people_must_exclude",
+    next: string[],
+  ) => mutateForm((s) => ({ ...s, [key]: next }));
+
+  const setPeopleBool = (
+    key:
+      | "people_must_exclude_other_identifiable"
+      | "people_no_unidentified_humans",
+    next: boolean,
+  ) => mutateForm((s) => ({ ...s, [key]: next }));
 
   const onToggleMedia = (enabled: boolean) =>
     mutateForm((s) => ({ ...s, media_enabled: enabled }));
@@ -554,22 +558,104 @@ const RuleBuilder: Component = () => {
                 Restrict by people
               </label>
               <Show when={state().people_enabled}>
-                <p class="mt-2 text-xs text-slate-500">
-                  The structured multi-select with thumbnails ships in the
-                  next iteration (M6-T6). For now, paste the{" "}
-                  <code>people:</code> YAML body directly.
-                </p>
-                <textarea
-                  value={peopleYaml()}
-                  onInput={(e) => onPeopleTextareaInput(e.currentTarget.value)}
-                  placeholder={"must_include: [paloma-id]\nmust_exclude_other_identifiable: true"}
-                  class="mt-2 block h-32 w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-xs leading-relaxed focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  spellcheck={false}
-                  aria-label="People predicate YAML"
-                />
-                <Show when={peopleError()}>
-                  <p class="mt-1 text-xs text-red-700">{peopleError()}</p>
-                </Show>
+                <PeopleProvider>
+                  <Show when={state().people_raw !== null}>
+                    <p
+                      class="mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800"
+                      role="status"
+                    >
+                      The <code>people:</code> block in the YAML uses an
+                      unrecognized shape and will be saved verbatim. Clear it
+                      via the Advanced YAML panel to use the multi-selects
+                      below.
+                    </p>
+                  </Show>
+                  <PeopleMultiSelect
+                    label="Must include all"
+                    description="Every selected person must appear on the asset."
+                    value={() => state().people_must_include}
+                    onChange={(next) =>
+                      setPeopleField("people_must_include", next)
+                    }
+                    disabled={state().people_raw !== null}
+                  />
+                  <PeopleMultiSelect
+                    label="Must include at least one of"
+                    description="The asset matches if any selected person appears."
+                    value={() => state().people_must_include_any_of}
+                    onChange={(next) =>
+                      setPeopleField("people_must_include_any_of", next)
+                    }
+                    disabled={state().people_raw !== null}
+                  />
+                  <PeopleMultiSelect
+                    label="May include"
+                    description="Allowed presence; does not affect whether the asset matches."
+                    value={() => state().people_may_include}
+                    onChange={(next) =>
+                      setPeopleField("people_may_include", next)
+                    }
+                    disabled={state().people_raw !== null}
+                  />
+                  <PeopleMultiSelect
+                    label="Must exclude"
+                    description="If any selected person is present, the asset is skipped."
+                    value={() => state().people_must_exclude}
+                    onChange={(next) =>
+                      setPeopleField("people_must_exclude", next)
+                    }
+                    disabled={state().people_raw !== null}
+                  />
+                  <div class="mt-4 space-y-2">
+                    <label class="flex items-start gap-2 text-sm text-slate-700">
+                      <input
+                        type="checkbox"
+                        class="mt-0.5"
+                        checked={
+                          state().people_must_exclude_other_identifiable
+                        }
+                        onChange={(e) =>
+                          setPeopleBool(
+                            "people_must_exclude_other_identifiable",
+                            e.currentTarget.checked,
+                          )
+                        }
+                        disabled={state().people_raw !== null}
+                        aria-label="Must exclude other identifiable people"
+                      />
+                      <span>
+                        Skip if any identified face isn&apos;t listed above
+                        <span class="block text-xs font-normal text-slate-500">
+                          Asset is skipped when Immich recognizes a face that
+                          isn&apos;t in the three include lists.
+                        </span>
+                      </span>
+                    </label>
+                    <label class="flex items-start gap-2 text-sm text-slate-700">
+                      <input
+                        type="checkbox"
+                        class="mt-0.5"
+                        checked={state().people_no_unidentified_humans}
+                        onChange={(e) =>
+                          setPeopleBool(
+                            "people_no_unidentified_humans",
+                            e.currentTarget.checked,
+                          )
+                        }
+                        disabled={state().people_raw !== null}
+                        aria-label="No unidentified humans"
+                      />
+                      <span>
+                        Skip if YOLO detects more humans than Immich identified
+                        faces
+                        <span class="block text-xs font-normal text-slate-500">
+                          Slower — downloads thumbnails and runs YOLO inference
+                          for assets that pass the other filters.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                </PeopleProvider>
               </Show>
             </fieldset>
 

@@ -7,8 +7,11 @@
 // (yet) render. The builder preserves those keys through the round-trip so
 // raw YAML edits are never silently dropped.
 //
-// People predicate is treated as raw passthrough in T5 (textarea fallback) —
-// T6 replaces this with a structured multi-select.
+// People predicate has structured fields backing four multi-selects and two
+// toggles (mirroring serde's `PeoplePredicate`). If the YAML's `match.people`
+// uses an unrecognized shape (e.g. a forward-compat sub-rule key), it falls
+// back to `people_raw` and round-trips verbatim — the structured controls
+// stay disabled until the user clears the raw block via Advanced YAML.
 
 import yaml from "js-yaml";
 
@@ -30,6 +33,16 @@ export interface RuleBuilderState {
   location_center: [number, number];
   location_radius_km: number;
   people_enabled: boolean;
+  // Structured sub-rules — mirror `PeoplePredicate` in engine/rule/schema.rs.
+  people_must_include: string[];
+  people_must_include_any_of: string[];
+  people_may_include: string[];
+  people_must_exclude: string[];
+  people_must_exclude_other_identifiable: boolean;
+  people_no_unidentified_humans: boolean;
+  // Raw passthrough — populated only when the parsed `match.people` has an
+  // unrecognized shape (e.g. a future key). When non-null, structured fields
+  // are ignored on emit and the raw value is round-tripped verbatim.
   people_raw: unknown;
   media_enabled: boolean;
   media_photo: boolean;
@@ -54,6 +67,12 @@ export function defaultBuilderState(): RuleBuilderState {
     location_center: [...DEFAULT_LOCATION_CENTER] as [number, number],
     location_radius_km: DEFAULT_LOCATION_RADIUS_KM,
     people_enabled: false,
+    people_must_include: [],
+    people_must_include_any_of: [],
+    people_may_include: [],
+    people_must_exclude: [],
+    people_must_exclude_other_identifiable: false,
+    people_no_unidentified_humans: false,
     people_raw: null,
     media_enabled: false,
     media_photo: true,
@@ -61,6 +80,31 @@ export function defaultBuilderState(): RuleBuilderState {
     untouched_top_level: {},
     untouched_match: {},
   };
+}
+
+// Keys recognized inside `match.people`. A YAML payload whose `people` block
+// uses only these keys parses into the structured fields above. Any other
+// key forces a fallback to `people_raw` so the round-trip stays lossless.
+const KNOWN_PEOPLE_KEYS = new Set([
+  "must_include",
+  "must_include_any_of",
+  "may_include",
+  "must_exclude",
+  "must_exclude_other_identifiable",
+  "no_unidentified_humans",
+]);
+
+function isRecognizedPeopleShape(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    if (!KNOWN_PEOPLE_KEYS.has(key)) return false;
+  }
+  return true;
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((x): x is string => typeof x === "string");
 }
 
 export interface YamlParseResult {
@@ -151,12 +195,36 @@ export function formStateToYaml(state: RuleBuilderState): string {
       radius_km: state.location_radius_km,
     };
   }
-  if (
-    state.people_enabled &&
-    state.people_raw !== null &&
-    state.people_raw !== undefined
-  ) {
-    match.people = state.people_raw;
+  if (state.people_enabled) {
+    if (state.people_raw !== null && state.people_raw !== undefined) {
+      // Unrecognized shape — round-trip verbatim.
+      match.people = state.people_raw;
+    } else {
+      // Structured emit. Mirrors serde's `skip_serializing_if = "Vec::is_empty"`
+      // / `is_false`: empty arrays and false booleans are omitted entirely so
+      // the wire shape matches what `serialize_rule` would produce on the
+      // Rust side after a round-trip through `parse_rule`.
+      const people: Record<string, unknown> = {};
+      if (state.people_must_include.length > 0) {
+        people.must_include = [...state.people_must_include];
+      }
+      if (state.people_must_include_any_of.length > 0) {
+        people.must_include_any_of = [...state.people_must_include_any_of];
+      }
+      if (state.people_may_include.length > 0) {
+        people.may_include = [...state.people_may_include];
+      }
+      if (state.people_must_exclude.length > 0) {
+        people.must_exclude = [...state.people_must_exclude];
+      }
+      if (state.people_must_exclude_other_identifiable) {
+        people.must_exclude_other_identifiable = true;
+      }
+      if (state.people_no_unidentified_humans) {
+        people.no_unidentified_humans = true;
+      }
+      match.people = people;
+    }
   }
   if (state.media_enabled && (state.media_photo || state.media_video)) {
     const types: string[] = [];
@@ -285,8 +353,24 @@ export function yamlToFormState(text: string): YamlParseResult {
 
     if (matchObj.people !== undefined && matchObj.people !== null) {
       state.people_enabled = true;
-      state.people_raw = matchObj.people;
-      untouched.push("match.people");
+      if (isRecognizedPeopleShape(matchObj.people)) {
+        const pObj = matchObj.people;
+        state.people_must_include = readStringArray(pObj.must_include);
+        state.people_must_include_any_of = readStringArray(
+          pObj.must_include_any_of,
+        );
+        state.people_may_include = readStringArray(pObj.may_include);
+        state.people_must_exclude = readStringArray(pObj.must_exclude);
+        state.people_must_exclude_other_identifiable =
+          pObj.must_exclude_other_identifiable === true;
+        state.people_no_unidentified_humans =
+          pObj.no_unidentified_humans === true;
+        state.people_raw = null;
+      } else {
+        // Unrecognized shape — preserve for round-trip and surface a warning.
+        state.people_raw = matchObj.people;
+        untouched.push("match.people");
+      }
     }
 
     const media = matchObj.media;
@@ -311,29 +395,3 @@ export function yamlToFormState(text: string): YamlParseResult {
   return { state, untouched, error: null };
 }
 
-// Round-trip helper for the people textarea fallback (T5 stub). Empty input
-// clears the people predicate; a parse failure surfaces an error string.
-export function peopleYamlToValue(text: string): {
-  value: unknown;
-  error: string | null;
-} {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return { value: null, error: null };
-  try {
-    const parsed = yaml.load(trimmed);
-    if (parsed === null || parsed === undefined) {
-      return { value: null, error: null };
-    }
-    return { value: parsed, error: null };
-  } catch (cause) {
-    return {
-      value: null,
-      error: cause instanceof Error ? cause.message : String(cause),
-    };
-  }
-}
-
-export function peopleValueToYaml(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  return yaml.dump(coerceDatesForDump(value), DUMP_OPTIONS);
-}

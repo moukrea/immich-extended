@@ -54,6 +54,21 @@ function albumsResponse() {
   ]);
 }
 
+function peopleResponse() {
+  return jsonResponse([
+    {
+      id: "alice",
+      name: "Alice",
+      thumbnail_url: "/api/v1/me/people/alice/thumbnail",
+    },
+    {
+      id: "bob",
+      name: "Bob",
+      thumbnail_url: "/api/v1/me/people/bob/thumbnail",
+    },
+  ]);
+}
+
 describe("RuleBuilder — visual ↔ YAML sync", () => {
   it("renders the empty form and seeds the YAML panel with defaults", async () => {
     fetchMock.mockResolvedValueOnce(albumsResponse());
@@ -205,6 +220,71 @@ describe("RuleBuilder — visual ↔ YAML sync", () => {
       type: "managed",
       name: "Saved album",
     });
+  });
+
+  it("selecting a person in the People multi-select reflects in match.people.must_include", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+    fetchMock.mockResolvedValueOnce(peopleResponse());
+
+    const { findByLabelText, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    await findByLabelText(/^Name$/);
+    const peopleToggle = getByLabelText(
+      "Enable people filter",
+    ) as HTMLInputElement;
+    fireEvent.click(peopleToggle);
+
+    const addAlice = await findByLabelText("Add Alice (Must include all)");
+    fireEvent.click(addAlice);
+
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+    const ta = getByLabelText("Rule YAML") as HTMLTextAreaElement;
+    const parsed = yaml.load(ta.value) as Record<string, unknown>;
+    const match = parsed.match as Record<string, unknown>;
+    const people = match.people as Record<string, unknown>;
+    expect(people.must_include).toEqual(["alice"]);
+  });
+
+  it("editing match.people.no_unidentified_humans in the YAML toggles the checkbox", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+    // Pre-register the people fetch so the PeopleProvider's mount-time fetch
+    // resolves cleanly when the YAML edit flips people_enabled to true.
+    fetchMock.mockResolvedValueOnce(peopleResponse());
+
+    const { findByRole, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    await findByRole("button", { name: /Advanced \(YAML\)/ });
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+
+    const ta = getByLabelText("Rule YAML") as HTMLTextAreaElement;
+    const newYaml = [
+      "name: NoStrangers",
+      "target_album:",
+      "  type: managed",
+      "  name: KnownFacesOnly",
+      "match:",
+      "  people:",
+      "    no_unidentified_humans: true",
+      "status: active",
+    ].join("\n");
+    fireEvent.input(ta, { target: { value: newYaml } });
+
+    const peopleToggle = getByLabelText(
+      "Enable people filter",
+    ) as HTMLInputElement;
+    expect(peopleToggle.checked).toBe(true);
+    const yoloToggle = getByLabelText(
+      "No unidentified humans",
+    ) as HTMLInputElement;
+    expect(yoloToggle.checked).toBe(true);
+    const otherToggle = getByLabelText(
+      "Must exclude other identifiable people",
+    ) as HTMLInputElement;
+    expect(otherToggle.checked).toBe(false);
   });
 
   it("surfaces a parse error when the YAML textarea contains invalid YAML", async () => {
