@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@solidjs/router": "0.14.10",
+    "maplibre-gl": "^5.24.0",
     "solid-js": "1.9.3"
   },
   "devDependencies": {
