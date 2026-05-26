@@ -1,19 +1,23 @@
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 
 use crate::error::YoloError;
 
-static SESSION: OnceLock<Session> = OnceLock::new();
+static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
 
-/// Loads `model_path` into a global `ort::Session` on first call; subsequent calls return
-/// the cached reference.
+/// Loads `model_path` into a global, mutex-guarded `ort::Session` on first call;
+/// subsequent calls return the same mutex.
 ///
-/// `intra_threads=1` because YOLOv11n inference is small enough that single-threaded execution
-/// is fine on consumer CPUs and we run rule cycles sequentially.
-pub fn session(model_path: &Path) -> Result<&'static Session, YoloError> {
+/// `ort::Session::run` requires `&mut self`. We serialize inference behind a `Mutex` so
+/// callers can share the loaded model without rebuilding it for every image. Rule cycles
+/// run sequentially today (per PRD §12), so the mutex never contends in practice.
+///
+/// `intra_threads=1` because YOLOv11n inference is light enough that single-threaded
+/// execution beats the per-call thread-pool spin-up cost on consumer CPUs.
+pub fn session(model_path: &Path) -> Result<&'static Mutex<Session>, YoloError> {
     if let Some(s) = SESSION.get() {
         return Ok(s);
     }
@@ -24,9 +28,9 @@ pub fn session(model_path: &Path) -> Result<&'static Session, YoloError> {
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(1)?
         .commit_from_file(model_path)?;
-    // `set` is only Err if SESSION was already initialised — race with a parallel call. In that
-    // case the existing one wins and we discard our build.
-    let _ = SESSION.set(built);
+    // `set` is `Err` only if SESSION was initialised by a parallel call; in that case the
+    // existing model wins and we discard our build.
+    let _ = SESSION.set(Mutex::new(built));
     SESSION.get().ok_or_else(|| {
         YoloError::Ort(ort::Error::new(
             "yolo: global Session not initialized after set",

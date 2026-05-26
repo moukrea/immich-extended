@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "rt"] }
 tracing = "0.1"
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 
 [lints]
