@@ -4,6 +4,7 @@ pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod me;
+pub mod setup;
 
 use std::sync::Arc;
 
@@ -55,7 +56,8 @@ pub fn router(state: AppState) -> Router {
 
     let api_v1 = Router::new()
         .nest("/auth", auth_routes)
-        .nest("/me", me::routes::router());
+        .nest("/me", me::routes::router())
+        .nest("/setup", setup::routes::router());
 
     Router::new()
         .route("/health", get(health))

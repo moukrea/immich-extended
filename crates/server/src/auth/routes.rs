@@ -158,7 +158,7 @@ fn internal_error() -> ErrorResponse {
     )
 }
 
-fn build_session_cookie(cfg: &SessionConfig, value: String) -> Cookie<'static> {
+pub(crate) fn build_session_cookie(cfg: &SessionConfig, value: String) -> Cookie<'static> {
     let mut builder = Cookie::build((cfg.cookie_name.clone(), value))
         .path("/")
         .http_only(true)

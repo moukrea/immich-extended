@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO immich_api_keys (user_id, base_url, ciphertext, nonce, immich_user_id, created_at, last_validated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "5abbee7cc0cacceadd38b2accecbbcf47d519f51180b579d628383c5878e9251"
+}
