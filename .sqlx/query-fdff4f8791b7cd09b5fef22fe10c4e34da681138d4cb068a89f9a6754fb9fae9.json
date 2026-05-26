@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO asset_yolo_cache (asset_id, person_count, model_version, evaluated_at) VALUES (?, ?, ?, ?) ON CONFLICT(asset_id) DO UPDATE SET person_count = excluded.person_count, model_version = excluded.model_version, evaluated_at = excluded.evaluated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "fdff4f8791b7cd09b5fef22fe10c4e34da681138d4cb068a89f9a6754fb9fae9"
+}
