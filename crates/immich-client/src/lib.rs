@@ -61,13 +61,21 @@ pub struct ImmichUserInfo {
     pub email: String,
 }
 
-/// One entry from `/api/people`. We only care about `id` + `name` for
-/// validation; the full Immich shape carries thumbnail, birthDate, etc.
+/// One entry from `/api/people`. We only care about `id`, `name`, and
+/// `thumbnail_path` (a server-relative path Immich uses to serve the face
+/// thumbnail). The full Immich shape carries birthDate, isHidden, etc. —
+/// we ignore them.
+///
+/// `thumbnail_path` is `Option<String>` rather than required because some
+/// older Immich versions omit it and the validator path that uses
+/// `ImmichPerson` (rule semantic check) doesn't care about thumbnails.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImmichPerson {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    #[serde(rename = "thumbnailPath", default)]
+    pub thumbnail_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +142,44 @@ impl From<RawAlbum> for ImmichAlbum {
 /// Album role indicating write access. Immich uses `"editor"` for editors
 /// and `"viewer"` for read-only collaborators; only the former is writable.
 const ALBUM_ROLE_EDITOR: &str = "editor";
+
+/// Summary shape for `GET /api/albums` — the fields the rule builder's
+/// target-album dropdown needs. `is_writable` is computed by the client (not
+/// returned by Immich directly): true iff the caller owns the album OR is
+/// listed in `albumUsers` with role `"editor"`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImmichAlbumSummary {
+    pub id: String,
+    pub name: String,
+    pub asset_count: u32,
+    pub is_writable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAlbumListItem {
+    id: String,
+    #[serde(rename = "albumName", default)]
+    album_name: String,
+    #[serde(rename = "ownerId")]
+    owner_id: String,
+    #[serde(rename = "albumUsers", default)]
+    album_users: Vec<RawAlbumUser>,
+    #[serde(rename = "assetCount", default)]
+    asset_count: u32,
+}
+
+/// Pure helper shared by [`ImmichClient::is_album_writable`] and the
+/// per-album writability derivation inside [`ImmichClient::list_albums`].
+/// Returns true iff `caller_user_id` is the owner OR an editor of `album`.
+pub fn is_album_writable_for(album: &ImmichAlbum, caller_user_id: &str) -> bool {
+    if album.owner_id == caller_user_id {
+        return true;
+    }
+    album
+        .album_users
+        .iter()
+        .any(|au| au.user_id == caller_user_id && au.role == ALBUM_ROLE_EDITOR)
+}
 
 /// Immich's asset `type` discriminator, normalized to the variants the engine
 /// reasons about. Any unknown string maps to [`ImmichAssetType::Other`] so a
@@ -444,14 +490,72 @@ impl ImmichClient {
         let Some(album) = self.get_album(api_key, album_id).await? else {
             return Ok(false);
         };
-        if album.owner_id == caller_immich_user_id {
-            return Ok(true);
+        Ok(is_album_writable_for(&album, caller_immich_user_id))
+    }
+
+    /// List the caller's visible albums (owned + shared). Returns a flat
+    /// `[ImmichAlbumSummary]` with the writability flag derived per-album
+    /// against `caller_immich_user_id`.
+    ///
+    /// Immich currently returns `/api/albums` as a bare array (no pagination
+    /// envelope). If a future Immich switches to paged responses, walk pages
+    /// the same way [`Self::list_people`] does.
+    ///
+    /// Errors mirror [`Self::list_people`]: 401/403 → `Unauthorized`, other
+    /// non-2xx → `Upstream`, transport → `Transport`, malformed body →
+    /// `BadResponse`.
+    pub async fn list_albums(
+        &self,
+        api_key: &str,
+        caller_immich_user_id: &str,
+    ) -> Result<Vec<ImmichAlbumSummary>, ValidationError> {
+        let url = self
+            .base_url
+            .join("api/albums")
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let resp = self
+            .http
+            .get(url)
+            .header("x-api-key", api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                return Err(ValidationError::Unauthorized(status));
+            }
+            return Err(ValidationError::Upstream { status });
         }
-        let editor = album
-            .album_users
-            .iter()
-            .any(|au| au.user_id == caller_immich_user_id && au.role == ALBUM_ROLE_EDITOR);
-        Ok(editor)
+        let raw: Vec<RawAlbumListItem> = resp
+            .json()
+            .await
+            .map_err(|e| ValidationError::BadResponse(e.to_string()))?;
+        let summaries = raw
+            .into_iter()
+            .map(|item| {
+                let album = ImmichAlbum {
+                    id: item.id.clone(),
+                    owner_id: item.owner_id.clone(),
+                    album_users: item
+                        .album_users
+                        .into_iter()
+                        .map(|au| AlbumUser {
+                            user_id: au.user.id,
+                            role: au.role,
+                        })
+                        .collect(),
+                };
+                let is_writable = is_album_writable_for(&album, caller_immich_user_id);
+                ImmichAlbumSummary {
+                    id: item.id,
+                    name: item.album_name,
+                    asset_count: item.asset_count,
+                    is_writable,
+                }
+            })
+            .collect();
+        Ok(summaries)
     }
 
     /// Page through `POST /api/search/metadata` collecting assets newer than
@@ -676,6 +780,40 @@ impl ImmichClient {
         Err(ValidationError::Upstream { status })
     }
 
+    /// Download a person's face thumbnail bytes. Used by the people-picker
+    /// proxy (M6-T4): the frontend never sees the Immich API key, so we
+    /// fetch and pass the bytes through with the right content type.
+    ///
+    /// Returns the raw response bytes on 200. Errors mirror
+    /// [`Self::download_thumbnail`]: 401/403 → `Unauthorized`, other non-2xx
+    /// → `Upstream`, transport → `Transport`.
+    pub async fn download_person_thumbnail(
+        &self,
+        api_key: &str,
+        person_id: &str,
+    ) -> Result<Vec<u8>, ValidationError> {
+        let path = format!("api/people/{person_id}/thumbnail");
+        let url = self
+            .base_url
+            .join(&path)
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let resp = self
+            .http
+            .get(url)
+            .header("x-api-key", api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            let bytes = resp.bytes().await?;
+            return Ok(bytes.to_vec());
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ValidationError::Unauthorized(status));
+        }
+        Err(ValidationError::Upstream { status })
+    }
+
     /// Exposed so tests can assert what base URL the client targets.
     pub fn base_url(&self) -> &Url {
         &self.base_url
@@ -738,6 +876,76 @@ mod tests {
         assert_eq!(asset.longitude, Some(2.35));
         assert_eq!(asset.people_ids, vec!["p1".to_string(), "p2".to_string()]);
         assert_eq!(asset.updated_at.to_rfc3339(), "2025-06-01T10:05:00+00:00",);
+    }
+
+    #[test]
+    fn is_album_writable_for_recognizes_owner() {
+        let album = ImmichAlbum {
+            id: "a1".into(),
+            owner_id: "user-1".into(),
+            album_users: vec![],
+        };
+        assert!(is_album_writable_for(&album, "user-1"));
+        assert!(!is_album_writable_for(&album, "user-2"));
+    }
+
+    #[test]
+    fn is_album_writable_for_recognizes_editor_role() {
+        let album = ImmichAlbum {
+            id: "a1".into(),
+            owner_id: "owner".into(),
+            album_users: vec![
+                AlbumUser {
+                    user_id: "editor".into(),
+                    role: "editor".into(),
+                },
+                AlbumUser {
+                    user_id: "viewer".into(),
+                    role: "viewer".into(),
+                },
+            ],
+        };
+        assert!(is_album_writable_for(&album, "editor"));
+        assert!(!is_album_writable_for(&album, "viewer"));
+        assert!(!is_album_writable_for(&album, "stranger"));
+    }
+
+    #[test]
+    fn immich_person_parses_thumbnail_path_optionally() {
+        let with_thumb: ImmichPerson = serde_json::from_value(serde_json::json!({
+            "id": "p1",
+            "name": "Alice",
+            "thumbnailPath": "/upload/p1.jpg",
+        }))
+        .unwrap();
+        assert_eq!(with_thumb.thumbnail_path.as_deref(), Some("/upload/p1.jpg"));
+
+        let without_thumb: ImmichPerson = serde_json::from_value(serde_json::json!({
+            "id": "p2",
+            "name": "Bob",
+        }))
+        .unwrap();
+        assert!(without_thumb.thumbnail_path.is_none());
+    }
+
+    #[test]
+    fn raw_album_list_item_parses_immich_shape() {
+        let item: RawAlbumListItem = serde_json::from_value(serde_json::json!({
+            "id": "alb-1",
+            "albumName": "Vacation",
+            "ownerId": "owner-1",
+            "albumUsers": [
+                {"user": {"id": "editor-1"}, "role": "editor"},
+                {"user": {"id": "viewer-1"}, "role": "viewer"}
+            ],
+            "assetCount": 42
+        }))
+        .unwrap();
+        assert_eq!(item.id, "alb-1");
+        assert_eq!(item.album_name, "Vacation");
+        assert_eq!(item.owner_id, "owner-1");
+        assert_eq!(item.asset_count, 42);
+        assert_eq!(item.album_users.len(), 2);
     }
 
     #[test]

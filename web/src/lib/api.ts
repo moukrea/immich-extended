@@ -224,3 +224,26 @@ export function fetchDecisions(
   }`;
   return request<DecisionsResponse>(path, { method: "GET" });
 }
+
+export interface MePerson {
+  id: string;
+  name: string;
+  /// Server-relative URL. The browser includes the session cookie
+  /// automatically, so no extra wiring is needed at the call site.
+  thumbnail_url: string;
+}
+
+export interface MeAlbum {
+  id: string;
+  name: string;
+  asset_count: number;
+  is_writable: boolean;
+}
+
+export function fetchPeople(): Promise<ApiResult<MePerson[]>> {
+  return request<MePerson[]>("/api/v1/me/people", { method: "GET" });
+}
+
+export function fetchAlbums(): Promise<ApiResult<MeAlbum[]>> {
+  return request<MeAlbum[]>("/api/v1/me/albums", { method: "GET" });
+}

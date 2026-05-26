@@ -3,4 +3,5 @@
 //! linking, etc.) will live here too.
 
 pub mod immich_key;
+pub mod immich_proxy;
 pub mod routes;
