@@ -20,7 +20,7 @@ use axum::{
 use common::crypto::MasterKey;
 use common::db;
 use http_body_util::BodyExt;
-use server::{config::SessionConfig, AppState};
+use server::{config::SessionConfig, engine_scheduler::Scheduler, AppState};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -31,7 +31,7 @@ async fn test_state() -> AppState {
     let pool = db::open_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     AppState {
-        db: pool,
+        db: pool.clone(),
         session: SessionConfig {
             cookie_name: "iext_session_dev".to_string(),
             cookie_secure: false,
@@ -39,6 +39,7 @@ async fn test_state() -> AppState {
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: std::sync::Arc::new(None),
         resolver: std::sync::Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
+        scheduler: std::sync::Arc::new(Scheduler::for_tests(pool)),
     }
 }
 

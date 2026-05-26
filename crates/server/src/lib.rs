@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod engine_scheduler;
 pub mod me;
 pub mod rules;
 pub mod setup;
@@ -17,6 +18,7 @@ use axum::{extract::State, middleware, routing::get, Json, Router};
 use common::crypto::MasterKey;
 use config::SessionConfig;
 use engine::rule::RuleResourceResolver;
+use engine_scheduler::Scheduler;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
@@ -43,6 +45,12 @@ pub struct AppState {
     /// validator. Production wires this to an Immich-backed implementation
     /// (M2-T5); tests inject `engine::rule::testing::FakeResourceResolver`.
     pub resolver: Arc<dyn RuleResourceResolver>,
+    /// Owns the per-rule poll tasks. CRUD handlers call
+    /// `scheduler.on_rule_changed(id)` after each write so create / pause /
+    /// resume / delete take effect immediately rather than waiting for the
+    /// next boot. Hand-rolled `Debug` because `Scheduler` holds an opaque
+    /// `RunCycleFn` closure (no `Debug` impl).
+    pub scheduler: Arc<Scheduler>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -53,6 +61,7 @@ impl std::fmt::Debug for AppState {
             .field("master_key", &self.master_key)
             .field("oidc", &self.oidc)
             .field("resolver", &"Arc<dyn RuleResourceResolver>")
+            .field("scheduler", &"Arc<Scheduler>")
             .finish()
     }
 }

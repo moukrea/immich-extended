@@ -44,6 +44,7 @@ use rsa::{pkcs8::EncodePrivateKey, traits::PublicKeyParts, RsaPrivateKey, RsaPub
 use server::{
     auth::oidc::OidcClient,
     config::{OidcConfig, SessionConfig},
+    engine_scheduler::Scheduler,
     AppState,
 };
 use sqlx::SqlitePool;
@@ -219,6 +220,7 @@ async fn fresh_state_with_oidc(issuer: &str) -> (AppState, SqlitePool) {
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: Arc::new(Some(client)),
         resolver: Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
+        scheduler: Arc::new(Scheduler::for_tests(pool.clone())),
     };
     (state, pool)
 }

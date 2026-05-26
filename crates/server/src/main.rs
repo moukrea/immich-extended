@@ -12,16 +12,19 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use common::db;
+use immich_client::ImmichClient;
 use server::{
     admin::{create_user, CreateUserError},
     auth::oidc::OidcClient,
     config::Config,
+    engine_scheduler::Scheduler,
     rules::resolver::ImmichResourceResolver,
     AppState,
 };
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use url::Url;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -133,6 +136,20 @@ async fn run_serve(cfg: Config) -> Result<()> {
         }
     };
 
+    // The scheduler holds a default `ImmichClient` to keep the call-site
+    // forward-compatible with M3-T4 (which will use it to run the real
+    // poll cycle). v0 per-user requests still build their own client from
+    // the URL stored in `immich_api_keys.base_url`, so the URL given here
+    // is a placeholder that the default tick stub never dereferences.
+    let placeholder_immich = Arc::new(ImmichClient::new(
+        Url::parse("http://immich.invalid/").context("parsing placeholder Immich URL")?,
+    ));
+    let scheduler = Arc::new(Scheduler::new(
+        pool.clone(),
+        placeholder_immich,
+        cfg.master_key.clone(),
+    ));
+
     let state = AppState {
         db: pool.clone(),
         session: cfg.session.clone(),
@@ -142,7 +159,15 @@ async fn run_serve(cfg: Config) -> Result<()> {
             db: pool.clone(),
             master_key: cfg.master_key.clone(),
         }),
+        scheduler: scheduler.clone(),
     };
+
+    scheduler
+        .clone()
+        .start()
+        .await
+        .context("starting per-rule scheduler")?;
+
     let app = server::router(state, cfg.web_dist_dir.clone());
 
     let listener = TcpListener::bind(cfg.http_bind)
@@ -159,6 +184,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
         .await
         .context("axum::serve terminated with an error")?;
 
+    scheduler.stop().await;
     info!("immich-extended stopped");
     pool.close().await;
     Ok(())

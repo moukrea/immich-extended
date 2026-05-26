@@ -154,6 +154,13 @@ pub(super) async fn create_rule(
         internal_error()
     })?;
 
+    // Scheduler reconciliation runs after the DB write succeeds. Log + swallow
+    // scheduler errors so the API contract stays "the rule is created" — a
+    // hiccup on the in-process scheduler must not turn a 201 into a 500.
+    if let Err(err) = state.scheduler.on_rule_changed(&id).await {
+        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after create failed");
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(RuleSummary {
@@ -343,6 +350,10 @@ pub(super) async fn update_rule(
             internal_error()
         })?;
 
+        if let Err(err) = state.scheduler.on_rule_changed(&id).await {
+            tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after patch failed");
+        }
+
         return Ok(Json(RuleSummary {
             id,
             name: rule.name,
@@ -387,6 +398,10 @@ pub(super) async fn update_rule(
         internal_error()
     })?;
 
+    if let Err(err) = state.scheduler.on_rule_changed(&id).await {
+        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after status patch failed");
+    }
+
     Ok(Json(RuleSummary {
         id,
         name: row.name,
@@ -418,6 +433,11 @@ pub(super) async fn delete_rule(
         tracing::warn!(error = %err, "failed to delete rule");
         internal_error()
     })?;
+
+    if let Err(err) = state.scheduler.on_rule_changed(&id).await {
+        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after delete failed");
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
