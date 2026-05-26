@@ -227,14 +227,22 @@ async fn cycle_body(
     // Album push happens *after* the decisions transaction has committed —
     // see the module-level docs for why this ordering matters on crash.
     // Managed-target rules carry an empty `target_album_id` until the
-    // engine creates the album (deferred to a later task); skip the PUT in
-    // that case so M3-T4 stays focused on the "existing target_album" path.
-    if !to_add_to_album.is_empty() && !rule.target_album_id.is_empty() {
-        client
-            .add_assets_to_album(&key.api_key, &rule.target_album_id, &to_add_to_album)
-            .await
-            .map_err(immich_error)?;
-    }
+    // engine creates the album (deferred to a later task); the helper
+    // short-circuits to a no-op in that case.
+    let pushed = crate::album_sync::idempotent_album_add(
+        &client,
+        &key.api_key,
+        &rule.target_album_id,
+        &to_add_to_album,
+    )
+    .await
+    .map_err(immich_error)?;
+    tracing::debug!(
+        rule_id,
+        candidates = to_add_to_album.len(),
+        pushed,
+        "album sync diff applied",
+    );
 
     let watermark_epoch = watermark.map(|w| w.timestamp());
     update_watermark_and_last_run(pool, rule_id, watermark_epoch, now_unix_seconds()).await?;

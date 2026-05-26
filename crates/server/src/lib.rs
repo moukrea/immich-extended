@@ -1,6 +1,7 @@
 //! HTTP server, configuration, and wiring of the engine + clients into axum routes.
 
 pub mod admin;
+pub mod album_sync;
 pub mod auth;
 pub mod config;
 pub mod engine_cycle;
