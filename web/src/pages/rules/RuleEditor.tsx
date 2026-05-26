@@ -11,6 +11,7 @@ import {
 import { A, useNavigate, useParams } from "@solidjs/router";
 import {
   createRule,
+  deleteRule,
   getRule,
   postLogout,
   updateRule,
@@ -22,9 +23,12 @@ import {
   readLocation,
   writeLocation,
 } from "../../lib/yamlLocation";
+import ConfirmDialog from "../../components/ConfirmDialog";
 import { humanRuleError } from "./errors";
 
 const MapPicker = lazy(() => import("../../components/MapPicker"));
+
+type PendingLifecycle = "archive" | "delete";
 
 const PLACEHOLDER_YAML = `# Paste a rule definition. Example:
 name: Vacation 2024
@@ -47,9 +51,11 @@ const RuleEditor: Component = () => {
   const [status, setStatus] = createSignal<RuleStatus>("active");
   const [error, setError] = createSignal<string | null>(null);
   const [saving, setSaving] = createSignal(false);
+  const [lifecycleBusy, setLifecycleBusy] = createSignal(false);
   const [loaded, setLoaded] = createSignal(untrack(() => mode() === "new"));
   const [originalName, setOriginalName] = createSignal<string | null>(null);
   const [showMap, setShowMap] = createSignal(false);
+  const [pending, setPending] = createSignal<PendingLifecycle | null>(null);
 
   const pickerLocation = createMemo(
     () => readLocation(yamlSource()) ?? DEFAULT_LOCATION,
@@ -94,6 +100,58 @@ const RuleEditor: Component = () => {
   const onLogout = async () => {
     await postLogout();
     navigate("/login", { replace: true });
+  };
+
+  const applyStatus = async (next: RuleStatus) => {
+    const id = params.id;
+    if (!id) return;
+    setLifecycleBusy(true);
+    setError(null);
+    const result = await updateRule(id, { status: next });
+    setLifecycleBusy(false);
+    if (!result.ok) {
+      if (result.status === 401) {
+        navigate("/login", { replace: true });
+        return;
+      }
+      setError(humanRuleError(result.error));
+      return;
+    }
+    setStatus(next);
+  };
+
+  const onTogglePause = () => {
+    const next: RuleStatus = status() === "paused" ? "active" : "paused";
+    void applyStatus(next);
+  };
+
+  const onArchive = () => setPending("archive");
+  const onDelete = () => setPending("delete");
+  const onCancelPending = () => setPending(null);
+
+  const onConfirmPending = async () => {
+    const action = pending();
+    if (!action) return;
+    setPending(null);
+    if (action === "archive") {
+      await applyStatus("archived");
+      return;
+    }
+    const id = params.id;
+    if (!id) return;
+    setLifecycleBusy(true);
+    setError(null);
+    const result = await deleteRule(id);
+    setLifecycleBusy(false);
+    if (!result.ok) {
+      if (result.status === 401) {
+        navigate("/login", { replace: true });
+        return;
+      }
+      setError(humanRuleError(result.error));
+      return;
+    }
+    navigate("/rules", { replace: true });
   };
 
   const onSubmit = async (event: SubmitEvent) => {
@@ -261,6 +319,36 @@ const RuleEditor: Component = () => {
                   <option value="archived">archived</option>
                 </select>
               </div>
+
+              <div class="flex flex-wrap items-center gap-2 border-t border-slate-200 pt-4">
+                <span class="text-sm font-medium text-slate-700">Actions:</span>
+                <Show when={status() !== "archived"}>
+                  <button
+                    type="button"
+                    disabled={lifecycleBusy()}
+                    onClick={onTogglePause}
+                    class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+                  >
+                    {status() === "paused" ? "Resume" : "Pause"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={lifecycleBusy()}
+                    onClick={onArchive}
+                    class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+                  >
+                    Archive
+                  </button>
+                </Show>
+                <button
+                  type="button"
+                  disabled={lifecycleBusy()}
+                  onClick={onDelete}
+                  class="rounded-md border border-red-300 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-60"
+                >
+                  Delete
+                </button>
+              </div>
             </Show>
 
             <Show when={error()}>
@@ -290,6 +378,24 @@ const RuleEditor: Component = () => {
           </form>
         </Show>
       </section>
+
+      <ConfirmDialog
+        open={pending() === "archive"}
+        title="Archive rule"
+        message={`Archive "${originalName() ?? "this rule"}"? It will stop running until you reactivate it.`}
+        confirmLabel="Archive"
+        onConfirm={onConfirmPending}
+        onCancel={onCancelPending}
+      />
+      <ConfirmDialog
+        open={pending() === "delete"}
+        title="Delete rule"
+        message={`Delete "${originalName() ?? "this rule"}"? Decisions and run history will be removed. This cannot be undone.`}
+        confirmLabel="Delete"
+        destructive
+        onConfirm={onConfirmPending}
+        onCancel={onCancelPending}
+      />
     </main>
   );
 };

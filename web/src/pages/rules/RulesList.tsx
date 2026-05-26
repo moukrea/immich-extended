@@ -10,15 +10,22 @@ import {
   deleteRule,
   listRules,
   postLogout,
+  updateRule,
   type RuleStatus,
   type RuleSummary,
 } from "../../lib/api";
+import ConfirmDialog from "../../components/ConfirmDialog";
 import { humanRuleError } from "./errors";
+
+type PendingAction =
+  | { kind: "archive"; rule: RuleSummary }
+  | { kind: "delete"; rule: RuleSummary };
 
 const RulesList: Component = () => {
   const navigate = useNavigate();
   const [error, setError] = createSignal<string | null>(null);
   const [busyId, setBusyId] = createSignal<string | null>(null);
+  const [pending, setPending] = createSignal<PendingAction | null>(null);
 
   const [rulesResource, { refetch }] = createResource<RuleSummary[] | null>(
     async () => {
@@ -41,11 +48,46 @@ const RulesList: Component = () => {
     navigate("/login", { replace: true });
   };
 
-  const onDelete = async (rule: RuleSummary) => {
-    const confirmed = window.confirm(
-      `Delete rule "${rule.name}"? This cannot be undone.`,
-    );
-    if (!confirmed) return;
+  const setStatus = async (rule: RuleSummary, status: RuleStatus) => {
+    setBusyId(rule.id);
+    setError(null);
+    const result = await updateRule(rule.id, { status });
+    setBusyId(null);
+    if (!result.ok) {
+      if (result.status === 401) {
+        navigate("/login", { replace: true });
+        return;
+      }
+      setError(humanRuleError(result.error));
+      return;
+    }
+    await refetch();
+  };
+
+  const onTogglePause = (rule: RuleSummary) => {
+    const next: RuleStatus = rule.status === "paused" ? "active" : "paused";
+    void setStatus(rule, next);
+  };
+
+  const onArchiveClick = (rule: RuleSummary) => {
+    setPending({ kind: "archive", rule });
+  };
+
+  const onDeleteClick = (rule: RuleSummary) => {
+    setPending({ kind: "delete", rule });
+  };
+
+  const onCancelPending = () => setPending(null);
+
+  const onConfirmPending = async () => {
+    const action = pending();
+    if (!action) return;
+    setPending(null);
+    if (action.kind === "archive") {
+      await setStatus(action.rule, "archived");
+      return;
+    }
+    const rule = action.rule;
     setBusyId(rule.id);
     setError(null);
     const result = await deleteRule(rule.id);
@@ -117,43 +159,88 @@ const RulesList: Component = () => {
           >
             <ul class="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white shadow-sm">
               <For each={rulesResource() ?? []}>
-                {(rule) => (
-                  <li class="flex items-center justify-between gap-4 px-4 py-3">
-                    <div class="min-w-0 flex-1">
-                      <p class="truncate text-sm font-medium text-slate-900">
-                        {rule.name}
-                      </p>
-                      <p class="mt-0.5 text-xs text-slate-500">
-                        {rule.target_album_strategy === "managed"
-                          ? "Managed album"
-                          : "Existing album"}{" "}
-                        · updated {formatTimestamp(rule.updated_at)}
-                      </p>
-                    </div>
-                    <StatusBadge status={rule.status} />
-                    <div class="flex items-center gap-2">
-                      <A
-                        href={`/rules/${rule.id}`}
-                        class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                      >
-                        Edit
-                      </A>
-                      <button
-                        type="button"
-                        disabled={busyId() === rule.id}
-                        onClick={() => onDelete(rule)}
-                        class="rounded-md border border-red-300 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-60"
-                      >
-                        {busyId() === rule.id ? "Deleting…" : "Delete"}
-                      </button>
-                    </div>
-                  </li>
-                )}
+                {(rule) => {
+                  const isBusy = () => busyId() === rule.id;
+                  const dimmed = () => rule.status === "archived";
+                  const pauseLabel = () =>
+                    rule.status === "paused" ? "Resume" : "Pause";
+                  return (
+                    <li
+                      class="flex items-center justify-between gap-4 px-4 py-3"
+                      classList={{ "opacity-60": dimmed() }}
+                    >
+                      <div class="min-w-0 flex-1">
+                        <p class="truncate text-sm font-medium text-slate-900">
+                          {rule.name}
+                        </p>
+                        <p class="mt-0.5 text-xs text-slate-500">
+                          {rule.target_album_strategy === "managed"
+                            ? "Managed album"
+                            : "Existing album"}{" "}
+                          · updated {formatTimestamp(rule.updated_at)}
+                        </p>
+                      </div>
+                      <StatusBadge status={rule.status} />
+                      <div class="flex items-center gap-2">
+                        <A
+                          href={`/rules/${rule.id}`}
+                          class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                        >
+                          Edit
+                        </A>
+                        <Show when={rule.status !== "archived"}>
+                          <button
+                            type="button"
+                            disabled={isBusy()}
+                            onClick={() => onTogglePause(rule)}
+                            class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+                          >
+                            {pauseLabel()}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isBusy()}
+                            onClick={() => onArchiveClick(rule)}
+                            class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+                          >
+                            Archive
+                          </button>
+                        </Show>
+                        <button
+                          type="button"
+                          disabled={isBusy()}
+                          onClick={() => onDeleteClick(rule)}
+                          class="rounded-md border border-red-300 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-60"
+                        >
+                          {isBusy() ? "Working…" : "Delete"}
+                        </button>
+                      </div>
+                    </li>
+                  );
+                }}
               </For>
             </ul>
           </Show>
         </Show>
       </section>
+
+      <ConfirmDialog
+        open={pending()?.kind === "archive"}
+        title="Archive rule"
+        message={`Archive "${pending()?.rule.name ?? ""}"? It will stop running until you reactivate it.`}
+        confirmLabel="Archive"
+        onConfirm={onConfirmPending}
+        onCancel={onCancelPending}
+      />
+      <ConfirmDialog
+        open={pending()?.kind === "delete"}
+        title="Delete rule"
+        message={`Delete "${pending()?.rule.name ?? ""}"? Decisions and run history will be removed. This cannot be undone.`}
+        confirmLabel="Delete"
+        destructive
+        onConfirm={onConfirmPending}
+        onCancel={onCancelPending}
+      />
     </main>
   );
 };
