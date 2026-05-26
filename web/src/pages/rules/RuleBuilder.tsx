@@ -39,6 +39,26 @@ const MapPicker = lazy(() => import("../../components/MapPicker"));
 const MANAGED_OPTION_VALUE = "__managed__";
 type PendingLifecycle = "archive" | "delete";
 
+// Read a Blob/File as a UTF-8 string. Uses FileReader instead of `Blob.text()`
+// because jsdom (the test environment) does not implement the latter even in
+// its current release.
+function readFileAsText(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result === "string") {
+        resolve(result);
+      } else {
+        reject(new Error("FileReader returned a non-string result"));
+      }
+    };
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("Unknown FileReader error"));
+    reader.readAsText(file);
+  });
+}
+
 function deriveStateFromRule(rule: Rule): RuleBuilderState {
   const parsed = yamlToFormState(rule.yaml_source);
   // Server-side status is the lifecycle-button authoritative source; pin it
@@ -67,6 +87,10 @@ const RuleBuilder: Component = () => {
   const [error, setError] = createSignal<string | null>(null);
   const [originalName, setOriginalName] = createSignal<string | null>(null);
   const [loaded, setLoaded] = createSignal(untrack(() => mode() === "new"));
+  const [copyStatus, setCopyStatus] = createSignal<"idle" | "copied" | "error">(
+    "idle",
+  );
+  let fileInputRef: HTMLInputElement | undefined;
 
   const [albumsResource] = createResource<MeAlbum[]>(async () => {
     const result = await fetchAlbums();
@@ -233,6 +257,79 @@ const RuleBuilder: Component = () => {
     if (t.kind !== "existing") return false;
     return !writableAlbums().some((a) => a.id === t.album_id);
   });
+
+  const exportSlug = createMemo(() => {
+    const trimmed = state().name.trim().toLowerCase();
+    const slug = trimmed
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return slug.length > 0 ? slug : "rule";
+  });
+
+  const exportHref = createMemo(
+    () => `data:text/yaml;charset=utf-8,${encodeURIComponent(yamlText())}`,
+  );
+  const exportFilename = createMemo(() => `rule-${exportSlug()}.yaml`);
+
+  const copyButtonLabel = createMemo(() => {
+    const s = copyStatus();
+    if (s === "copied") return "Copied!";
+    if (s === "error") return "Copy failed";
+    return "Copy YAML";
+  });
+
+  const onCopyYaml = async () => {
+    const text = yamlText();
+    try {
+      const clip = navigator.clipboard;
+      if (!clip || typeof clip.writeText !== "function") {
+        throw new Error("Clipboard API unavailable");
+      }
+      await clip.writeText(text);
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("error");
+    }
+    setTimeout(() => setCopyStatus("idle"), 1500);
+  };
+
+  const onImportClick = () => {
+    if (!fileInputRef) return;
+    // Reset so picking the same file twice in a row still fires `change`.
+    fileInputRef.value = "";
+    fileInputRef.click();
+  };
+
+  const onImportFile = async (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+
+    let text: string;
+    try {
+      text = await readFileAsText(file);
+    } catch (cause) {
+      setError(
+        `Failed to read file: ${
+          cause instanceof Error ? cause.message : String(cause)
+        }`,
+      );
+      return;
+    }
+
+    const isDirty =
+      mode() === "edit" || state().name.trim().length > 0;
+    if (isDirty && typeof window.confirm === "function") {
+      const ok = window.confirm(
+        "Replace the current rule with the imported YAML?",
+      );
+      if (!ok) return;
+    }
+
+    setShowAdvanced(true);
+    onYamlInput(text);
+  };
 
   const onLogout = async () => {
     await postLogout();
@@ -708,10 +805,48 @@ const RuleBuilder: Component = () => {
               </button>
               <Show when={showAdvanced()}>
                 <div id="rule-yaml-panel" class="border-t border-slate-200 p-4">
-                  <p class="text-xs text-slate-500">
-                    The YAML below is the live serialization of the form. Edits
-                    here re-populate the visual fields when the YAML parses.
-                  </p>
+                  <div class="flex flex-wrap items-start justify-between gap-3">
+                    <p class="text-xs text-slate-500 max-w-md">
+                      The YAML below is the live serialization of the form.
+                      Edits here re-populate the visual fields when the YAML
+                      parses.
+                    </p>
+                    <div class="flex flex-wrap items-center gap-2">
+                      <a
+                        href={exportHref()}
+                        download={exportFilename()}
+                        class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                        aria-label="Export YAML as file"
+                      >
+                        Export
+                      </a>
+                      <button
+                        type="button"
+                        onClick={onCopyYaml}
+                        class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                        aria-label="Copy YAML to clipboard"
+                      >
+                        {copyButtonLabel()}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onImportClick}
+                        class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                        aria-label="Import YAML from file"
+                      >
+                        Import
+                      </button>
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept=".yaml,.yml,application/x-yaml,text/yaml,text/plain"
+                        class="sr-only"
+                        onChange={onImportFile}
+                        aria-label="Import YAML file"
+                        tabindex="-1"
+                      />
+                    </div>
+                  </div>
                   <textarea
                     id="rule-yaml"
                     value={yamlText()}

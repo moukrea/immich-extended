@@ -304,4 +304,90 @@ describe("RuleBuilder — visual ↔ YAML sync", () => {
     const errorPanel = ta.parentElement!.querySelector("p.text-red-700");
     expect(errorPanel).toBeTruthy();
   });
+
+  it("Export link encodes the current YAML and uses a name-derived filename", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByLabelText, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    const nameInput = (await findByLabelText(/^Name$/)) as HTMLInputElement;
+    fireEvent.input(nameInput, { target: { value: "Paris — Juillet 2024" } });
+    const managedName = getByLabelText(
+      "Managed album name",
+    ) as HTMLInputElement;
+    fireEvent.input(managedName, { target: { value: "Paris" } });
+
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+    const exportLink = getByRole("link", {
+      name: /Export YAML as file/,
+    }) as HTMLAnchorElement;
+    expect(exportLink.getAttribute("download")).toBe("rule-paris-juillet-2024.yaml");
+    const href = exportLink.getAttribute("href") ?? "";
+    expect(href.startsWith("data:text/yaml;charset=utf-8,")).toBe(true);
+    const encoded = href.slice("data:text/yaml;charset=utf-8,".length);
+    const decoded = decodeURIComponent(encoded);
+    const parsed = yaml.load(decoded) as Record<string, unknown>;
+    expect(parsed.name).toBe("Paris — Juillet 2024");
+    expect(parsed.target_album).toEqual({ type: "managed", name: "Paris" });
+  });
+
+  it("importing a YAML file replaces the form state", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByRole, getByLabelText, getByRole, container } = render(() => (
+      <RuleBuilder />
+    ));
+
+    await findByRole("button", { name: /Advanced \(YAML\)/ });
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+
+    const yamlContent = [
+      "name: Imported via file",
+      "target_album:",
+      "  type: managed",
+      "  name: Imported album",
+      "match:",
+      "  media:",
+      "    types: [video]",
+      "status: active",
+    ].join("\n");
+
+    const file = new File([yamlContent], "test-rule.yaml", {
+      type: "text/yaml",
+    });
+    const fileInput = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    // jsdom's HTMLInputElement.files property is read-only via the setter, so
+    // the standard `fireEvent.change(input, { target: { files }})` no-ops the
+    // assignment. Override the property descriptor directly, then dispatch
+    // a bubbling `change` so Solid's delegated handler picks it up.
+    Object.defineProperty(fileInput, "files", {
+      configurable: true,
+      value: [file],
+    });
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    // `file.text()` resolves on a microtask; the YAML applies after that.
+    await vi.waitFor(() => {
+      const nameInput = getByLabelText(/^Name$/) as HTMLInputElement;
+      expect(nameInput.value).toBe("Imported via file");
+    });
+
+    const managedName = getByLabelText(
+      "Managed album name",
+    ) as HTMLInputElement;
+    expect(managedName.value).toBe("Imported album");
+    const mediaToggle = getByLabelText(
+      "Enable media filter",
+    ) as HTMLInputElement;
+    expect(mediaToggle.checked).toBe(true);
+    const videoBox = getByLabelText("Video media type") as HTMLInputElement;
+    expect(videoBox.checked).toBe(true);
+    const photoBox = getByLabelText("Photo media type") as HTMLInputElement;
+    expect(photoBox.checked).toBe(false);
+  });
 });

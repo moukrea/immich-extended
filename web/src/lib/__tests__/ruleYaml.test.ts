@@ -387,3 +387,94 @@ describe("ruleYaml — round trip", () => {
     expectSemanticallyEqual(yamlIn, out);
   });
 });
+
+// PRD §6 Appendix A — every advertised example must survive a builder
+// round-trip with structural equality. These three examples are what users
+// will paste into the Advanced YAML panel; losing keys or reshaping nested
+// blocks would silently corrupt their rules.
+describe("ruleYaml — PRD §6 Appendix A round-trips", () => {
+  it("'Famille — restreint' (people predicate with includes + toggles)", () => {
+    const yamlIn = [
+      'name: "Famille — restreint"',
+      "target_album:",
+      "  type: managed",
+      '  name: "Paloma — Famille proche"',
+      "match:",
+      "  people:",
+      "    must_include: [paloma-id]",
+      "    may_include: [manon-id, emeric-id]",
+      "    must_exclude_other_identifiable: true",
+      "    no_unidentified_humans: true",
+      "status: active",
+    ].join("\n");
+    const result = yamlToFormState(yamlIn);
+    expect(result.error).toBeNull();
+    expect(result.state.people_raw).toBeNull();
+    expect(result.state.people_must_include).toEqual(["paloma-id"]);
+    expect(result.state.people_may_include).toEqual([
+      "manon-id",
+      "emeric-id",
+    ]);
+    expect(result.state.people_must_exclude_other_identifiable).toBe(true);
+    expect(result.state.people_no_unidentified_humans).toBe(true);
+    const out = formStateToYaml(result.state);
+    expectSemanticallyEqual(yamlIn, out);
+  });
+
+  it("'Paris — juillet 2024' (existing album + date + location)", () => {
+    // PRD §6 uses +02:00 offsets to express the user's intent ("local Paris
+    // time"); the builder's <input type="date"> widget only carries day
+    // precision and normalizes to UTC midnight bounds, so the round-trip
+    // canonicalizes to the Z form. The structural shape (date/location/album)
+    // is what matters for the import path.
+    const yamlIn = [
+      'name: "Paris — juillet 2024"',
+      "target_album:",
+      "  type: existing",
+      "  album_id: paris-album-uuid",
+      "match:",
+      "  date:",
+      "    from: 2024-07-15T00:00:00Z",
+      "    to:   2024-07-22T23:59:59Z",
+      "  location:",
+      "    center: [48.8566, 2.3522]",
+      "    radius_km: 60",
+      "status: active",
+    ].join("\n");
+    const result = yamlToFormState(yamlIn);
+    expect(result.error).toBeNull();
+    expect(result.state.target).toEqual({
+      kind: "existing",
+      album_id: "paris-album-uuid",
+    });
+    expect(result.state.date_enabled).toBe(true);
+    expect(result.state.date_from).toBe("2024-07-15");
+    expect(result.state.date_to).toBe("2024-07-22");
+    expect(result.state.location_enabled).toBe(true);
+    expect(result.state.location_center).toEqual([48.8566, 2.3522]);
+    expect(result.state.location_radius_km).toBe(60);
+    const out = formStateToYaml(result.state);
+    expectSemanticallyEqual(yamlIn, out);
+  });
+
+  it("'Enfants ensemble' (must_include of multiple ids + exclude flag)", () => {
+    const yamlIn = [
+      'name: "Enfants ensemble"',
+      "target_album:",
+      "  type: managed",
+      '  name: "Les enfants"',
+      "match:",
+      "  people:",
+      "    must_include: [kid1-id, kid2-id]",
+      "    must_exclude_other_identifiable: true",
+      "status: active",
+    ].join("\n");
+    const result = yamlToFormState(yamlIn);
+    expect(result.error).toBeNull();
+    expect(result.state.people_must_include).toEqual(["kid1-id", "kid2-id"]);
+    expect(result.state.people_must_exclude_other_identifiable).toBe(true);
+    expect(result.state.people_no_unidentified_humans).toBe(false);
+    const out = formStateToYaml(result.state);
+    expectSemanticallyEqual(yamlIn, out);
+  });
+});
