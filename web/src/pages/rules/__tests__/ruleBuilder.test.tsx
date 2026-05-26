@@ -1,0 +1,227 @@
+// @vitest-environment jsdom
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, fireEvent } from "@solidjs/testing-library";
+import yaml from "js-yaml";
+
+vi.mock("@solidjs/router", () => {
+  return {
+    A: (props: { href: string; children: unknown; class?: string }) => (
+      <a href={props.href} class={props.class}>
+        {props.children as never}
+      </a>
+    ),
+    useNavigate: () => () => {},
+    useParams: () => ({}),
+  };
+});
+
+import RuleBuilder from "../RuleBuilder";
+
+const fetchMock = vi.fn();
+
+beforeEach(() => {
+  fetchMock.mockReset();
+  vi.stubGlobal("fetch", fetchMock);
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function albumsResponse() {
+  return jsonResponse([
+    {
+      id: "album-a",
+      name: "Beach trip",
+      asset_count: 42,
+      is_writable: true,
+    },
+    {
+      id: "album-b",
+      name: "Read only",
+      asset_count: 7,
+      is_writable: false,
+    },
+  ]);
+}
+
+describe("RuleBuilder — visual ↔ YAML sync", () => {
+  it("renders the empty form and seeds the YAML panel with defaults", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByLabelText, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    const nameInput = await findByLabelText(/^Name$/);
+    expect(nameInput).toBeTruthy();
+
+    const advancedToggle = getByRole("button", {
+      name: /Advanced \(YAML\)/,
+    });
+    fireEvent.click(advancedToggle);
+
+    const ta = getByLabelText("Rule YAML") as HTMLTextAreaElement;
+    const parsed = yaml.load(ta.value) as Record<string, unknown>;
+    expect(parsed.name).toBe("");
+    expect(parsed.target_album).toEqual({ type: "managed", name: "" });
+    expect(parsed.status).toBe("active");
+    expect("match" in parsed).toBe(false);
+  });
+
+  it("typing in the Name field reflects in the YAML panel", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByLabelText, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    const nameInput = (await findByLabelText(/^Name$/)) as HTMLInputElement;
+    fireEvent.input(nameInput, { target: { value: "Lunar vacation" } });
+
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+    const ta = getByLabelText("Rule YAML") as HTMLTextAreaElement;
+    const parsed = yaml.load(ta.value) as Record<string, unknown>;
+    expect(parsed.name).toBe("Lunar vacation");
+  });
+
+  it("editing the YAML textarea repopulates the form fields", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByRole, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    await findByRole("button", { name: /Advanced \(YAML\)/ });
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+
+    const ta = getByLabelText("Rule YAML") as HTMLTextAreaElement;
+    const newYaml = [
+      "name: Imported via YAML",
+      "target_album:",
+      "  type: managed",
+      "  name: Imported album",
+      "match:",
+      "  media:",
+      "    types: [photo]",
+      "status: active",
+    ].join("\n");
+    fireEvent.input(ta, { target: { value: newYaml } });
+
+    const nameInput = getByLabelText(/^Name$/) as HTMLInputElement;
+    expect(nameInput.value).toBe("Imported via YAML");
+    const managedName = getByLabelText(
+      "Managed album name",
+    ) as HTMLInputElement;
+    expect(managedName.value).toBe("Imported album");
+    const mediaToggle = getByLabelText(
+      "Enable media filter",
+    ) as HTMLInputElement;
+    expect(mediaToggle.checked).toBe(true);
+    const photoBox = getByLabelText("Photo media type") as HTMLInputElement;
+    expect(photoBox.checked).toBe(true);
+    const videoBox = getByLabelText("Video media type") as HTMLInputElement;
+    expect(videoBox.checked).toBe(false);
+  });
+
+  it("toggling the date filter writes match.date into the YAML", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByLabelText, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    const nameInput = (await findByLabelText(/^Name$/)) as HTMLInputElement;
+    fireEvent.input(nameInput, { target: { value: "Spring" } });
+
+    const dateToggle = getByLabelText(
+      "Enable date filter",
+    ) as HTMLInputElement;
+    fireEvent.click(dateToggle);
+
+    const fromInput = getByLabelText(/^From$/) as HTMLInputElement;
+    fireEvent.input(fromInput, { target: { value: "2024-03-01" } });
+    const toInput = getByLabelText(/^To$/) as HTMLInputElement;
+    fireEvent.input(toInput, { target: { value: "2024-05-31" } });
+
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+    const ta = getByLabelText("Rule YAML") as HTMLTextAreaElement;
+    const parsed = yaml.load(ta.value) as Record<string, unknown>;
+    const match = parsed.match as Record<string, unknown>;
+    const date = match.date as Record<string, unknown>;
+    const from = date.from instanceof Date ? date.from.toISOString() : String(date.from);
+    const to = date.to instanceof Date ? date.to.toISOString() : String(date.to);
+    expect(from.startsWith("2024-03-01T00:00:00")).toBe(true);
+    expect(to.startsWith("2024-05-31T23:59:59")).toBe(true);
+  });
+
+  it("clicking Save POSTs the current YAML to /api/v1/rules", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: "new-rule-id",
+        name: "Saved rule",
+        status: "active",
+        target_album_strategy: "managed",
+        updated_at: 1747000000,
+      }),
+    );
+
+    const { findByLabelText, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    const nameInput = (await findByLabelText(/^Name$/)) as HTMLInputElement;
+    fireEvent.input(nameInput, { target: { value: "Saved rule" } });
+    const managedName = getByLabelText(
+      "Managed album name",
+    ) as HTMLInputElement;
+    fireEvent.input(managedName, { target: { value: "Saved album" } });
+
+    const saveButton = getByRole("button", { name: /^Save$/ });
+    fireEvent.click(saveButton);
+
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+    const [, saveCall] = fetchMock.mock.calls;
+    expect(String(saveCall![0])).toBe("/api/v1/rules");
+    const init = saveCall![1] as RequestInit;
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(String(init.body)) as { yaml_source: string };
+    expect(body.yaml_source).toBeTruthy();
+    const parsed = yaml.load(body.yaml_source) as Record<string, unknown>;
+    expect(parsed.name).toBe("Saved rule");
+    expect(parsed.target_album).toEqual({
+      type: "managed",
+      name: "Saved album",
+    });
+  });
+
+  it("surfaces a parse error when the YAML textarea contains invalid YAML", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByRole, getByLabelText, getByRole, getByText } = render(() => (
+      <RuleBuilder />
+    ));
+
+    await findByRole("button", { name: /Advanced \(YAML\)/ });
+    fireEvent.click(getByRole("button", { name: /Advanced \(YAML\)/ }));
+
+    const ta = getByLabelText("Rule YAML") as HTMLTextAreaElement;
+    fireEvent.input(ta, { target: { value: "name: [\nbroken-yaml" } });
+
+    expect(getByText(/^Save$/).hasAttribute("disabled")).toBe(true);
+    const errorPanel = ta.parentElement!.querySelector("p.text-red-700");
+    expect(errorPanel).toBeTruthy();
+  });
+});

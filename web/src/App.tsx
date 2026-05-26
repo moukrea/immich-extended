@@ -14,7 +14,7 @@ import Login from "./pages/Login";
 import Setup from "./pages/Setup";
 import Dashboard from "./pages/Dashboard";
 import RulesList from "./pages/rules/RulesList";
-import RuleEditor from "./pages/rules/RuleEditor";
+import RuleBuilder from "./pages/rules/RuleBuilder";
 import RuleDecisions from "./pages/rules/RuleDecisions";
 
 interface BootstrapValue {
@@ -85,8 +85,8 @@ const App: Component = () => (
     <Route path="/setup" component={Setup} />
     <Route path="/" component={Dashboard} />
     <Route path="/rules" component={RulesList} />
-    <Route path="/rules/new" component={RuleEditor} />
-    <Route path="/rules/:id" component={RuleEditor} />
+    <Route path="/rules/new" component={RuleBuilder} />
+    <Route path="/rules/:id" component={RuleBuilder} />
     <Route path="/rules/:id/decisions" component={RuleDecisions} />
     <Route path="*" component={NotFound} />
   </Router>

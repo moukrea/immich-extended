@@ -12,11 +12,13 @@
   },
   "dependencies": {
     "@solidjs/router": "0.14.10",
+    "js-yaml": "^4.1.1",
     "maplibre-gl": "^5.24.0",
     "solid-js": "1.9.3"
   },
   "devDependencies": {
     "@solidjs/testing-library": "0.8.10",
+    "@types/js-yaml": "^4.0.9",
     "@typescript-eslint/eslint-plugin": "7.18.0",
     "@typescript-eslint/parser": "7.18.0",
     "autoprefixer": "10.4.20",
