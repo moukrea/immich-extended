@@ -268,6 +268,162 @@ mod tests {
         assert_eq!(admin_flag, 0, "default is_admin should be 0");
     }
 
+    #[derive(sqlx::FromRow, Debug)]
+    struct PragmaIndex {
+        #[sqlx(rename = "seq")]
+        _seq: i64,
+        name: String,
+        #[sqlx(rename = "unique")]
+        _unique: i64,
+        #[sqlx(rename = "origin")]
+        _origin: String,
+        #[sqlx(rename = "partial")]
+        _partial: i64,
+    }
+
+    #[tokio::test]
+    async fn migrations_create_rules() {
+        let pool = fresh_pool().await;
+        let cols = columns(&pool, "rules").await;
+        for c in [
+            "id",
+            "owner_user_id",
+            "name",
+            "yaml_source",
+            "parsed_predicates",
+            "target_album_id",
+            "target_album_strategy",
+            "status",
+            "poll_interval_seconds",
+            "last_run_at",
+            "last_processed_asset_timestamp",
+            "created_at",
+            "updated_at",
+        ] {
+            assert_has(&cols, c);
+        }
+
+        let id = cols.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id.pk, 1, "'id' should be PRIMARY KEY");
+        assert_eq!(
+            id.notnull, 1,
+            "'id' should be NOT NULL (explicit, to avoid the SELECT id AS \"id!\" cast hack)"
+        );
+
+        for required_notnull in [
+            "owner_user_id",
+            "name",
+            "yaml_source",
+            "parsed_predicates",
+            "target_album_id",
+            "target_album_strategy",
+            "status",
+            "poll_interval_seconds",
+            "created_at",
+            "updated_at",
+        ] {
+            let col = cols.iter().find(|c| c.name == required_notnull).unwrap();
+            assert_eq!(col.notnull, 1, "'{required_notnull}' should be NOT NULL");
+        }
+
+        for nullable in ["last_run_at", "last_processed_asset_timestamp"] {
+            let col = cols.iter().find(|c| c.name == nullable).unwrap();
+            assert_eq!(col.notnull, 0, "'{nullable}' should be NULL-able");
+        }
+
+        let status = cols.iter().find(|c| c.name == "status").unwrap();
+        assert_eq!(
+            status._dflt.as_deref(),
+            Some("'active'"),
+            "'status' should default to 'active'"
+        );
+        let poll = cols
+            .iter()
+            .find(|c| c.name == "poll_interval_seconds")
+            .unwrap();
+        assert_eq!(
+            poll._dflt.as_deref(),
+            Some("300"),
+            "'poll_interval_seconds' should default to 300"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrations_create_rules_indexes() {
+        let pool = fresh_pool().await;
+        let indexes: Vec<PragmaIndex> = sqlx::query_as("PRAGMA index_list('rules')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let names: Vec<&str> = indexes.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            names.contains(&"rules_owner_user_id_idx"),
+            "missing rules_owner_user_id_idx: {names:?}"
+        );
+        assert!(
+            names.contains(&"rules_status_idx"),
+            "missing rules_status_idx: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_fk_cascades_on_user_delete() {
+        let pool = fresh_pool().await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)")
+            .bind("u-rule-owner")
+            .bind("rule-owner@example.com")
+            .bind(Option::<String>::None)
+            .bind(0_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO rules (\
+                id, owner_user_id, name, yaml_source, parsed_predicates, \
+                target_album_id, target_album_strategy, status, \
+                poll_interval_seconds, created_at, updated_at\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("rule-1")
+        .bind("u-rule-owner")
+        .bind("Paris 2024")
+        .bind("name: Paris 2024\nmatch:\n  date:\n    from: 2024-01-01\n")
+        .bind("{}")
+        .bind("")
+        .bind("managed")
+        .bind("active")
+        .bind(300_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rules WHERE owner_user_id = ?")
+            .bind("u-rule-owner")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, 1, "row should exist before user delete");
+
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind("u-rule-owner")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rules WHERE owner_user_id = ?")
+            .bind("u-rule-owner")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, 0, "rule row should cascade-delete with the user");
+    }
+
     #[tokio::test]
     async fn local_credentials_fk_cascades_on_user_delete() {
         let pool = fresh_pool().await;
