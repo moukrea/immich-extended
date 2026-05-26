@@ -26,10 +26,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
+use common::decisions::{count_decisions_for_rule, list_decisions_for_rule, DecisionsError};
 use engine::rule::{
     parse_rule, validate_rule, ParseError, RuleStatus, TargetAlbum, ValidationError,
 };
@@ -439,6 +440,117 @@ pub(super) async fn delete_rule(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DecisionsQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionItem {
+    pub asset_id: String,
+    pub decision: String,
+    pub reason: String,
+    pub run_id: Option<String>,
+    pub decided_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionsResponse {
+    pub decisions: Vec<DecisionItem>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+const DECISIONS_DEFAULT_LIMIT: i64 = 25;
+const DECISIONS_MAX_LIMIT: i64 = 100;
+
+/// `GET /api/v1/rules/:id/decisions?limit=&offset=` — paginated decisions.
+///
+/// Owner-scoped: returns 404 (matching the `get_rule` convention) when the
+/// rule does not exist for the caller. `limit` defaults to 25 and is capped
+/// at 100; `offset` defaults to 0. Rejecting an out-of-range `limit` with a
+/// 400 + `limit_too_large` slug mirrors the `empty_patch` convention so the
+/// frontend can map errors the same way.
+pub(super) async fn list_rule_decisions(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Path(id): Path<String>,
+    Query(params): Query<DecisionsQuery>,
+) -> Result<Json<DecisionsResponse>, ErrorResponse> {
+    let limit = params.limit.unwrap_or(DECISIONS_DEFAULT_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+    if !(1..=DECISIONS_MAX_LIMIT).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "limit_too_large",
+                "detail": format!(
+                    "limit must be between 1 and {DECISIONS_MAX_LIMIT}, got {limit}",
+                ),
+                "max": DECISIONS_MAX_LIMIT,
+            })),
+        ));
+    }
+    if offset < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_offset",
+                "detail": "offset must be >= 0",
+            })),
+        ));
+    }
+
+    let exists = sqlx::query!(
+        "SELECT id FROM rules WHERE id = ? AND owner_user_id = ?",
+        id,
+        uid,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to verify rule ownership for decisions");
+        internal_error()
+    })?;
+    if exists.is_none() {
+        return Err(not_found());
+    }
+
+    let rows = list_decisions_for_rule(&state.db, &id, limit, offset)
+        .await
+        .map_err(decisions_error_response)?;
+    let total = count_decisions_for_rule(&state.db, &id)
+        .await
+        .map_err(decisions_error_response)?;
+
+    let decisions = rows
+        .into_iter()
+        .map(|r| DecisionItem {
+            asset_id: r.asset_id,
+            decision: r.decision,
+            reason: r.reason,
+            run_id: r.run_id,
+            decided_at: r.decided_at,
+        })
+        .collect();
+
+    Ok(Json(DecisionsResponse {
+        decisions,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+fn decisions_error_response(err: DecisionsError) -> ErrorResponse {
+    tracing::warn!(error = %err, "decisions query failed");
+    internal_error()
 }
 
 fn parse_error_response(err: ParseError) -> ErrorResponse {

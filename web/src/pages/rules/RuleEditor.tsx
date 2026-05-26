@@ -161,13 +161,23 @@ const RuleEditor: Component = () => {
             </A>
             <h1 class="text-lg font-semibold text-slate-900">{heading()}</h1>
           </div>
-          <button
-            type="button"
-            onClick={onLogout}
-            class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
-          >
-            Sign out
-          </button>
+          <div class="flex items-center gap-2">
+            <Show when={mode() === "edit" && params.id}>
+              <A
+                href={`/rules/${params.id}/decisions`}
+                class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+              >
+                Decisions
+              </A>
+            </Show>
+            <button
+              type="button"
+              onClick={onLogout}
+              class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </header>
 

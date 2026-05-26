@@ -106,6 +106,26 @@ pub async fn list_decisions_for_rule(
         .collect())
 }
 
+/// Count `asset_decisions` rows attached to `rule_id`.
+///
+/// Used by the decisions browser page to render "page X of Y" without
+/// re-walking the paginated list. A separate query (rather than tacking a
+/// COUNT onto the existing list query) keeps the offline `.sqlx/` cache
+/// entries readable and lets the frontend treat the total as a stable
+/// metadata field independent of pagination parameters.
+pub async fn count_decisions_for_rule(
+    pool: &SqlitePool,
+    rule_id: &str,
+) -> Result<i64, DecisionsError> {
+    let total = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM asset_decisions WHERE rule_id = ?",
+        rule_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(total)
+}
+
 /// Open a fresh run row; counters start at zero, `finished_at` stays NULL.
 pub async fn insert_run(
     pool: &SqlitePool,
@@ -311,6 +331,37 @@ mod tests {
         let rows = list_decisions_for_rule(&pool, "r1", 2, 2).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].asset_id, "a");
+    }
+
+    #[tokio::test]
+    async fn count_decisions_for_rule_counts_only_target_rule() {
+        let pool = fresh_pool().await;
+        seed_user_and_rule(&pool, "u1", "r1").await;
+        seed_user_and_rule(&pool, "u2", "r2").await;
+
+        assert_eq!(count_decisions_for_rule(&pool, "r1").await.unwrap(), 0);
+
+        upsert_decision(&pool, "r1", "a", "added", "matched", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(count_decisions_for_rule(&pool, "r1").await.unwrap(), 1);
+
+        for (asset, ts) in [("b", 200_i64), ("c", 300), ("d", 400)] {
+            upsert_decision(&pool, "r1", asset, "skipped", "date_out_of_range", None, ts)
+                .await
+                .unwrap();
+        }
+        upsert_decision(&pool, "r2", "a", "added", "matched", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(count_decisions_for_rule(&pool, "r1").await.unwrap(), 4);
+        assert_eq!(count_decisions_for_rule(&pool, "r2").await.unwrap(), 1);
+        assert_eq!(
+            count_decisions_for_rule(&pool, "nonexistent")
+                .await
+                .unwrap(),
+            0,
+        );
     }
 
     #[tokio::test]

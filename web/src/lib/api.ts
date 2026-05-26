@@ -186,3 +186,37 @@ export function deleteRule(id: string): Promise<ApiResult<void>> {
     method: "DELETE",
   });
 }
+
+export interface DecisionItem {
+  asset_id: string;
+  decision: "added" | "skipped";
+  reason: string;
+  run_id: string | null;
+  decided_at: number;
+}
+
+export interface DecisionsResponse {
+  decisions: DecisionItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface FetchDecisionsParams {
+  limit?: number;
+  offset?: number;
+}
+
+export function fetchDecisions(
+  ruleId: string,
+  params: FetchDecisionsParams = {},
+): Promise<ApiResult<DecisionsResponse>> {
+  const search = new URLSearchParams();
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+  if (params.offset !== undefined) search.set("offset", String(params.offset));
+  const qs = search.toString();
+  const path = `/api/v1/rules/${encodeURIComponent(ruleId)}/decisions${
+    qs ? `?${qs}` : ""
+  }`;
+  return request<DecisionsResponse>(path, { method: "GET" });
+}
