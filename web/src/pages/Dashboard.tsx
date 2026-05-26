@@ -1,5 +1,5 @@
 import { createResource, Show, type Component } from "solid-js";
-import { useNavigate } from "@solidjs/router";
+import { A, useNavigate } from "@solidjs/router";
 import { getMe, postLogout } from "../lib/api";
 
 const Dashboard: Component = () => {
@@ -35,7 +35,7 @@ const Dashboard: Component = () => {
         </div>
       </header>
 
-      <section class="max-w-5xl mx-auto px-4 py-8">
+      <section class="max-w-5xl mx-auto px-4 py-8 space-y-6">
         <Show when={me()} fallback={<p class="text-slate-500">Loading…</p>}>
           {(user) => (
             <p class="text-slate-700">
@@ -50,6 +50,22 @@ const Dashboard: Component = () => {
             </p>
           )}
         </Show>
+
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <A
+            href="/rules"
+            class="block rounded-lg border border-slate-200 bg-white p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition-shadow"
+          >
+            <h2 class="text-base font-semibold text-slate-900">Rules</h2>
+            <p class="mt-1 text-sm text-slate-500">
+              Author and manage automation rules that decide which assets land
+              in which Immich albums.
+            </p>
+            <span class="mt-3 inline-block text-sm font-medium text-indigo-600">
+              Open rules →
+            </span>
+          </A>
+        </div>
       </section>
     </main>
   );

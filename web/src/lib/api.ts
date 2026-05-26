@@ -120,3 +120,69 @@ export function postSetupInitial(
     body: JSON.stringify(payload),
   });
 }
+
+export type RuleStatus = "active" | "paused" | "archived";
+export type TargetAlbumStrategy = "existing" | "managed";
+
+export interface RuleSummary {
+  id: string;
+  name: string;
+  status: RuleStatus;
+  target_album_strategy: TargetAlbumStrategy;
+  updated_at: number;
+}
+
+export interface ListRulesResponse {
+  rules: RuleSummary[];
+}
+
+export interface Rule {
+  id: string;
+  name: string;
+  yaml_source: string;
+  status: RuleStatus;
+  target_album_strategy: TargetAlbumStrategy;
+  target_album_id: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export function listRules(): Promise<ApiResult<ListRulesResponse>> {
+  return request<ListRulesResponse>("/api/v1/rules", { method: "GET" });
+}
+
+export function getRule(id: string): Promise<ApiResult<Rule>> {
+  return request<Rule>(`/api/v1/rules/${encodeURIComponent(id)}`, {
+    method: "GET",
+  });
+}
+
+export function createRule(
+  yaml_source: string,
+): Promise<ApiResult<RuleSummary>> {
+  return request<RuleSummary>("/api/v1/rules", {
+    method: "POST",
+    body: JSON.stringify({ yaml_source }),
+  });
+}
+
+export interface UpdateRulePayload {
+  yaml_source?: string;
+  status?: RuleStatus;
+}
+
+export function updateRule(
+  id: string,
+  payload: UpdateRulePayload,
+): Promise<ApiResult<RuleSummary>> {
+  return request<RuleSummary>(`/api/v1/rules/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteRule(id: string): Promise<ApiResult<void>> {
+  return request<void>(`/api/v1/rules/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}

@@ -9,10 +9,12 @@ import {
   type JSX,
 } from "solid-js";
 import { getMe, getSetupState, type SetupState } from "./lib/api";
-import { decideInitialRoute } from "./lib/route";
+import { decideBootstrapNavigation } from "./lib/route";
 import Login from "./pages/Login";
 import Setup from "./pages/Setup";
 import Dashboard from "./pages/Dashboard";
+import RulesList from "./pages/rules/RulesList";
+import RuleEditor from "./pages/rules/RuleEditor";
 
 interface BootstrapValue {
   setupState: Accessor<SetupState | null>;
@@ -40,11 +42,12 @@ const Bootstrap: Component<{ children: JSX.Element }> = (props) => {
       : { needs_setup: false, oidc_enabled: false };
     const authed = meRes.ok;
     setSetupState(state);
-    const target = decideInitialRoute(
+    const target = decideBootstrapNavigation(
       { needs_setup: state.needs_setup },
       { authed },
+      window.location.pathname,
     );
-    if (window.location.pathname !== target) {
+    if (target !== null) {
       navigate(target, { replace: true });
     }
     setReady(true);
@@ -80,6 +83,9 @@ const App: Component = () => (
     <Route path="/login" component={LoginRoute} />
     <Route path="/setup" component={Setup} />
     <Route path="/" component={Dashboard} />
+    <Route path="/rules" component={RulesList} />
+    <Route path="/rules/new" component={RuleEditor} />
+    <Route path="/rules/:id" component={RuleEditor} />
     <Route path="*" component={NotFound} />
   </Router>
 );

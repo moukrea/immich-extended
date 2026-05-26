@@ -27,3 +27,25 @@ export function decideInitialRoute(
   }
   return "/login";
 }
+
+/**
+ * Path-aware bootstrap nav: returns the path to redirect to, or `null` to stay
+ * put. Lets authenticated users deep-link to inner pages (e.g. `/rules`) on
+ * page load instead of being bounced to `/`.
+ */
+export function decideBootstrapNavigation(
+  state: SetupStateForRoute,
+  me: MeForRoute,
+  currentPath: string,
+): string | null {
+  if (state.needs_setup) {
+    return currentPath === "/setup" ? null : "/setup";
+  }
+  if (!me.authed) {
+    return currentPath === "/login" ? null : "/login";
+  }
+  if (currentPath === "/login" || currentPath === "/setup") {
+    return "/";
+  }
+  return null;
+}
