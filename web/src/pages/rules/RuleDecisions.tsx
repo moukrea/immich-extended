@@ -1,4 +1,5 @@
 import {
+  createMemo,
   createResource,
   createSignal,
   For,
@@ -12,18 +13,33 @@ import {
   type DecisionItem,
   type DecisionsResponse,
 } from "../../lib/api";
+import { DECISION_REASONS, reasonLabel } from "../../lib/decisionReasons";
 import { humanRuleError } from "./errors";
+
+const PAGE_SIZE = 25;
 
 const RuleDecisions: Component = () => {
   const navigate = useNavigate();
   const params = useParams<{ id: string }>();
   const [error, setError] = createSignal<string | null>(null);
+  const [page, setPage] = createSignal(1);
+  const [reasons, setReasons] = createSignal<string[]>([]);
 
-  const [data] = createResource<DecisionsResponse | null, string>(
-    () => params.id,
-    async (id) => {
+  // SolidJS resources refetch whenever any signal read in the source closure
+  // changes; reading id / page / reasons here makes pagination + filter live.
+  const [data] = createResource<DecisionsResponse | null, {
+    id: string;
+    page: number;
+    reasons: string[];
+  }>(
+    () => ({ id: params.id, page: page(), reasons: reasons() }),
+    async ({ id, page: p, reasons: rs }) => {
       setError(null);
-      const result = await fetchDecisions(id, { limit: 25, offset: 0 });
+      const result = await fetchDecisions(id, {
+        limit: PAGE_SIZE,
+        offset: (p - 1) * PAGE_SIZE,
+        reasons: rs,
+      });
       if (!result.ok) {
         if (result.status === 401) {
           navigate("/login", { replace: true });
@@ -40,9 +56,39 @@ const RuleDecisions: Component = () => {
     },
   );
 
+  const totalPages = createMemo(() => {
+    const d = data();
+    if (!d || d.total <= 0) return 1;
+    return Math.max(1, Math.ceil(d.total / PAGE_SIZE));
+  });
+
   const onLogout = async () => {
     await postLogout();
     navigate("/login", { replace: true });
+  };
+
+  const onPrev = () => {
+    setPage((p) => Math.max(1, p - 1));
+  };
+  const onNext = () => {
+    setPage((p) => Math.min(totalPages(), p + 1));
+  };
+
+  const onToggleReason = (slug: string, checked: boolean) => {
+    setPage(1);
+    setReasons((prev) => {
+      const set = new Set(prev);
+      if (checked) set.add(slug);
+      else set.delete(slug);
+      // Preserve canonical ordering (matches DECISION_REASONS) so URLs are
+      // stable regardless of click sequence.
+      return DECISION_REASONS.filter((r) => set.has(r));
+    });
+  };
+
+  const onClearReasons = () => {
+    setPage(1);
+    setReasons([]);
   };
 
   return (
@@ -78,6 +124,38 @@ const RuleDecisions: Component = () => {
           </div>
         </Show>
 
+        <fieldset class="mb-4 rounded-md border border-slate-200 bg-white p-3 shadow-sm">
+          <legend class="px-1 text-xs font-medium uppercase tracking-wide text-slate-500">
+            Filter by reason
+          </legend>
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+            <For each={DECISION_REASONS}>
+              {(slug) => (
+                <label class="inline-flex items-center gap-1.5 text-slate-700">
+                  <input
+                    type="checkbox"
+                    class="rounded border-slate-300 text-slate-900 focus:ring-slate-500"
+                    checked={reasons().includes(slug)}
+                    onChange={(e) =>
+                      onToggleReason(slug, e.currentTarget.checked)
+                    }
+                  />
+                  <span>{reasonLabel(slug)}</span>
+                </label>
+              )}
+            </For>
+            <Show when={reasons().length > 0}>
+              <button
+                type="button"
+                onClick={onClearReasons}
+                class="ml-auto text-xs text-slate-500 underline hover:text-slate-700"
+              >
+                Clear
+              </button>
+            </Show>
+          </div>
+        </fieldset>
+
         <Show
           when={!data.loading}
           fallback={<p class="text-slate-500">Loading decisions…</p>}
@@ -88,13 +166,15 @@ const RuleDecisions: Component = () => {
                 when={d().decisions.length > 0}
                 fallback={
                   <p class="text-slate-500">
-                    No decisions recorded yet. They will appear here after
-                    the rule's next poll cycle.
+                    {reasons().length > 0
+                      ? "No decisions match the current filter."
+                      : "No decisions recorded yet. They will appear here after the rule's next poll cycle."}
                   </p>
                 }
               >
                 <p class="mb-3 text-sm text-slate-600">
-                  Showing {d().decisions.length} of {d().total} decisions.
+                  Showing {d().decisions.length} of {d().total} decisions
+                  {reasons().length > 0 ? " (filtered)" : ""}.
                 </p>
                 <div class="overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm">
                   <table class="min-w-full divide-y divide-slate-200 text-sm">
@@ -121,6 +201,30 @@ const RuleDecisions: Component = () => {
                     </tbody>
                   </table>
                 </div>
+                <nav
+                  class="mt-4 flex items-center justify-between text-sm"
+                  aria-label="Decisions pagination"
+                >
+                  <button
+                    type="button"
+                    onClick={onPrev}
+                    disabled={page() <= 1}
+                    class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    ← Previous
+                  </button>
+                  <span class="text-slate-600" aria-live="polite">
+                    Page {page()} of {totalPages()}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onNext}
+                    disabled={page() >= totalPages()}
+                    class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Next →
+                  </button>
+                </nav>
               </Show>
             )}
           </Show>

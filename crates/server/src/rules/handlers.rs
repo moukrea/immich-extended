@@ -30,7 +30,9 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use common::decisions::{count_decisions_for_rule, list_decisions_for_rule, DecisionsError};
+use common::decisions::{
+    count_decisions_for_rule_filtered, list_decisions_for_rule_filtered, DecisionsError,
+};
 use engine::rule::{
     parse_rule, validate_rule, ParseError, RuleStatus, TargetAlbum, ValidationError,
 };
@@ -448,6 +450,10 @@ pub struct DecisionsQuery {
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
+    /// Comma-separated list of reason slugs (e.g. `?reason=matched,date_out_of_range`).
+    /// Empty / missing means no filter. Whitespace / empty tokens are dropped.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -522,10 +528,21 @@ pub(super) async fn list_rule_decisions(
         return Err(not_found());
     }
 
-    let rows = list_decisions_for_rule(&state.db, &id, limit, offset)
+    let reasons: Vec<&str> = params
+        .reason
+        .as_deref()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rows = list_decisions_for_rule_filtered(&state.db, &id, &reasons, limit, offset)
         .await
         .map_err(decisions_error_response)?;
-    let total = count_decisions_for_rule(&state.db, &id)
+    let total = count_decisions_for_rule_filtered(&state.db, &id, &reasons)
         .await
         .map_err(decisions_error_response)?;
 

@@ -5,7 +5,7 @@
 //! the queries up; richer logic (transactional batching, retention, etc.)
 //! lives in the engine/server crates that call these.
 
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,7 +15,7 @@ pub enum DecisionsError {
 }
 
 /// One row in `asset_decisions` as returned to callers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct DecisionRow {
     pub rule_id: String,
     pub asset_id: String,
@@ -123,6 +123,68 @@ pub async fn count_decisions_for_rule(
     )
     .fetch_one(pool)
     .await?;
+    Ok(total)
+}
+
+/// Same as [`list_decisions_for_rule`], but additionally filters by `reasons`.
+///
+/// An empty `reasons` slice delegates to the unfiltered helper so the offline
+/// `.sqlx/` cache still covers the common path. The non-empty branch builds a
+/// dynamic `IN (?, ?, …)` clause via [`sqlx::QueryBuilder`], which does NOT go
+/// through the offline cache (the macro can't validate a variable-length IN
+/// list). The frontend caps the reason filter at the known slug set so the
+/// query length stays bounded.
+pub async fn list_decisions_for_rule_filtered(
+    pool: &SqlitePool,
+    rule_id: &str,
+    reasons: &[&str],
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<DecisionRow>, DecisionsError> {
+    if reasons.is_empty() {
+        return list_decisions_for_rule(pool, rule_id, limit, offset).await;
+    }
+    let mut q: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT rule_id, asset_id, decision, reason, run_id, decided_at \
+         FROM asset_decisions \
+         WHERE rule_id = ",
+    );
+    q.push_bind(rule_id);
+    q.push(" AND reason IN (");
+    let mut sep = q.separated(", ");
+    for r in reasons {
+        sep.push_bind(*r);
+    }
+    q.push(") ORDER BY decided_at DESC LIMIT ");
+    q.push_bind(limit);
+    q.push(" OFFSET ");
+    q.push_bind(offset);
+    let rows: Vec<DecisionRow> = q.build_query_as().fetch_all(pool).await?;
+    Ok(rows)
+}
+
+/// Same as [`count_decisions_for_rule`], but additionally filters by `reasons`.
+///
+/// Mirrors [`list_decisions_for_rule_filtered`] so the handler's `total`
+/// stays consistent with the paginated list when a reason filter is active.
+pub async fn count_decisions_for_rule_filtered(
+    pool: &SqlitePool,
+    rule_id: &str,
+    reasons: &[&str],
+) -> Result<i64, DecisionsError> {
+    if reasons.is_empty() {
+        return count_decisions_for_rule(pool, rule_id).await;
+    }
+    let mut q: QueryBuilder<'_, Sqlite> =
+        QueryBuilder::new("SELECT COUNT(*) FROM asset_decisions WHERE rule_id = ");
+    q.push_bind(rule_id);
+    q.push(" AND reason IN (");
+    let mut sep = q.separated(", ");
+    for r in reasons {
+        sep.push_bind(*r);
+    }
+    q.push(")");
+    let total: i64 = q.build_query_scalar().fetch_one(pool).await?;
     Ok(total)
 }
 
@@ -331,6 +393,98 @@ mod tests {
         let rows = list_decisions_for_rule(&pool, "r1", 2, 2).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].asset_id, "a");
+    }
+
+    #[tokio::test]
+    async fn list_and_count_decisions_filtered_respect_reasons() {
+        let pool = fresh_pool().await;
+        seed_user_and_rule(&pool, "u1", "r1").await;
+
+        upsert_decision(&pool, "r1", "a", "added", "matched", None, 100)
+            .await
+            .unwrap();
+        upsert_decision(&pool, "r1", "b", "skipped", "date_out_of_range", None, 200)
+            .await
+            .unwrap();
+        upsert_decision(&pool, "r1", "c", "skipped", "date_out_of_range", None, 300)
+            .await
+            .unwrap();
+        upsert_decision(
+            &pool,
+            "r1",
+            "d",
+            "skipped",
+            "location_out_of_range",
+            None,
+            400,
+        )
+        .await
+        .unwrap();
+
+        // Empty filter delegates to the unfiltered helper.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", &[], 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            count_decisions_for_rule_filtered(&pool, "r1", &[])
+                .await
+                .unwrap(),
+            4,
+        );
+
+        // Single reason → only matching rows + count.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["matched"], 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id, "a");
+        assert_eq!(
+            count_decisions_for_rule_filtered(&pool, "r1", &["matched"])
+                .await
+                .unwrap(),
+            1,
+        );
+
+        // Multi reason → IN clause walks the list.
+        let rows =
+            list_decisions_for_rule_filtered(&pool, "r1", &["matched", "date_out_of_range"], 10, 0)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].asset_id, "c"); // newest-first
+        assert_eq!(rows[1].asset_id, "b");
+        assert_eq!(rows[2].asset_id, "a");
+        assert_eq!(
+            count_decisions_for_rule_filtered(&pool, "r1", &["matched", "date_out_of_range"])
+                .await
+                .unwrap(),
+            3,
+        );
+
+        // Unknown reason → empty, total 0.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["does_not_exist"], 10, 0)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(
+            count_decisions_for_rule_filtered(&pool, "r1", &["does_not_exist"])
+                .await
+                .unwrap(),
+            0,
+        );
+
+        // Pagination still works through the filtered path.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["date_out_of_range"], 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id, "c");
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["date_out_of_range"], 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id, "b");
     }
 
     #[tokio::test]

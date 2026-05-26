@@ -102,4 +102,90 @@ describe("RuleDecisions page", () => {
     expect(alert.textContent).toContain("Rule not found");
     await flushPromises();
   });
+
+  it("next page button increments the offset", async () => {
+    // Total 50 → 2 pages at limit 25.
+    const firstPage = Array.from({ length: 25 }, (_, i) => ({
+      asset_id: `asset-${i + 26}`,
+      decision: "added" as const,
+      reason: "matched",
+      run_id: null,
+      decided_at: 1747000000 - i,
+    }));
+    const secondPage = Array.from({ length: 25 }, (_, i) => ({
+      asset_id: `asset-${i + 1}`,
+      decision: "added" as const,
+      reason: "matched",
+      run_id: null,
+      decided_at: 1746999000 - i,
+    }));
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        decisions: firstPage,
+        total: 50,
+        limit: 25,
+        offset: 0,
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        decisions: secondPage,
+        total: 50,
+        limit: 25,
+        offset: 25,
+      }),
+    );
+
+    const { findByText, findByRole } = render(() => <RuleDecisions />);
+    await findByText(/Page 1 of 2/);
+    const nextButton = await findByRole("button", { name: /Next/ });
+
+    nextButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await findByText(/Page 2 of 2/);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, secondCall] = fetchMock.mock.calls;
+    expect(String(secondCall![0])).toBe(
+      "/api/v1/rules/rule-1/decisions?limit=25&offset=25",
+    );
+  });
+
+  it("toggling a reason filter passes ?reason=... to the API", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ decisions: [], total: 0, limit: 25, offset: 0 }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        decisions: [
+          {
+            asset_id: "11112222-3333-4444-5555-666677778888",
+            decision: "added",
+            reason: "matched",
+            run_id: null,
+            decided_at: 1747000000,
+          },
+        ],
+        total: 1,
+        limit: 25,
+        offset: 0,
+      }),
+    );
+
+    const { findByText, findByLabelText } = render(() => <RuleDecisions />);
+    // Wait for the initial empty fetch to resolve.
+    await findByText(/No decisions recorded yet/);
+
+    const matchedCheckbox = (await findByLabelText(
+      "Matched",
+    )) as HTMLInputElement;
+    matchedCheckbox.checked = true;
+    matchedCheckbox.dispatchEvent(new Event("change", { bubbles: true }));
+
+    await findByText(/Showing 1 of 1 decisions/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, secondCall] = fetchMock.mock.calls;
+    expect(String(secondCall![0])).toBe(
+      "/api/v1/rules/rule-1/decisions?limit=25&offset=0&reason=matched",
+    );
+  });
 });

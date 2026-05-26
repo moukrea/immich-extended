@@ -297,6 +297,140 @@ async fn invalid_limit_rejected() {
     assert_eq!(body["error"], "limit_too_large");
 }
 
+/// Seed five decisions covering three distinct reason slugs and a single rule;
+/// shared by the reason-filter tests below.
+async fn seed_mixed_decisions(pool: &SqlitePool, rule_id: &str) {
+    upsert_decision(pool, rule_id, "a", "added", "matched", None, 1000)
+        .await
+        .unwrap();
+    upsert_decision(pool, rule_id, "b", "added", "matched", None, 2000)
+        .await
+        .unwrap();
+    upsert_decision(
+        pool,
+        rule_id,
+        "c",
+        "skipped",
+        "date_out_of_range",
+        None,
+        3000,
+    )
+    .await
+    .unwrap();
+    upsert_decision(
+        pool,
+        rule_id,
+        "d",
+        "skipped",
+        "date_out_of_range",
+        None,
+        4000,
+    )
+    .await
+    .unwrap();
+    upsert_decision(
+        pool,
+        rule_id,
+        "e",
+        "skipped",
+        "location_out_of_range",
+        None,
+        5000,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reason_filter_single_value_narrows_results_and_total() {
+    let (state, pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+    let rule_id = create_rule_as(&state, &cookie, YAML_RULE_A).await;
+    seed_mixed_decisions(&pool, &rule_id).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{rule_id}/decisions?reason=matched"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let decisions = body["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 2);
+    // newest-first ordering preserved through the filter
+    assert_eq!(decisions[0]["asset_id"], "b");
+    assert_eq!(decisions[1]["asset_id"], "a");
+    for row in decisions {
+        assert_eq!(row["reason"], "matched");
+    }
+    assert_eq!(body["total"], 2, "total reflects the filtered count");
+}
+
+#[tokio::test]
+async fn reason_filter_multiple_values_comma_separated() {
+    let (state, pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+    let rule_id = create_rule_as(&state, &cookie, YAML_RULE_A).await;
+    seed_mixed_decisions(&pool, &rule_id).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{rule_id}/decisions?reason=matched,date_out_of_range"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let decisions = body["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 4);
+    // newest-first: d(4000), c(3000), b(2000), a(1000)
+    assert_eq!(decisions[0]["asset_id"], "d");
+    assert_eq!(decisions[1]["asset_id"], "c");
+    assert_eq!(decisions[2]["asset_id"], "b");
+    assert_eq!(decisions[3]["asset_id"], "a");
+    // location_out_of_range row "e" is excluded
+    for row in decisions {
+        assert_ne!(row["asset_id"], "e");
+        assert_ne!(row["reason"], "location_out_of_range");
+    }
+    assert_eq!(body["total"], 4);
+}
+
+#[tokio::test]
+async fn reason_filter_unknown_value_returns_empty_with_zero_total() {
+    let (state, pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+    let rule_id = create_rule_as(&state, &cookie, YAML_RULE_A).await;
+    seed_mixed_decisions(&pool, &rule_id).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{rule_id}/decisions?reason=does_not_exist"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let decisions = body["decisions"].as_array().unwrap();
+    assert!(decisions.is_empty());
+    assert_eq!(body["total"], 0);
+    assert_eq!(body["limit"], 25);
+    assert_eq!(body["offset"], 0);
+}
+
 #[tokio::test]
 async fn empty_result_returns_200_with_empty_array() {
     let (state, _pool, _a, _b) = fresh_state_two_users().await;

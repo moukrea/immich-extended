@@ -205,6 +205,7 @@ export interface DecisionsResponse {
 export interface FetchDecisionsParams {
   limit?: number;
   offset?: number;
+  reasons?: string[];
 }
 
 export function fetchDecisions(
@@ -214,6 +215,9 @@ export function fetchDecisions(
   const search = new URLSearchParams();
   if (params.limit !== undefined) search.set("limit", String(params.limit));
   if (params.offset !== undefined) search.set("offset", String(params.offset));
+  if (params.reasons && params.reasons.length > 0) {
+    search.set("reason", params.reasons.join(","));
+  }
   const qs = search.toString();
   const path = `/api/v1/rules/${encodeURIComponent(ruleId)}/decisions${
     qs ? `?${qs}` : ""
