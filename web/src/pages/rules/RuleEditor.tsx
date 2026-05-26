@@ -2,7 +2,9 @@ import {
   createMemo,
   createResource,
   createSignal,
+  lazy,
   Show,
+  Suspense,
   untrack,
   type Component,
 } from "solid-js";
@@ -15,7 +17,14 @@ import {
   type Rule,
   type RuleStatus,
 } from "../../lib/api";
+import {
+  DEFAULT_LOCATION,
+  readLocation,
+  writeLocation,
+} from "../../lib/yamlLocation";
 import { humanRuleError } from "./errors";
+
+const MapPicker = lazy(() => import("../../components/MapPicker"));
 
 const PLACEHOLDER_YAML = `# Paste a rule definition. Example:
 name: Vacation 2024
@@ -40,6 +49,15 @@ const RuleEditor: Component = () => {
   const [saving, setSaving] = createSignal(false);
   const [loaded, setLoaded] = createSignal(untrack(() => mode() === "new"));
   const [originalName, setOriginalName] = createSignal<string | null>(null);
+  const [showMap, setShowMap] = createSignal(false);
+
+  const pickerLocation = createMemo(
+    () => readLocation(yamlSource()) ?? DEFAULT_LOCATION,
+  );
+
+  const onPickerChange = (center: [number, number], radiusKm: number) => {
+    setYamlSource(writeLocation(yamlSource(), { center, radiusKm }));
+  };
 
   const [existing] = createResource<Rule | null, string | undefined>(
     () => (mode() === "edit" ? params.id : undefined),
@@ -179,6 +197,37 @@ const RuleEditor: Component = () => {
                 value={yamlSource()}
                 onInput={(e) => setYamlSource(e.currentTarget.value)}
               />
+            </div>
+
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowMap((s) => !s)}
+                class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+                aria-expanded={showMap()}
+                aria-controls="rule-map-picker"
+              >
+                {showMap() ? "Hide map picker" : "Open map picker"}
+              </button>
+              <p class="mt-1 text-xs text-slate-500">
+                The picker writes the <code>match.location</code> block in
+                the YAML above. The YAML stays the source of truth.
+              </p>
+              <Show when={showMap()}>
+                <div id="rule-map-picker" class="mt-3">
+                  <Suspense
+                    fallback={
+                      <p class="text-sm text-slate-500">Loading map…</p>
+                    }
+                  >
+                    <MapPicker
+                      center={pickerLocation().center}
+                      radiusKm={pickerLocation().radiusKm}
+                      onChange={onPickerChange}
+                    />
+                  </Suspense>
+                </div>
+              </Show>
             </div>
 
             <Show when={mode() === "edit"}>
