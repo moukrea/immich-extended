@@ -41,6 +41,7 @@ async fn fresh_state() -> (AppState, SqlitePool) {
             cookie_secure: false,
         },
         master_key: MasterKey::from_bytes(TEST_KEY_BYTES),
+        oidc: std::sync::Arc::new(None),
     };
     (state, pool)
 }

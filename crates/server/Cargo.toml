@@ -26,7 +26,9 @@ axum = "0.7"
 axum-extra = { version = "0.9", features = ["cookie"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = [
@@ -45,7 +47,10 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+base64 = "0.22"
 http-body-util = "0.1"
+jsonwebtoken = "10"
+rsa = { version = "0.9", features = ["sha2"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

@@ -22,6 +22,7 @@ async fn test_state() -> AppState {
             cookie_secure: false,
         },
         master_key: MasterKey::from_bytes([0u8; 32]),
+        oidc: std::sync::Arc::new(None),
     }
 }
 

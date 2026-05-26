@@ -7,17 +7,19 @@
 
 use std::io;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use common::db;
 use server::{
     admin::{create_user, CreateUserError},
+    auth::oidc::OidcClient,
     config::Config,
     AppState,
 };
 use tokio::{net::TcpListener, signal};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[derive(Debug, Parser)]
@@ -111,10 +113,30 @@ async fn run_serve(cfg: Config) -> Result<()> {
         .context("running sqlx migrations")?;
     info!("migrations applied");
 
+    let oidc_client: Option<OidcClient> = match cfg.oidc.as_ref() {
+        Some(oidc_cfg) => {
+            info!(
+                issuer_url = %oidc_cfg.issuer_url,
+                client_id = %oidc_cfg.client_id,
+                "OIDC enabled, running discovery"
+            );
+            let client = OidcClient::from_config(oidc_cfg)
+                .await
+                .context("OIDC discovery (set OIDC_ISSUER_URL='' to disable)")?;
+            info!("OIDC discovery succeeded, login routes enabled");
+            Some(client)
+        }
+        None => {
+            warn!("OIDC disabled — no OIDC_ISSUER_URL set");
+            None
+        }
+    };
+
     let state = AppState {
         db: pool.clone(),
         session: cfg.session.clone(),
         master_key: cfg.master_key.clone(),
+        oidc: Arc::new(oidc_client),
     };
     let app = server::router(state);
 

@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT pkce_verifier, nonce, expires_at FROM oidc_states WHERE state = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "pkce_verifier",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "nonce",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d817654999694e5ef7deebdba4f61c4d6ee9787c1bcbfffbf8158f56cf987106"
+}

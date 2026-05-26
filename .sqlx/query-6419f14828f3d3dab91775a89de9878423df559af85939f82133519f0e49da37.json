@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO oidc_states (state, pkce_verifier, nonce, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "6419f14828f3d3dab91775a89de9878423df559af85939f82133519f0e49da37"
+}

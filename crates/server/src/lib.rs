@@ -5,6 +5,9 @@ pub mod auth;
 pub mod config;
 pub mod me;
 
+use std::sync::Arc;
+
+use auth::oidc::OidcClient;
 use axum::{extract::State, middleware, routing::get, Json, Router};
 use common::crypto::MasterKey;
 use config::SessionConfig;
@@ -20,12 +23,15 @@ pub fn version() -> &'static str {
 
 /// Application-wide shared state. Cloned per-handler — `SqlitePool` is `Arc`-backed
 /// internally so cloning is cheap and safe. `MasterKey` is a 32-byte newtype
-/// (clone = cheap byte copy, `Debug` elides the key value).
+/// (clone = cheap byte copy, `Debug` elides the key value). `oidc` is
+/// `Arc<Option<OidcClient>>` so the disabled case is a single cheap clone of
+/// an Arc-wrapped `None`, and the OIDC router can be mounted unconditionally.
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub db: SqlitePool,
     pub session: SessionConfig,
     pub master_key: MasterKey,
+    pub oidc: Arc<Option<OidcClient>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,8 +51,10 @@ pub struct HealthResponse {
 /// get a 401 short-circuit from the extractor when the request carries no
 /// (valid) session cookie.
 pub fn router(state: AppState) -> Router {
+    let auth_routes = auth::routes::router().nest("/oidc", auth::oidc::router(state.oidc.clone()));
+
     let api_v1 = Router::new()
-        .nest("/auth", auth::routes::router())
+        .nest("/auth", auth_routes)
         .nest("/me", me::routes::router());
 
     Router::new()

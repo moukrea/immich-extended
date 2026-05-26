@@ -30,6 +30,12 @@ pub enum ConfigError {
     EmptyDatabaseUrl,
     #[error("master key: {0}")]
     MasterKey(#[from] MasterKeyError),
+    #[error(
+        "partial OIDC config: when OIDC_ISSUER_URL is set, OIDC_CLIENT_ID, \
+         OIDC_CLIENT_SECRET, and OIDC_REDIRECT_URL must all be set too \
+         (missing: {missing:?})"
+    )]
+    PartialOidcConfig { missing: Vec<&'static str> },
 }
 
 /// Cookie-session knobs derived from `SESSION_COOKIE_NAME` / `SESSION_COOKIE_SECURE`.
@@ -45,6 +51,18 @@ pub struct SessionConfig {
     pub cookie_secure: bool,
 }
 
+/// OIDC settings discovered from env when `OIDC_ISSUER_URL` is present. When
+/// absent the whole block is `None` and the server skips OIDC route mounting
+/// (single warn-level log at startup). PRD §8 allows local + OIDC to coexist;
+/// the absence of OIDC must never break a local-only deployment.
+#[derive(Debug, Clone)]
+pub struct OidcConfig {
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub http_bind: SocketAddr,
@@ -53,6 +71,7 @@ pub struct Config {
     pub database_url: String,
     pub session: SessionConfig,
     pub master_key: MasterKey,
+    pub oidc: Option<OidcConfig>,
 }
 
 impl Config {
@@ -93,6 +112,7 @@ impl Config {
 
         let session = SessionConfig::from_env();
         let master_key = MasterKey::from_env()?;
+        let oidc = OidcConfig::from_env()?;
 
         Ok(Self {
             http_bind,
@@ -101,7 +121,50 @@ impl Config {
             database_url,
             session,
             master_key,
+            oidc,
         })
+    }
+}
+
+impl OidcConfig {
+    /// Read OIDC env vars. Returns `Ok(None)` if `OIDC_ISSUER_URL` is absent
+    /// (OIDC disabled). Returns `Err(PartialOidcConfig)` if the issuer URL is
+    /// set but any of the other three variables is missing — partial config
+    /// almost always indicates a deployment mistake, and silently disabling
+    /// OIDC in that case would be misleading.
+    pub fn from_env() -> Result<Option<Self>, ConfigError> {
+        let issuer_url = match env::var("OIDC_ISSUER_URL").ok().filter(|s| !s.is_empty()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let client_id = env::var("OIDC_CLIENT_ID").ok().filter(|s| !s.is_empty());
+        let client_secret = env::var("OIDC_CLIENT_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let redirect_url = env::var("OIDC_REDIRECT_URL").ok().filter(|s| !s.is_empty());
+
+        let mut missing = Vec::new();
+        if client_id.is_none() {
+            missing.push("OIDC_CLIENT_ID");
+        }
+        if client_secret.is_none() {
+            missing.push("OIDC_CLIENT_SECRET");
+        }
+        if redirect_url.is_none() {
+            missing.push("OIDC_REDIRECT_URL");
+        }
+        if !missing.is_empty() {
+            return Err(ConfigError::PartialOidcConfig { missing });
+        }
+
+        Ok(Some(Self {
+            issuer_url,
+            // unwrap-safe: missing list is empty so all three Options are Some.
+            client_id: client_id.unwrap_or_default(),
+            client_secret: client_secret.unwrap_or_default(),
+            redirect_url: redirect_url.unwrap_or_default(),
+        }))
     }
 }
 
@@ -128,7 +191,7 @@ fn default_database_url(data_dir: &Path) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -167,6 +230,10 @@ mod tests {
         "SESSION_COOKIE_NAME",
         "SESSION_COOKIE_SECURE",
         "IMMICH_EXT_MASTER_KEY",
+        "OIDC_ISSUER_URL",
+        "OIDC_CLIENT_ID",
+        "OIDC_CLIENT_SECRET",
+        "OIDC_REDIRECT_URL",
     ];
 
     /// 64 hex chars = 32 bytes — the format `MasterKey::from_env` accepts.
@@ -269,5 +336,73 @@ mod tests {
 
         let err = Config::from_env().unwrap_err();
         assert!(matches!(err, ConfigError::MasterKey(_)));
+    }
+
+    #[test]
+    fn oidc_disabled_when_issuer_unset() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
+
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.oidc.is_none(), "OIDC must be disabled with no issuer");
+    }
+
+    #[test]
+    fn oidc_enabled_with_full_config() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
+        env::set_var("OIDC_ISSUER_URL", "https://issuer.example.test");
+        env::set_var("OIDC_CLIENT_ID", "ie-client");
+        env::set_var("OIDC_CLIENT_SECRET", "shh");
+        env::set_var(
+            "OIDC_REDIRECT_URL",
+            "https://ext.example.test/api/v1/auth/oidc/callback",
+        );
+
+        let cfg = Config::from_env().unwrap();
+        let oidc = cfg.oidc.expect("OIDC must be enabled with full config");
+        assert_eq!(oidc.issuer_url, "https://issuer.example.test");
+        assert_eq!(oidc.client_id, "ie-client");
+        assert_eq!(oidc.client_secret, "shh");
+        assert_eq!(
+            oidc.redirect_url,
+            "https://ext.example.test/api/v1/auth/oidc/callback"
+        );
+    }
+
+    #[test]
+    fn oidc_partial_config_is_error() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
+        env::set_var("OIDC_ISSUER_URL", "https://issuer.example.test");
+        env::set_var("OIDC_CLIENT_ID", "ie-client");
+        // Deliberately omit OIDC_CLIENT_SECRET and OIDC_REDIRECT_URL.
+
+        let err = Config::from_env().unwrap_err();
+        match err {
+            ConfigError::PartialOidcConfig { missing } => {
+                assert!(missing.contains(&"OIDC_CLIENT_SECRET"));
+                assert!(missing.contains(&"OIDC_REDIRECT_URL"));
+                assert!(!missing.contains(&"OIDC_CLIENT_ID"));
+            }
+            other => panic!("expected PartialOidcConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oidc_empty_string_treated_as_unset() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::new(ALL_KEYS);
+        with_master_key();
+        env::set_var("OIDC_ISSUER_URL", "");
+
+        let cfg = Config::from_env().unwrap();
+        assert!(
+            cfg.oidc.is_none(),
+            "empty OIDC_ISSUER_URL must disable OIDC, not error"
+        );
     }
 }

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT user_id FROM oidc_identities WHERE issuer = ? AND subject = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "user_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3b6f70c32af2484d3ed8f18c3a8de7c305b3bf30c0feb5b77d9f99ed3c9f1233"
+}
