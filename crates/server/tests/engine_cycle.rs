@@ -26,6 +26,7 @@ use std::sync::Arc;
 use chrono::{TimeZone, Utc};
 use common::crypto::MasterKey;
 use common::db;
+use engine::rule::{LocationPredicate, MatchSpec};
 use server::admin::create_user;
 use server::engine_cycle::run_one_cycle;
 use sqlx::SqlitePool;
@@ -450,4 +451,184 @@ async fn run_one_cycle_immich_5xx_records_error_run_and_keeps_watermark() {
     .await
     .unwrap();
     assert!(row.last_processed_asset_timestamp.is_none());
+}
+
+#[tokio::test]
+async fn run_one_cycle_location_filter_matches_in_radius_and_skips_others() {
+    // M4-T2: end-to-end location predicate.
+    //
+    // Rule filter: Paris centroid (48.8566, 2.3522), 50 km radius. Four
+    // search-result assets exercise each location outcome:
+    //
+    //   asset-paris-1: at Paris    → in-radius  → added/matched
+    //   asset-lyon:    ~391 km off → out of band → skipped/location_out_of_range
+    //   asset-no-gps:  no GPS exif → no GPS     → skipped/location_missing_gps
+    //   asset-paris-2: ~70 m off   → in-radius  → added/matched
+    //
+    // Assertions: 4 decision rows with the right (decision, reason) pair;
+    // rule_runs finalised with evaluated=4 added=2 skipped=2 and no error;
+    // PUT fires exactly once with the two matched ids (order-insensitive).
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "assets": {
+                "items": [
+                    {
+                        "id": "asset-paris-1",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2026-01-01T10:00:00Z",
+                        "updatedAt": "2026-02-01T10:00:00Z",
+                        "exifInfo": {
+                            "dateTimeOriginal": "2026-01-01T10:00:00Z",
+                            "latitude": 48.8566,
+                            "longitude": 2.3522
+                        },
+                        "people": []
+                    },
+                    {
+                        "id": "asset-lyon",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2026-01-02T10:00:00Z",
+                        "updatedAt": "2026-02-02T10:00:00Z",
+                        "exifInfo": {
+                            "dateTimeOriginal": "2026-01-02T10:00:00Z",
+                            "latitude": 45.7640,
+                            "longitude": 4.8357
+                        },
+                        "people": []
+                    },
+                    {
+                        "id": "asset-no-gps",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2026-01-03T10:00:00Z",
+                        "updatedAt": "2026-02-03T10:00:00Z",
+                        "exifInfo": {
+                            "dateTimeOriginal": "2026-01-03T10:00:00Z"
+                        },
+                        "people": []
+                    },
+                    {
+                        "id": "asset-paris-2",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2026-01-04T10:00:00Z",
+                        "updatedAt": "2026-02-04T10:00:00Z",
+                        "exifInfo": {
+                            "dateTimeOriginal": "2026-01-04T10:00:00Z",
+                            "latitude": 48.8570,
+                            "longitude": 2.3530
+                        },
+                        "people": []
+                    }
+                ],
+                "nextPage": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Empty existing album — diff produces both matched ids.
+    Mock::given(method("GET"))
+        .and(path("/api/albums/album-loc"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "album-loc",
+            "assets": []
+        })))
+        .mount(&server)
+        .await;
+
+    let put_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
+    let put_body_capture = put_body.clone();
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-loc/assets"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(move |req: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            if let Ok(mut g) = put_body_capture.try_lock() {
+                *g = Some(body);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+
+    let predicates = serde_json::to_string(&MatchSpec {
+        location: Some(LocationPredicate {
+            center: [48.8566, 2.3522],
+            radius_km: 50.0,
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    seed_rule(&pool, &owner, "r1", "album-loc", &predicates).await;
+
+    let mk = deterministic_key();
+    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+
+    assert_eq!(outcome.evaluated, 4, "all 4 assets evaluated");
+    assert_eq!(outcome.added, 2, "both paris assets matched");
+    assert_eq!(outcome.skipped, 2, "lyon (out of range) + no-gps");
+
+    let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(decisions.len(), 4);
+    let by_id: std::collections::HashMap<String, (String, String)> = decisions
+        .into_iter()
+        .map(|d| (d.asset_id, (d.decision, d.reason)))
+        .collect();
+    assert_eq!(
+        by_id["asset-paris-1"],
+        ("added".to_string(), "matched".to_string()),
+    );
+    assert_eq!(
+        by_id["asset-paris-2"],
+        ("added".to_string(), "matched".to_string()),
+    );
+    assert_eq!(
+        by_id["asset-lyon"],
+        ("skipped".to_string(), "location_out_of_range".to_string()),
+    );
+    assert_eq!(
+        by_id["asset-no-gps"],
+        ("skipped".to_string(), "location_missing_gps".to_string()),
+    );
+
+    let run = common::decisions::latest_run_for_rule(&pool, "r1")
+        .await
+        .unwrap()
+        .expect("a run row should exist");
+    assert_eq!(run.assets_evaluated, 4);
+    assert_eq!(run.assets_added, 2);
+    assert_eq!(run.assets_skipped, 2);
+    assert!(run.finished_at.is_some(), "run should be finalised");
+    assert!(run.error_message.is_none(), "no error expected");
+
+    let body = put_body
+        .lock()
+        .await
+        .clone()
+        .expect("PUT was supposed to fire once");
+    let ids: Vec<String> = body["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["asset-paris-1".to_string(), "asset-paris-2".to_string()],
+    );
 }
