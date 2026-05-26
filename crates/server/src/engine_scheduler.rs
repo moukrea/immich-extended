@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,8 +109,12 @@ impl Scheduler {
     /// every spawned task runs the real Immich-backed poll cycle. The
     /// per-rule Immich client is built *inside* the cycle from the owner's
     /// stored credentials, so the scheduler itself never sees an Immich URL.
-    pub fn new(pool: SqlitePool, master_key: MasterKey) -> Self {
-        let tick_fn = engine_cycle::production_tick_fn(pool.clone(), master_key);
+    ///
+    /// `data_dir` is threaded through so the lazy YOLO inference path can
+    /// reach `data_dir/models/yolo.onnx`. Tests that don't exercise the real
+    /// cycle should prefer [`Self::for_tests`].
+    pub fn new(pool: SqlitePool, master_key: MasterKey, data_dir: PathBuf) -> Self {
+        let tick_fn = engine_cycle::production_tick_fn(pool.clone(), master_key, data_dir);
         Self::new_with(pool, SchedulerConfig::default(), tick_fn)
     }
 

@@ -34,13 +34,18 @@
 //! data and EXIF can be re-derived after upload — bumping `updatedAt` is the
 //! signal that the asset is worth re-evaluating.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
 use common::crypto::MasterKey;
 use common::decisions::{finish_run, insert_run};
-use engine::predicate::{evaluate_match, AssetSnapshot, AssetType, PredicateOutcome};
+use common::yolo_cache;
+use engine::predicate::{
+    evaluate_match, AssetSnapshot, AssetType, DecisionReason, PredicateOutcome,
+};
 use engine::rule::MatchSpec;
 use immich_client::{ImmichAsset, ImmichAssetType, ImmichClient, ValidationError};
 use sqlx::SqlitePool;
@@ -68,6 +73,10 @@ pub enum CycleError {
     BadParsedPredicates(String),
     #[error("immich api call failed: {0}")]
     Immich(String),
+    #[error("yolo inference failed: {0}")]
+    Yolo(String),
+    #[error("io error during yolo dispatch: {0}")]
+    Io(String),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
     #[error("decisions store error: {0}")]
@@ -85,6 +94,8 @@ impl CycleError {
             CycleError::InvalidBaseUrl(_) => "invalid_base_url".into(),
             CycleError::BadParsedPredicates(_) => "bad_parsed_predicates".into(),
             CycleError::Immich(detail) => format!("immich_unreachable: {detail}"),
+            CycleError::Yolo(detail) => format!("yolo_failed: {detail}"),
+            CycleError::Io(detail) => format!("io_error: {detail}"),
             CycleError::Db(e) => format!("db_error: {e}"),
             CycleError::Decisions(e) => format!("db_error: {e}"),
         }
@@ -119,16 +130,22 @@ struct ResolvedKey {
 /// Public entry: run one poll cycle for `rule_id`. Returns the run summary
 /// on success; on failure, the `rule_runs` row is still finalised with an
 /// `error_message` slug.
+///
+/// `data_dir` is the on-disk root the YOLO crate consults for its model file
+/// (`data_dir/models/yolo.onnx`). It's threaded through here because the
+/// lazy YOLO inference path (when a rule sets `no_unidentified_humans=true`)
+/// downloads asset bytes to a tempfile and hands them to `yolo::count_*`.
 pub async fn run_one_cycle(
     pool: &SqlitePool,
     master_key: &MasterKey,
+    data_dir: &Path,
     rule_id: &str,
 ) -> Result<RunOutcome, CycleError> {
     let run_id = Uuid::new_v4().to_string();
     let started_at = now_unix_seconds();
     insert_run(pool, &run_id, rule_id, started_at).await?;
 
-    match cycle_body(pool, master_key, rule_id, &run_id).await {
+    match cycle_body(pool, master_key, data_dir, rule_id, &run_id).await {
         Ok(outcome) => {
             let finished_at = now_unix_seconds();
             finish_run(
@@ -165,6 +182,7 @@ pub async fn run_one_cycle(
 async fn cycle_body(
     pool: &SqlitePool,
     master_key: &MasterKey,
+    data_dir: &Path,
     rule_id: &str,
     run_id: &str,
 ) -> Result<RunOutcome, CycleError> {
@@ -180,6 +198,18 @@ async fn cycle_body(
         .await
         .map_err(immich_error)?;
 
+    // Pre-pass: evaluate every asset, dispatching to YOLO when (and only when)
+    // a `no_unidentified_humans` rule has all other predicates passing.
+    // Building the full `(asset, outcome)` set BEFORE the transaction lets the
+    // YOLO downloads + tempfile writes happen outside any held DB locks.
+    let mut decided: Vec<(&ImmichAsset, PredicateOutcome)> = Vec::with_capacity(assets.len());
+    for asset in &assets {
+        let outcome =
+            decide_with_optional_yolo(pool, &client, &key.api_key, data_dir, &match_spec, asset)
+                .await?;
+        decided.push((asset, outcome));
+    }
+
     let mut evaluated: i64 = 0;
     let mut added: i64 = 0;
     let mut skipped: i64 = 0;
@@ -189,11 +219,9 @@ async fn cycle_body(
 
     let mut tx = pool.begin().await?;
     let decided_at = now_unix_seconds();
-    for asset in &assets {
+    for (asset, outcome) in &decided {
         evaluated += 1;
-        let snapshot = snapshot_from_immich(asset);
-        let outcome = evaluate_match(&match_spec, &snapshot);
-        let (decision_str, reason_slug) = decision_columns(&outcome);
+        let (decision_str, reason_slug) = decision_columns(outcome);
         sqlx::query!(
             "INSERT INTO asset_decisions (rule_id, asset_id, decision, reason, run_id, decided_at) \
              VALUES (?, ?, ?, ?, ?, ?) \
@@ -328,6 +356,125 @@ async fn update_watermark_and_last_run(
     Ok(())
 }
 
+/// Evaluate a single asset against `match_spec`, lazily falling back to YOLO
+/// inference when (and only when) the cheaper predicates passed and the rule
+/// opted in via `people.no_unidentified_humans`.
+///
+/// Returns the final outcome — the caller persists it as-is. Implements the
+/// pay-zero rule for non-YOLO rules: if the spec doesn't require YOLO, this
+/// function performs a single `evaluate_match` and returns.
+async fn decide_with_optional_yolo(
+    pool: &SqlitePool,
+    client: &ImmichClient,
+    api_key: &str,
+    data_dir: &Path,
+    match_spec: &MatchSpec,
+    asset: &ImmichAsset,
+) -> Result<PredicateOutcome, CycleError> {
+    let snapshot = snapshot_from_immich(asset);
+    let outcome = evaluate_match(match_spec, &snapshot);
+    if !match_spec.requires_yolo() {
+        return Ok(outcome);
+    }
+    // Only re-evaluate when the cheap predicates ALL passed and the only
+    // remaining gate is the YOLO sub-rule. Any other skip reason is final
+    // (cheap-first dispatch already ruled the asset out).
+    if outcome.reason != DecisionReason::YoloUnimplemented {
+        return Ok(outcome);
+    }
+    let yolo_count = resolve_yolo_count(pool, client, api_key, data_dir, asset).await?;
+    let mut snapshot = snapshot;
+    snapshot.yolo_person_count = Some(yolo_count);
+    Ok(evaluate_match(match_spec, &snapshot))
+}
+
+/// Cache-aware YOLO dispatch. Returns the person count, downloading +
+/// inferring only on cache miss and writing the result back. The cache key is
+/// `asset_id` alone (per PRD §10); the model_version column lets a rolled
+/// model invalidate prior rows automatically.
+async fn resolve_yolo_count(
+    pool: &SqlitePool,
+    client: &ImmichClient,
+    api_key: &str,
+    data_dir: &Path,
+    asset: &ImmichAsset,
+) -> Result<u32, CycleError> {
+    if let Some(cached) = yolo_cache::get_count(pool, &asset.id, yolo::MODEL_VERSION).await? {
+        return Ok(cached);
+    }
+    let asset_type = map_asset_type(asset.asset_type);
+    let count = run_yolo_for_asset(client, api_key, data_dir, &asset.id, asset_type).await?;
+    yolo_cache::upsert_count(
+        pool,
+        &asset.id,
+        count,
+        yolo::MODEL_VERSION,
+        now_unix_seconds(),
+    )
+    .await?;
+    Ok(count)
+}
+
+/// Download the asset bytes (thumbnail for photos, original for videos) into
+/// a tempfile and run the matching YOLO entrypoint.
+async fn run_yolo_for_asset(
+    client: &ImmichClient,
+    api_key: &str,
+    data_dir: &Path,
+    asset_id: &str,
+    asset_type: AssetType,
+) -> Result<u32, CycleError> {
+    match asset_type {
+        AssetType::Photo => {
+            let bytes = client
+                .download_thumbnail(api_key, asset_id)
+                .await
+                .map_err(immich_error)?;
+            let tmp = write_tempfile(&bytes, ".jpg")?;
+            yolo::count_people_in_image(data_dir, tmp.path())
+                .await
+                .map_err(|e| CycleError::Yolo(e.to_string()))
+        }
+        AssetType::Video => {
+            let bytes = client
+                .download_original(api_key, asset_id)
+                .await
+                .map_err(immich_error)?;
+            let tmp = write_tempfile(&bytes, ".mp4")?;
+            yolo::count_people_in_video(data_dir, tmp.path())
+                .await
+                .map_err(|e| CycleError::Yolo(e.to_string()))
+        }
+    }
+}
+
+/// Write `bytes` into a freshly-created `NamedTempFile` with the given suffix
+/// (so ffmpeg / image decoders can sniff format from the path extension). The
+/// tempfile is auto-deleted when the returned handle drops at the caller's
+/// scope end.
+fn write_tempfile(bytes: &[u8], suffix: &str) -> Result<tempfile::NamedTempFile, CycleError> {
+    let mut tmp = tempfile::Builder::new()
+        .suffix(suffix)
+        .tempfile()
+        .map_err(|e| CycleError::Io(e.to_string()))?;
+    tmp.write_all(bytes)
+        .map_err(|e| CycleError::Io(e.to_string()))?;
+    tmp.flush().map_err(|e| CycleError::Io(e.to_string()))?;
+    Ok(tmp)
+}
+
+fn map_asset_type(t: ImmichAssetType) -> AssetType {
+    match t {
+        ImmichAssetType::Image => AssetType::Photo,
+        ImmichAssetType::Video => AssetType::Video,
+        // Unknown Immich types are treated as Photo for YOLO dispatch.
+        // The predicate stack already mapped them the same way; the
+        // thumbnail endpoint is safer than `original` for "we don't know
+        // what this is".
+        ImmichAssetType::Other => AssetType::Photo,
+    }
+}
+
 /// Pure mapper from Immich's asset shape to the engine's snapshot. Lives here
 /// (server crate) rather than in `engine` so the `engine` crate stays free of
 /// any `immich-client` dependency — the engine deals in `AssetSnapshot`,
@@ -387,18 +534,20 @@ fn now_unix_seconds() -> i64 {
 }
 
 /// Build the scheduler's production tick function. The closure captures the
-/// pool + master key and delegates each tick to [`run_one_cycle`]. Lives here
-/// (next to the cycle body) so a future refactor can swap implementations in
-/// one place without touching the scheduler module.
+/// pool + master key + data_dir and delegates each tick to [`run_one_cycle`].
+/// Lives here (next to the cycle body) so a future refactor can swap
+/// implementations in one place without touching the scheduler module.
 pub fn production_tick_fn(
     pool: SqlitePool,
     master_key: MasterKey,
+    data_dir: PathBuf,
 ) -> crate::engine_scheduler::RunCycleFn {
     Arc::new(move |rule_id: String| {
         let pool = pool.clone();
         let master_key = master_key.clone();
+        let data_dir = data_dir.clone();
         Box::pin(async move {
-            match run_one_cycle(&pool, &master_key, &rule_id).await {
+            match run_one_cycle(&pool, &master_key, &data_dir, &rule_id).await {
                 Ok(outcome) => {
                     tracing::info!(
                         %rule_id,

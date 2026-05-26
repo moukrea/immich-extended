@@ -198,7 +198,9 @@ async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
 
     let mk = deterministic_key();
-    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
 
     assert_eq!(outcome.evaluated, 3, "should have evaluated all 3 assets");
     assert_eq!(outcome.added, 2, "a1 + a2 match the 2024+ date predicate");
@@ -331,7 +333,9 @@ async fn run_one_cycle_decision_reasons_track_predicates() {
     seed_rule(&pool, &owner, "r1", "album-1", parsed).await;
 
     let mk = deterministic_key();
-    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
     assert_eq!(outcome.evaluated, 3);
     assert_eq!(outcome.added, 0);
     assert_eq!(outcome.skipped, 3);
@@ -390,7 +394,9 @@ async fn run_one_cycle_uses_owner_api_key_not_any_other() {
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
 
     let mk = deterministic_key();
-    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
     assert_eq!(outcome.evaluated, 0);
 }
 
@@ -402,7 +408,9 @@ async fn run_one_cycle_no_api_key_records_error_run() {
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
 
     let mk = deterministic_key();
-    let err = run_one_cycle(&pool, &mk, "r1").await.unwrap_err();
+    let err = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap_err();
     assert!(matches!(err, server::engine_cycle::CycleError::NoApiKey(_)));
     let run = common::decisions::latest_run_for_rule(&pool, "r1")
         .await
@@ -427,7 +435,9 @@ async fn run_one_cycle_immich_5xx_records_error_run_and_keeps_watermark() {
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
 
     let mk = deterministic_key();
-    let err = run_one_cycle(&pool, &mk, "r1").await.unwrap_err();
+    let err = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap_err();
     assert!(matches!(err, server::engine_cycle::CycleError::Immich(_)));
     let run = common::decisions::latest_run_for_rule(&pool, "r1")
         .await
@@ -573,7 +583,9 @@ async fn run_one_cycle_location_filter_matches_in_radius_and_skips_others() {
     seed_rule(&pool, &owner, "r1", "album-loc", &predicates).await;
 
     let mk = deterministic_key();
-    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
 
     assert_eq!(outcome.evaluated, 4, "all 4 assets evaluated");
     assert_eq!(outcome.added, 2, "both paris assets matched");

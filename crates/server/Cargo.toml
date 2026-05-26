@@ -38,6 +38,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
     "macros",
 ] }
+tempfile = "3"
 thiserror = "1"
 time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "sync", "time"] }

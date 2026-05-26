@@ -269,9 +269,10 @@ async fn concurrent_cycles_never_cross_user_keys_or_albums() {
     // Run both cycles concurrently. Single-thread runtime is enough to
     // interleave the futures; that surfaces any shared state on the engine's
     // hot path.
+    let data_dir = std::env::temp_dir();
     let (out_a, out_b) = tokio::join!(
-        run_one_cycle(&pool, &mk, "rule-a"),
-        run_one_cycle(&pool, &mk, "rule-b"),
+        run_one_cycle(&pool, &mk, &data_dir, "rule-a"),
+        run_one_cycle(&pool, &mk, &data_dir, "rule-b"),
     );
     let out_a = out_a.unwrap();
     let out_b = out_b.unwrap();

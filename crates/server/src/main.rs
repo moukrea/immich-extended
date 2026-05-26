@@ -137,8 +137,14 @@ async fn run_serve(cfg: Config) -> Result<()> {
     // Per-rule Immich clients are built inside the poll cycle from each
     // rule owner's stored `immich_api_keys.base_url`, so the scheduler
     // doesn't need a global Immich URL — it just needs the master key to
-    // decrypt the stored secret.
-    let scheduler = Arc::new(Scheduler::new(pool.clone(), cfg.master_key.clone()));
+    // decrypt the stored secret. The `data_dir` plumbs through to the YOLO
+    // dispatch (M5-T6) so the model file at `data_dir/models/yolo.onnx`
+    // resolves at inference time.
+    let scheduler = Arc::new(Scheduler::new(
+        pool.clone(),
+        cfg.master_key.clone(),
+        cfg.data_dir.clone(),
+    ));
 
     let state = AppState {
         db: pool.clone(),

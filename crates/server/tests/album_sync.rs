@@ -186,7 +186,9 @@ async fn second_cycle_with_same_assets_does_not_re_put() {
     let mk = deterministic_key();
 
     // Cycle 1: empty album → PUT fires with a1, a2.
-    let out1 = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let out1 = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
     assert_eq!(out1.added, 2, "first cycle should add both assets");
 
     // Reset the watermark so cycle 2 re-evaluates the same assets, and flip
@@ -205,7 +207,9 @@ async fn second_cycle_with_same_assets_does_not_re_put() {
     }
 
     // Cycle 2: album already has {a1, a2} → diff empty → no PUT.
-    let out2 = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let out2 = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
     assert_eq!(
         out2.evaluated, 2,
         "second cycle should still evaluate both assets",
@@ -314,7 +318,9 @@ async fn second_cycle_pushes_only_newly_matched_id() {
 
     let mk = deterministic_key();
 
-    let out1 = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let out1 = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
     assert_eq!(out1.added, 2);
 
     // Reset watermark + populate album for cycle 2.
@@ -331,7 +337,9 @@ async fn second_cycle_pushes_only_newly_matched_id() {
         g.push("a2");
     }
 
-    let out2 = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let out2 = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
     assert_eq!(
         out2.evaluated, 3,
         "cycle 2 should have seen the new asset too"
@@ -396,7 +404,9 @@ async fn managed_target_with_empty_album_id_skips_get_and_put() {
     seed_rule(&pool, &owner, "r1", "", date_from_2024_match()).await;
 
     let mk = deterministic_key();
-    let outcome = run_one_cycle(&pool, &mk, "r1").await.unwrap();
+    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
     // Decision is still recorded — we just don't push to an album.
     assert_eq!(outcome.evaluated, 1);
     assert_eq!(outcome.added, 1);

@@ -83,6 +83,16 @@ impl MatchSpec {
             && self.people.is_none()
             && self.media.is_none()
     }
+
+    /// True iff the spec needs YOLO inference to be decided. Today the only
+    /// trigger is `people.no_unidentified_humans = true` — all other
+    /// predicates are decided from Immich metadata alone. Used by the engine
+    /// cycle (M5-T6) so that rules that don't opt in pay zero YOLO cost.
+    pub fn requires_yolo(&self) -> bool {
+        self.people
+            .as_ref()
+            .is_some_and(|p| p.no_unidentified_humans)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -153,4 +163,51 @@ impl RuleStatus {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_yolo_true_when_no_unidentified_humans_set() {
+        let spec = MatchSpec {
+            people: Some(PeoplePredicate {
+                no_unidentified_humans: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(spec.requires_yolo());
+    }
+
+    #[test]
+    fn requires_yolo_false_for_other_people_subrules() {
+        let spec = MatchSpec {
+            people: Some(PeoplePredicate {
+                must_include: vec!["p1".into()],
+                must_exclude_other_identifiable: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!spec.requires_yolo());
+    }
+
+    #[test]
+    fn requires_yolo_false_when_people_absent() {
+        let spec = MatchSpec {
+            date: Some(DatePredicate {
+                from: None,
+                to: None,
+            }),
+            ..Default::default()
+        };
+        assert!(!spec.requires_yolo());
+    }
+
+    #[test]
+    fn requires_yolo_false_for_empty_spec() {
+        assert!(!MatchSpec::default().requires_yolo());
+    }
 }
