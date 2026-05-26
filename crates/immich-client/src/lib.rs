@@ -609,6 +609,73 @@ impl ImmichClient {
         Err(ValidationError::Upstream { status })
     }
 
+    /// Download an asset's preview thumbnail. Used by the YOLO predicate
+    /// path (M5-T6) to fetch image bytes for inference. Preview size keeps
+    /// the request fast and is enough for person detection.
+    ///
+    /// Returns the raw response bytes on 200. Errors mirror [`Self::list_assets`]:
+    /// 401/403 → `Unauthorized`, other non-2xx → `Upstream`, transport →
+    /// `Transport`.
+    pub async fn download_thumbnail(
+        &self,
+        api_key: &str,
+        asset_id: &str,
+    ) -> Result<Vec<u8>, ValidationError> {
+        let path = format!("api/assets/{asset_id}/thumbnail");
+        let url = self
+            .base_url
+            .join(&path)
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("size", "preview")])
+            .header("x-api-key", api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            let bytes = resp.bytes().await?;
+            return Ok(bytes.to_vec());
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ValidationError::Unauthorized(status));
+        }
+        Err(ValidationError::Upstream { status })
+    }
+
+    /// Download an asset's original file bytes. Used by the YOLO video path
+    /// (M5-T6): we need the real container so ffmpeg can sample frames.
+    ///
+    /// Returns the raw response bytes on 200. Errors follow the same shape
+    /// as [`Self::download_thumbnail`].
+    pub async fn download_original(
+        &self,
+        api_key: &str,
+        asset_id: &str,
+    ) -> Result<Vec<u8>, ValidationError> {
+        let path = format!("api/assets/{asset_id}/original");
+        let url = self
+            .base_url
+            .join(&path)
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let resp = self
+            .http
+            .get(url)
+            .header("x-api-key", api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            let bytes = resp.bytes().await?;
+            return Ok(bytes.to_vec());
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ValidationError::Unauthorized(status));
+        }
+        Err(ValidationError::Upstream { status })
+    }
+
     /// Exposed so tests can assert what base URL the client targets.
     pub fn base_url(&self) -> &Url {
         &self.base_url
