@@ -16,7 +16,7 @@ import Setup from "./pages/Setup";
 import Dashboard from "./pages/Dashboard";
 import MeSettings from "./pages/MeSettings";
 import RulesList from "./pages/rules/RulesList";
-import RuleBuilder from "./pages/rules/RuleBuilder";
+import RuleBuilderV2 from "./pages/rules/RuleBuilderV2";
 import RuleDecisions from "./pages/rules/RuleDecisions";
 import RuleActivity from "./pages/rules/RuleActivity";
 
@@ -102,7 +102,7 @@ const ShelledRulesList: Component = () => (
 );
 const ShelledRuleBuilder: Component = () => (
   <AppShell>
-    <RuleBuilder />
+    <RuleBuilderV2 />
   </AppShell>
 );
 const ShelledRuleDecisions: Component = () => (

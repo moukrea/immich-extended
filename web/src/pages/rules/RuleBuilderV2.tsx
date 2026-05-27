@@ -24,12 +24,12 @@ import {
 } from "../../lib/api";
 import { emptyMatch, type MatchExpr } from "../../lib/matchTree";
 import {
+  BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
   defaultRuleMeta,
   formStateToYamlV2,
   yamlToFormStateV2,
   type RuleMetaState,
 } from "../../lib/ruleYamlV2";
-import { BUILDER_DEFAULT_POLL_INTERVAL_SECONDS } from "../../lib/ruleYaml";
 import BlockTreeEditor from "../../components/blocks/BlockTreeEditor";
 import { PeopleProvider } from "../../components/PeopleContext";
 import ConfirmDialog from "../../components/ConfirmDialog";

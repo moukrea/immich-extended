@@ -1,17 +1,16 @@
 // YAML ↔ state for the block-tree rule builder (POSTSHIP-T20).
 //
 // The non-match rule-level fields (id / name / status / target_album /
-// poll_interval_seconds) keep the same shape as the legacy ruleYaml.ts.
-// `match` is the only thing that changes — it round-trips through
-// `serializeMatchExpr` / `parseMatchExpr`, which accept both the new tree
-// shape and the legacy flat shape on load.
+// poll_interval_seconds) carry the same shape used by the deployed API.
+// `match` round-trips through `serializeMatchExpr` / `parseMatchExpr`, which
+// accept both the new tree shape and the legacy flat shape on load.
 //
 // Loading a legacy YAML produces a tree (via `legacyMatchSpecToTree`). Saving
 // always emits the canonical tree shape — the server accepts both because the
 // Rust `MatchExpr::Deserialize` dispatcher does the same.
 //
-// `untouched_top_level` mirrors the legacy helper: any top-level key that we
-// don't render (forward-compat sub-rule keys, etc.) is preserved verbatim.
+// `untouched_top_level` preserves any top-level key we don't render
+// (forward-compat sub-rule keys, etc.) verbatim through the round-trip.
 
 import yaml from "js-yaml";
 import {
@@ -21,13 +20,16 @@ import {
   serializeMatchExpr,
   type MatchExpr,
 } from "./matchTree";
-import {
-  BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
-  DEFAULT_LOCATION_CENTER,
-  DEFAULT_LOCATION_RADIUS_KM,
-  type RuleStatusValue,
-  type TargetAlbumState,
-} from "./ruleYaml";
+
+export type RuleStatusValue = "active" | "paused" | "archived";
+
+export type TargetAlbumState =
+  | { kind: "existing"; album_id: string }
+  | { kind: "managed"; name: string; shared_with: string[] };
+
+export const DEFAULT_LOCATION_CENTER: [number, number] = [48.8566, 2.3522];
+export const DEFAULT_LOCATION_RADIUS_KM = 60;
+export const BUILDER_DEFAULT_POLL_INTERVAL_SECONDS = 300;
 
 export interface RuleMetaState {
   id: string | null;
@@ -190,6 +192,3 @@ export function yamlToFormStateV2(text: string): YamlV2ParseResult {
 
   return { meta, expr, untouched, error: null };
 }
-
-// Re-export defaults for tests / page-level construction.
-export { DEFAULT_LOCATION_CENTER, DEFAULT_LOCATION_RADIUS_KM };
