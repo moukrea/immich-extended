@@ -31,7 +31,8 @@ use axum::{
     Json,
 };
 use common::decisions::{
-    count_decisions_for_rule_filtered, list_decisions_for_rule_filtered, DecisionsError,
+    count_decisions_for_rule_filtered, count_runs_for_rule, list_decisions_for_rule_filtered,
+    list_runs_for_rule, DecisionsError,
 };
 use engine::rule::{
     parse_rule, validate_rule, ParseError, RuleStatus, TargetAlbum, ValidationError,
@@ -637,6 +638,121 @@ pub(super) async fn list_rule_decisions(
 
 fn decisions_error_response(err: DecisionsError) -> ErrorResponse {
     tracing::warn!(error = %err, "decisions query failed");
+    internal_error()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunsQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunItem {
+    pub id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub assets_evaluated: i64,
+    pub assets_added: i64,
+    pub assets_skipped: i64,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunsResponse {
+    pub runs: Vec<RunItem>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+const RUNS_DEFAULT_LIMIT: i64 = 20;
+const RUNS_MAX_LIMIT: i64 = 100;
+
+/// `GET /api/v1/rules/:id/runs?limit=&offset=` — paginated `rule_runs` audit
+/// rows for the live-activity feed (POSTSHIP-T22).
+///
+/// Owner-scoped, same 404-on-foreign-rule convention as
+/// [`list_rule_decisions`]. `limit` defaults to 20 (lighter cadence than
+/// decisions: the UI polls this every few seconds and a typical operator only
+/// needs the last handful of cycles), capped at 100; `offset` defaults to 0.
+pub(super) async fn list_rule_runs(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Path(id): Path<String>,
+    Query(params): Query<RunsQuery>,
+) -> Result<Json<RunsResponse>, ErrorResponse> {
+    let limit = params.limit.unwrap_or(RUNS_DEFAULT_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+    if !(1..=RUNS_MAX_LIMIT).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "limit_too_large",
+                "detail": format!(
+                    "limit must be between 1 and {RUNS_MAX_LIMIT}, got {limit}",
+                ),
+                "max": RUNS_MAX_LIMIT,
+            })),
+        ));
+    }
+    if offset < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_offset",
+                "detail": "offset must be >= 0",
+            })),
+        ));
+    }
+
+    let exists = sqlx::query!(
+        "SELECT id FROM rules WHERE id = ? AND owner_user_id = ?",
+        id,
+        uid,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to verify rule ownership for runs");
+        internal_error()
+    })?;
+    if exists.is_none() {
+        return Err(not_found());
+    }
+
+    let rows = list_runs_for_rule(&state.db, &id, limit, offset)
+        .await
+        .map_err(runs_error_response)?;
+    let total = count_runs_for_rule(&state.db, &id)
+        .await
+        .map_err(runs_error_response)?;
+
+    let runs = rows
+        .into_iter()
+        .map(|r| RunItem {
+            id: r.id,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            assets_evaluated: r.assets_evaluated,
+            assets_added: r.assets_added,
+            assets_skipped: r.assets_skipped,
+            error_message: r.error_message,
+        })
+        .collect();
+
+    Ok(Json(RunsResponse {
+        runs,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+fn runs_error_response(err: DecisionsError) -> ErrorResponse {
+    tracing::warn!(error = %err, "runs query failed");
     internal_error()
 }
 

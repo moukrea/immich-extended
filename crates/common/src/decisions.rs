@@ -264,6 +264,57 @@ pub async fn latest_run_for_rule(
     }))
 }
 
+/// Return up to `limit` runs for `rule_id`, newest first (by `started_at`).
+///
+/// Powers `GET /api/v1/rules/:id/runs` — the live-activity feed UI on the rule
+/// edit page polls this every few seconds, so the index on
+/// `(rule_id, started_at DESC)` from `0005_engine.sql` does the work of the
+/// ORDER BY.
+pub async fn list_runs_for_rule(
+    pool: &SqlitePool,
+    rule_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<RuleRunRow>, DecisionsError> {
+    let rows = sqlx::query!(
+        "SELECT id, rule_id, started_at, finished_at, \
+                assets_evaluated, assets_added, assets_skipped, error_message \
+         FROM rule_runs \
+         WHERE rule_id = ? \
+         ORDER BY started_at DESC \
+         LIMIT ? OFFSET ?",
+        rule_id,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RuleRunRow {
+            id: r.id,
+            rule_id: r.rule_id,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            assets_evaluated: r.assets_evaluated,
+            assets_added: r.assets_added,
+            assets_skipped: r.assets_skipped,
+            error_message: r.error_message,
+        })
+        .collect())
+}
+
+/// Count `rule_runs` rows attached to `rule_id`.
+///
+/// Mirrors [`count_decisions_for_rule`] so the GET `/runs` endpoint can
+/// surface a stable `total` independent of pagination.
+pub async fn count_runs_for_rule(pool: &SqlitePool, rule_id: &str) -> Result<i64, DecisionsError> {
+    let total = sqlx::query_scalar!("SELECT COUNT(*) FROM rule_runs WHERE rule_id = ?", rule_id,)
+        .fetch_one(pool)
+        .await?;
+    Ok(total)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -575,6 +626,60 @@ mod tests {
         seed_user_and_rule(&pool, "u1", "r1").await;
         let res = latest_run_for_rule(&pool, "r1").await.unwrap();
         assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_runs_for_rule_orders_newest_first_and_paginates() {
+        let pool = fresh_pool().await;
+        seed_user_and_rule(&pool, "u1", "r1").await;
+
+        insert_run(&pool, "run-a", "r1", 1000).await.unwrap();
+        finish_run(&pool, "run-a", 1100, 1, 1, 0, None)
+            .await
+            .unwrap();
+        insert_run(&pool, "run-b", "r1", 3000).await.unwrap();
+        insert_run(&pool, "run-c", "r1", 2000).await.unwrap();
+        finish_run(&pool, "run-c", 2050, 2, 0, 2, Some("err"))
+            .await
+            .unwrap();
+
+        let page1 = list_runs_for_rule(&pool, "r1", 2, 0).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].id, "run-b");
+        assert!(page1[0].finished_at.is_none(), "open run surfaces");
+        assert_eq!(page1[1].id, "run-c");
+        assert_eq!(page1[1].error_message.as_deref(), Some("err"));
+
+        let page2 = list_runs_for_rule(&pool, "r1", 2, 2).await.unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].id, "run-a");
+        assert_eq!(page2[0].assets_evaluated, 1);
+        assert_eq!(page2[0].assets_added, 1);
+    }
+
+    #[tokio::test]
+    async fn list_runs_for_rule_returns_empty_when_no_runs() {
+        let pool = fresh_pool().await;
+        seed_user_and_rule(&pool, "u1", "r1").await;
+        let rows = list_runs_for_rule(&pool, "r1", 10, 0).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn count_runs_for_rule_only_counts_target_rule() {
+        let pool = fresh_pool().await;
+        seed_user_and_rule(&pool, "u1", "r1").await;
+        seed_user_and_rule(&pool, "u2", "r2").await;
+
+        assert_eq!(count_runs_for_rule(&pool, "r1").await.unwrap(), 0);
+
+        insert_run(&pool, "a", "r1", 100).await.unwrap();
+        insert_run(&pool, "b", "r1", 200).await.unwrap();
+        insert_run(&pool, "c", "r2", 100).await.unwrap();
+
+        assert_eq!(count_runs_for_rule(&pool, "r1").await.unwrap(), 2);
+        assert_eq!(count_runs_for_rule(&pool, "r2").await.unwrap(), 1);
+        assert_eq!(count_runs_for_rule(&pool, "nope").await.unwrap(), 0);
     }
 
     #[tokio::test]
