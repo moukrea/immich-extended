@@ -52,6 +52,7 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 const COOKIE_NAME: &str = "iext_session_dev";
+const PROD_COOKIE_NAME: &str = "__Host-iext_session";
 const CLIENT_ID: &str = "test-client";
 const CLIENT_SECRET: &str = "test-secret";
 const REDIRECT_URL: &str = "http://localhost/api/v1/auth/oidc/callback";
@@ -202,6 +203,20 @@ async fn start_mock_issuer() -> (String, MockState) {
 }
 
 async fn fresh_state_with_oidc(issuer: &str) -> (AppState, SqlitePool) {
+    fresh_state_with_oidc_session(
+        issuer,
+        SessionConfig {
+            cookie_name: COOKIE_NAME.to_string(),
+            cookie_secure: false,
+        },
+    )
+    .await
+}
+
+async fn fresh_state_with_oidc_session(
+    issuer: &str,
+    session: SessionConfig,
+) -> (AppState, SqlitePool) {
     let pool = db::open_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let cfg = OidcConfig {
@@ -213,10 +228,7 @@ async fn fresh_state_with_oidc(issuer: &str) -> (AppState, SqlitePool) {
     let client = OidcClient::from_config(&cfg).await.unwrap();
     let state = AppState {
         db: pool.clone(),
-        session: SessionConfig {
-            cookie_name: COOKIE_NAME.to_string(),
-            cookie_secure: false,
-        },
+        session,
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: Arc::new(Some(client)),
         resolver: Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
@@ -425,4 +437,81 @@ async fn callback_with_unknown_state_returns_400() {
         .await
         .unwrap();
     assert_eq!(sessions, 0);
+}
+
+/// Production cookie shape regression — POSTSHIP follow-up to T4.
+///
+/// The dev-config tests above run with `cookie_secure=false` and the short
+/// `iext_session_dev` name, so they never exercise the production cookie
+/// invariants the `__Host-` prefix demands: `Secure`, `Path=/`, and no
+/// `Domain` attribute. A refactor that drops any of those, or accidentally
+/// sets `Domain=`, would silently break the deployed cookie (the browser
+/// rejects a `__Host-`-prefixed cookie that violates the prefix contract)
+/// without failing any of the existing assertions. This test pins the
+/// production shape so that regression is impossible to merge.
+#[tokio::test]
+async fn callback_sets_production_cookie_with_host_prefix_invariants() {
+    let (issuer, mock) = start_mock_issuer().await;
+    let (state, pool) = fresh_state_with_oidc_session(
+        &issuer,
+        SessionConfig {
+            cookie_name: PROD_COOKIE_NAME.to_string(),
+            cookie_secure: true,
+        },
+    )
+    .await;
+
+    let login = call_login(&state).await;
+    assert_eq!(login.status(), StatusCode::SEE_OTHER);
+    let location = login
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let state_value = query_value(&location, "state").expect("state= must be in Location URL");
+
+    let nonce = fetch_nonce(&pool, &state_value).await;
+    *mock.next.lock().unwrap() = Some(TokenSpec {
+        sub: "user-prod".to_string(),
+        email: "p@mock".to_string(),
+        name: Some("Prod User".to_string()),
+        nonce,
+    });
+
+    let cb = call_callback(&state, &state_value, "code-prod").await;
+    assert_eq!(cb.status(), StatusCode::SEE_OTHER);
+
+    let set_cookie = cb
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("session cookie must be set on success")
+        .to_str()
+        .unwrap();
+
+    assert!(
+        set_cookie.starts_with(&format!("{PROD_COOKIE_NAME}=")),
+        "cookie name must be the production __Host- prefix: {set_cookie}",
+    );
+    assert!(
+        set_cookie.contains("Secure"),
+        "production cookie must have Secure (required by __Host- prefix): {set_cookie}",
+    );
+    assert!(
+        set_cookie.contains("Path=/"),
+        "production cookie must have Path=/ (required by __Host- prefix): {set_cookie}",
+    );
+    assert!(
+        !set_cookie.to_lowercase().contains("domain="),
+        "production cookie must NOT set Domain (forbidden by __Host- prefix): {set_cookie}",
+    );
+    assert!(
+        set_cookie.contains("HttpOnly"),
+        "production cookie must be HttpOnly: {set_cookie}",
+    );
+    assert!(
+        set_cookie.contains("SameSite=Lax"),
+        "production cookie must be SameSite=Lax (Strict would drop the IdP-redirect cookie): {set_cookie}",
+    );
 }
