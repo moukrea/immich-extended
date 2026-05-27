@@ -46,7 +46,7 @@ use common::yolo_cache;
 use engine::predicate::{
     evaluate_match, AssetSnapshot, AssetType, DecisionReason, PredicateOutcome,
 };
-use engine::rule::MatchSpec;
+use engine::rule::{parse_rule, MatchSpec, TargetAlbum};
 use immich_client::{ImmichAsset, ImmichAssetType, ImmichClient, ValidationError};
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -71,6 +71,8 @@ pub enum CycleError {
     InvalidBaseUrl(String),
     #[error("rule.parsed_predicates is not valid JSON: {0}")]
     BadParsedPredicates(String),
+    #[error("rule {0} is managed-target but the album name could not be resolved")]
+    ManagedAlbumNameMissing(String),
     #[error("immich api call failed: {0}")]
     Immich(String),
     #[error("yolo inference failed: {0}")]
@@ -98,6 +100,7 @@ impl CycleError {
             CycleError::Io(detail) => format!("io_error: {detail}"),
             CycleError::Db(e) => format!("db_error: {e}"),
             CycleError::Decisions(e) => format!("db_error: {e}"),
+            CycleError::ManagedAlbumNameMissing(_) => "managed_album_name_missing".into(),
         }
     }
 }
@@ -117,6 +120,9 @@ pub struct RunOutcome {
 struct LoadedRule {
     owner_user_id: String,
     target_album_id: String,
+    target_album_strategy: String,
+    managed_album_name: Option<String>,
+    yaml_source: String,
     parsed_predicates: String,
     last_processed_asset_timestamp: Option<i64>,
 }
@@ -125,6 +131,7 @@ struct LoadedRule {
 struct ResolvedKey {
     base_url: String,
     api_key: String,
+    immich_user_id: Option<String>,
 }
 
 /// Public entry: run one poll cycle for `rule_id`. Returns the run summary
@@ -192,6 +199,14 @@ async fn cycle_body(
     let match_spec: MatchSpec = serde_json::from_str(&rule.parsed_predicates)
         .map_err(|e| CycleError::BadParsedPredicates(e.to_string()))?;
 
+    // Resolve target album. For Existing-strategy rules `target_album_id` is
+    // already a real Immich id; for Managed-strategy rules an empty
+    // `target_album_id` means the album hasn't been minted yet, so we do
+    // find-or-create now and persist the resulting id back to the row. After
+    // the first successful cycle subsequent cycles short-circuit to the
+    // already-stored id.
+    let resolved_album_id = resolve_target_album(pool, &client, &key, &rule, rule_id).await?;
+
     let since = rule.last_processed_asset_timestamp.map(epoch_to_utc);
     let assets = client
         .list_assets(&key.api_key, since, MAX_PAGES_PER_TICK)
@@ -253,14 +268,13 @@ async fn cycle_body(
     tx.commit().await?;
 
     // Album push happens *after* the decisions transaction has committed —
-    // see the module-level docs for why this ordering matters on crash.
-    // Managed-target rules carry an empty `target_album_id` until the
-    // engine creates the album (deferred to a later task); the helper
-    // short-circuits to a no-op in that case.
+    // see the module-level docs for why this ordering matters on crash. The
+    // managed-target find-or-create already ran above (`resolve_target_album`)
+    // so `resolved_album_id` is non-empty for every reachable code path here.
     let pushed = crate::album_sync::idempotent_album_add(
         &client,
         &key.api_key,
-        &rule.target_album_id,
+        &resolved_album_id,
         &to_add_to_album,
     )
     .await
@@ -286,7 +300,8 @@ async fn cycle_body(
 
 async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, CycleError> {
     let row = sqlx::query!(
-        "SELECT owner_user_id, target_album_id, parsed_predicates, \
+        "SELECT owner_user_id, target_album_id, target_album_strategy, \
+                managed_album_name, yaml_source, parsed_predicates, \
                 last_processed_asset_timestamp \
          FROM rules WHERE id = ?",
         rule_id,
@@ -297,6 +312,9 @@ async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, Cycle
     Ok(LoadedRule {
         owner_user_id: row.owner_user_id,
         target_album_id: row.target_album_id,
+        target_album_strategy: row.target_album_strategy,
+        managed_album_name: row.managed_album_name,
+        yaml_source: row.yaml_source,
         parsed_predicates: row.parsed_predicates,
         last_processed_asset_timestamp: row.last_processed_asset_timestamp,
     })
@@ -308,7 +326,8 @@ async fn load_key(
     owner_user_id: &str,
 ) -> Result<ResolvedKey, CycleError> {
     let row = sqlx::query!(
-        "SELECT base_url, ciphertext, nonce FROM immich_api_keys WHERE user_id = ?",
+        "SELECT base_url, ciphertext, nonce, immich_user_id \
+         FROM immich_api_keys WHERE user_id = ?",
         owner_user_id,
     )
     .fetch_optional(pool)
@@ -321,12 +340,103 @@ async fn load_key(
     Ok(ResolvedKey {
         base_url: row.base_url,
         api_key,
+        immich_user_id: row.immich_user_id,
     })
 }
 
 fn build_client(base_url: &str) -> Result<ImmichClient, CycleError> {
     let url = Url::parse(base_url).map_err(|e| CycleError::InvalidBaseUrl(e.to_string()))?;
     Ok(ImmichClient::new(url))
+}
+
+/// Resolve the rule's Immich target album, creating it on first cycle when the
+/// rule is managed-target and no album has been minted yet.
+///
+/// Three paths:
+/// * `target_album_id` is non-empty — existing rule or already-resolved
+///   managed rule. Return the id as-is.
+/// * `target_album_id` empty + strategy `managed` — find the operator's
+///   first writable album matching `name`. If none exists, `POST /api/albums`
+///   creates one. The new id is persisted back to `rules.target_album_id`
+///   so the next cycle is a fast no-op for this branch.
+/// * `target_album_id` empty + strategy `existing` — malformed row (the
+///   handler refuses to write that combination). Treated as "no album to
+///   write to": return the empty string so the album push stays a no-op.
+async fn resolve_target_album(
+    pool: &SqlitePool,
+    client: &ImmichClient,
+    key: &ResolvedKey,
+    rule: &LoadedRule,
+    rule_id: &str,
+) -> Result<String, CycleError> {
+    if !rule.target_album_id.is_empty() {
+        return Ok(rule.target_album_id.clone());
+    }
+    if rule.target_album_strategy != "managed" {
+        return Ok(String::new());
+    }
+    let name = resolve_managed_name(rule)
+        .ok_or_else(|| CycleError::ManagedAlbumNameMissing(rule_id.to_string()))?;
+
+    // Caller's Immich user id is needed by `list_albums` to derive
+    // writability. If it's missing (key not validated yet) we still go
+    // through `list_albums` with an empty string — owner_id won't match, no
+    // album will be flagged writable, and we'll fall through to create.
+    // After create, the new album is owned by the caller so subsequent
+    // cycles can find it even without `immich_user_id` populated.
+    let caller_id = key.immich_user_id.as_deref().unwrap_or("");
+    let albums = client
+        .list_albums(&key.api_key, caller_id)
+        .await
+        .map_err(immich_error)?;
+
+    let existing_id = albums
+        .iter()
+        .find(|a| a.name == name && a.is_writable)
+        .map(|a| a.id.clone());
+
+    let resolved_id = match existing_id {
+        Some(id) => id,
+        None => {
+            let created = client
+                .create_album(&key.api_key, &name)
+                .await
+                .map_err(immich_error)?;
+            created.id
+        }
+    };
+
+    sqlx::query!(
+        "UPDATE rules SET target_album_id = ? WHERE id = ?",
+        resolved_id,
+        rule_id,
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!(
+        rule_id,
+        album_id = %resolved_id,
+        album_name = %name,
+        "managed target album resolved",
+    );
+    Ok(resolved_id)
+}
+
+/// Recover the managed-album name from a [`LoadedRule`]. Prefers the
+/// dedicated `managed_album_name` column (populated by handlers post-0007),
+/// then falls back to re-parsing `yaml_source` for legacy rows written
+/// before the column existed.
+fn resolve_managed_name(rule: &LoadedRule) -> Option<String> {
+    if let Some(name) = rule.managed_album_name.as_ref() {
+        if !name.is_empty() {
+            return Some(name.clone());
+        }
+    }
+    let parsed = parse_rule(&rule.yaml_source).ok()?;
+    match parsed.target_album {
+        TargetAlbum::Managed { name, .. } if !name.is_empty() => Some(name),
+        _ => None,
+    }
 }
 
 async fn update_watermark_and_last_run(

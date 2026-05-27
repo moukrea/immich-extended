@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE rules SET name = ?, yaml_source = ?, parsed_predicates = ?, target_album_id = ?, target_album_strategy = ?, managed_album_name = ?, status = ?, updated_at = ? WHERE id = ? AND owner_user_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "4dd75fa1b401d846680c83783da8297726b3ce931e9d080ef4e96a64f6274024"
+}

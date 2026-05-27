@@ -122,14 +122,19 @@ pub(super) async fn create_rule(
         TargetAlbum::Existing { album_id } => album_id.clone(),
         TargetAlbum::Managed { .. } => String::new(),
     };
+    let managed_album_name = match &rule.target_album {
+        TargetAlbum::Managed { name, .. } => Some(name.clone()),
+        TargetAlbum::Existing { .. } => None,
+    };
     let status_db = rule.status.as_str();
     let now = now_unix_seconds();
 
     sqlx::query!(
         "INSERT INTO rules \
             (id, owner_user_id, name, yaml_source, parsed_predicates, \
-             target_album_id, target_album_strategy, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             target_album_id, target_album_strategy, managed_album_name, \
+             status, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         id,
         uid,
         rule.name,
@@ -137,6 +142,7 @@ pub(super) async fn create_rule(
         parsed_predicates,
         target_album_id_str,
         target_album_strategy,
+        managed_album_name,
         status_db,
         now,
         now,
@@ -328,19 +334,24 @@ pub(super) async fn update_rule(
             TargetAlbum::Existing { album_id } => album_id.clone(),
             TargetAlbum::Managed { .. } => String::new(),
         };
+        let managed_album_name = match &rule.target_album {
+            TargetAlbum::Managed { name, .. } => Some(name.clone()),
+            TargetAlbum::Existing { .. } => None,
+        };
         let status_db = rule.status.as_str();
 
         sqlx::query!(
             "UPDATE rules SET \
                 name = ?, yaml_source = ?, parsed_predicates = ?, \
                 target_album_id = ?, target_album_strategy = ?, \
-                status = ?, updated_at = ? \
+                managed_album_name = ?, status = ?, updated_at = ? \
              WHERE id = ? AND owner_user_id = ?",
             rule.name,
             yaml_source,
             parsed_predicates,
             target_album_id_str,
             target_album_strategy,
+            managed_album_name,
             status_db,
             now,
             id,

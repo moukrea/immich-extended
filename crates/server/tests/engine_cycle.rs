@@ -644,3 +644,302 @@ async fn run_one_cycle_location_filter_matches_in_radius_and_skips_others() {
         vec!["asset-paris-1".to_string(), "asset-paris-2".to_string()],
     );
 }
+
+// --- T13 surface: managed albums find-or-create ---
+
+/// Seed a managed-target rule. `name_in_column` mimics the post-T13 happy
+/// path (handler persists the name to the new column); pass `None` to
+/// emulate a pre-T13 row (engine falls back to parsing `yaml_source`).
+async fn seed_managed_rule(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+    yaml_source: &str,
+    parsed_predicates_json: &str,
+    name_in_column: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO rules \
+            (id, owner_user_id, name, yaml_source, parsed_predicates, \
+             target_album_id, target_album_strategy, managed_album_name, \
+             status, poll_interval_seconds, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, '', 'managed', ?, 'active', 300, 0, 0)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(id)
+    .bind(yaml_source)
+    .bind(parsed_predicates_json)
+    .bind(name_in_column)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+const MANAGED_NAME: &str = "Paloma (partage Maman)";
+
+fn managed_yaml(id: &str) -> String {
+    format!(
+        "id: {id}\nname: {id}\ntarget_album:\n  type: managed\n  name: \"{MANAGED_NAME}\"\nmatch:\n  date:\n    from: 2024-01-01T00:00:00+00:00\n"
+    )
+}
+
+#[tokio::test]
+async fn run_one_cycle_creates_managed_album_when_none_exists() {
+    let server = MockServer::start().await;
+
+    // /api/albums list — caller has zero albums.
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // POST /api/albums — the create call. Captures the body so we assert the
+    // name we sent matches.
+    let create_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
+    let create_capture = create_body.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(move |req: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let cb = create_capture.clone();
+            if let Ok(mut g) = cb.try_lock() {
+                *g = Some(body);
+            }
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "new-album-id",
+                "albumName": MANAGED_NAME,
+                "ownerId": OWNER_IMMICH_UID,
+                "albumUsers": [],
+                "assetCount": 0,
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // /api/search/metadata — one matching asset.
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "assets": {
+                "items": [{
+                    "id": "asset-1",
+                    "type": "IMAGE",
+                    "fileCreatedAt": "2025-01-01T00:00:00Z",
+                    "updatedAt": "2025-01-01T00:00:00Z",
+                    "exifInfo": {"dateTimeOriginal": "2025-01-01T00:00:00Z"},
+                    "people": []
+                }],
+                "nextPage": null
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    // PUT /api/albums/new-album-id/assets — should be called with the matched id.
+    let put_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
+    let put_capture = put_body.clone();
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/new-album-id/assets"))
+        .respond_with(move |req: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let pb = put_capture.clone();
+            if let Ok(mut g) = pb.try_lock() {
+                *g = Some(body);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // GET the new album's asset ids (album_sync.get_album_asset_ids).
+    Mock::given(method("GET"))
+        .and(path("/api/albums/new-album-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "new-album-id",
+            "ownerId": OWNER_IMMICH_UID,
+            "albumUsers": [],
+            "assets": []
+        })))
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    let parsed = r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#;
+    seed_managed_rule(
+        &pool,
+        &owner,
+        "managed-r1",
+        &managed_yaml("managed-r1"),
+        parsed,
+        Some(MANAGED_NAME),
+    )
+    .await;
+
+    let mk = deterministic_key();
+    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "managed-r1")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.evaluated, 1);
+    assert_eq!(outcome.added, 1);
+
+    // Create body carried the expected name.
+    let body = create_body
+        .lock()
+        .await
+        .clone()
+        .expect("POST /api/albums was supposed to fire");
+    assert_eq!(body["albumName"], serde_json::json!(MANAGED_NAME));
+
+    // The rule row was patched with the new album id.
+    let row = sqlx::query!(
+        "SELECT target_album_id FROM rules WHERE id = ?",
+        "managed-r1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.target_album_id, "new-album-id");
+
+    // PUT to the new album fired with the matched asset id.
+    let put_body = put_body
+        .lock()
+        .await
+        .clone()
+        .expect("PUT /api/albums/new-album-id/assets was supposed to fire");
+    assert_eq!(put_body["ids"], serde_json::json!(["asset-1"]));
+}
+
+#[tokio::test]
+async fn run_one_cycle_reuses_existing_managed_album_when_name_matches() {
+    let server = MockServer::start().await;
+
+    // /api/albums list — caller already owns an album with the same name.
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": "existing-album-id",
+                "albumName": MANAGED_NAME,
+                "ownerId": OWNER_IMMICH_UID,
+                "albumUsers": [],
+                "assetCount": 0,
+            }])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // No POST expected — the existing album is reused.
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "assets": {"items": [], "nextPage": null}
+        })))
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    let parsed = r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#;
+    seed_managed_rule(
+        &pool,
+        &owner,
+        "managed-r2",
+        &managed_yaml("managed-r2"),
+        parsed,
+        Some(MANAGED_NAME),
+    )
+    .await;
+
+    let mk = deterministic_key();
+    run_one_cycle(&pool, &mk, &std::env::temp_dir(), "managed-r2")
+        .await
+        .unwrap();
+
+    // Existing album id was persisted to the rule.
+    let row = sqlx::query!(
+        "SELECT target_album_id FROM rules WHERE id = ?",
+        "managed-r2",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.target_album_id, "existing-album-id");
+}
+
+#[tokio::test]
+async fn run_one_cycle_resolves_managed_album_name_from_yaml_when_column_null() {
+    // Back-compat for rows written before migration 0007: the
+    // `managed_album_name` column is NULL but the YAML source carries the
+    // name. The engine should parse it back.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": "legacy-album-id",
+                "albumName": MANAGED_NAME,
+                "ownerId": OWNER_IMMICH_UID,
+                "albumUsers": [],
+                "assetCount": 0,
+            }])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "assets": {"items": [], "nextPage": null}
+        })))
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    let parsed = r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#;
+    // managed_album_name = NULL — engine should fall back to yaml_source.
+    seed_managed_rule(
+        &pool,
+        &owner,
+        "legacy-r3",
+        &managed_yaml("legacy-r3"),
+        parsed,
+        None,
+    )
+    .await;
+
+    let mk = deterministic_key();
+    run_one_cycle(&pool, &mk, &std::env::temp_dir(), "legacy-r3")
+        .await
+        .unwrap();
+
+    let row = sqlx::query!(
+        "SELECT target_album_id FROM rules WHERE id = ?",
+        "legacy-r3",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.target_album_id, "legacy-album-id");
+}

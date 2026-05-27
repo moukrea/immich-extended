@@ -713,6 +713,60 @@ impl ImmichClient {
         Err(ValidationError::Upstream { status })
     }
 
+    /// Create a new Immich album owned by the caller.
+    ///
+    /// Returns the newly-minted [`ImmichAlbumSummary`] (with `asset_count = 0`
+    /// and `is_writable = true` — the caller is the owner by construction).
+    /// Used by the engine when a rule's `target_album` is `Managed { name }`
+    /// and no album with that name exists yet in the operator's library.
+    ///
+    /// Errors mirror [`Self::list_albums`]: 401/403 → `Unauthorized`, other
+    /// non-2xx → `Upstream`, transport → `Transport`, malformed body →
+    /// `BadResponse`.
+    pub async fn create_album(
+        &self,
+        api_key: &str,
+        name: &str,
+    ) -> Result<ImmichAlbumSummary, ValidationError> {
+        let url = self
+            .base_url
+            .join("api/albums")
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        // Per Immich API: `POST /api/albums` with `albumName` (required)
+        // returns the created album row including `id`, `albumName`,
+        // `ownerId`, `albumUsers`, etc. We send `albumUsers: []` explicitly
+        // so we don't depend on a backend default.
+        let body = serde_json::json!({"albumName": name, "albumUsers": []});
+        let resp = self
+            .http
+            .post(url)
+            .header("x-api-key", api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                return Err(ValidationError::Unauthorized(status));
+            }
+            return Err(ValidationError::Upstream { status });
+        }
+        // The create response uses the same shape as a list item but does not
+        // always carry `assetCount`. Default to 0 — a fresh album has no
+        // assets by construction.
+        let raw: RawAlbumListItem = resp
+            .json()
+            .await
+            .map_err(|e| ValidationError::BadResponse(e.to_string()))?;
+        Ok(ImmichAlbumSummary {
+            id: raw.id,
+            name: raw.album_name,
+            asset_count: raw.asset_count,
+            is_writable: true,
+        })
+    }
+
     /// Download an asset's preview thumbnail. Used by the YOLO predicate
     /// path (M5-T6) to fetch image bytes for inference. Preview size keeps
     /// the request fast and is enough for person detection.

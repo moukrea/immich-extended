@@ -682,3 +682,108 @@ async fn add_assets_to_album_401_maps_unauthorized() {
         .unwrap_err();
     assert!(matches!(err, ValidationError::Unauthorized(_)));
 }
+
+// --- T13 surface: create_album ---
+
+#[tokio::test]
+async fn create_album_posts_albumname_and_parses_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .and(header("x-api-key", API_KEY))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "albumName": "Paloma (partage Maman)"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "new-album-id",
+            "albumName": "Paloma (partage Maman)",
+            "ownerId": "owner-1",
+            "albumUsers": [],
+            "assetCount": 0
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let album = client
+        .create_album(API_KEY, "Paloma (partage Maman)")
+        .await
+        .unwrap();
+    assert_eq!(album.id, "new-album-id");
+    assert_eq!(album.name, "Paloma (partage Maman)");
+    assert_eq!(album.asset_count, 0);
+    // By construction the caller owns a freshly-created album → writable.
+    assert!(album.is_writable);
+}
+
+#[tokio::test]
+async fn create_album_handles_missing_asset_count() {
+    let server = MockServer::start().await;
+    // Some Immich versions omit `assetCount` from the create response.
+    // The default fallback should be 0 — a brand new album has no assets.
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "x",
+            "albumName": "X",
+            "ownerId": "o",
+            "albumUsers": []
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let album = client.create_album(API_KEY, "X").await.unwrap();
+    assert_eq!(album.asset_count, 0);
+}
+
+#[tokio::test]
+async fn create_album_401_maps_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let err = client.create_album(API_KEY, "X").await.unwrap_err();
+    assert!(matches!(err, ValidationError::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn create_album_5xx_maps_upstream() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let err = client.create_album(API_KEY, "X").await.unwrap_err();
+    match err {
+        ValidationError::Upstream { status } => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+        other => panic!("expected Upstream, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_album_malformed_response_maps_bad_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            // `id` is missing — the client should surface this as BadResponse.
+            "albumName": "X",
+            "ownerId": "o",
+            "albumUsers": []
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let err = client.create_album(API_KEY, "X").await.unwrap_err();
+    assert!(matches!(err, ValidationError::BadResponse(_)));
+}

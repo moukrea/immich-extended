@@ -367,27 +367,24 @@ async fn second_cycle_pushes_only_newly_matched_id() {
 }
 
 #[tokio::test]
-async fn managed_target_with_empty_album_id_skips_get_and_put() {
-    // Managed-strategy rule whose album hasn't been created yet carries
-    // `target_album_id == ""`. The helper must short-circuit to no-op
-    // BEFORE the GET — no GET call should hit Immich (the album doesn't
-    // exist, so a GET would 4xx anyway, but skipping the call is cleaner).
+async fn managed_target_without_name_errors_with_dedicated_slug() {
+    // T13: a managed-strategy rule whose name we cannot recover (no
+    // `managed_album_name` column AND `yaml_source` doesn't parse back to a
+    // managed target) fails the cycle with `managed_album_name_missing`.
+    // This is the unreachable-by-handler state; we surface a typed error
+    // instead of silently no-oping (the pre-T13 behavior) because the rule
+    // is genuinely broken — silently dropping its decisions would hide the
+    // problem from the operator.
     let server = MockServer::start().await;
 
+    // No HTTP call should hit Immich — the cycle short-circuits before
+    // listing assets or albums.
     Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [asset_item("a1", "2026-01-15T10:00:00Z", "2024-06-01T10:00:00Z")],
-                "nextPage": null
-            }
-        })))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
         .mount(&server)
         .await;
-    // GET on ANY album path must NOT fire — the path is unknown anyway.
     Mock::given(method("GET"))
-        .and(path("/api/albums/"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
         .mount(&server)
@@ -401,17 +398,34 @@ async fn managed_target_with_empty_album_id_skips_get_and_put() {
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    // `seed_rule` plants `yaml_source = "name: stub"` which doesn't parse
+    // back to a managed TargetAlbum — combined with the empty column, the
+    // engine cannot recover a name.
     seed_rule(&pool, &owner, "r1", "", date_from_2024_match()).await;
 
     let mk = deterministic_key();
-    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+    let err = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
         .await
-        .unwrap();
-    // Decision is still recorded — we just don't push to an album.
-    assert_eq!(outcome.evaluated, 1);
-    assert_eq!(outcome.added, 1);
+        .expect_err("managed rule with no name should error");
+    let err_text = format!("{err}");
+    assert!(
+        err_text.contains("managed-target"),
+        "error should mention managed-target, got: {err_text}",
+    );
+
+    // The errored rule_run row carries the dedicated slug.
+    let run = common::decisions::latest_run_for_rule(&pool, "r1")
+        .await
+        .unwrap()
+        .expect("a run row should exist");
+    assert_eq!(
+        run.error_message.as_deref(),
+        Some("managed_album_name_missing"),
+    );
+
+    // No decisions were recorded — the cycle never reached the asset loop.
     let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
         .await
         .unwrap();
-    assert_eq!(decisions.len(), 1);
+    assert!(decisions.is_empty());
 }
