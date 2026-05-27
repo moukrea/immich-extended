@@ -1,0 +1,15 @@
+# Example: "All photos of the kids together, no other identifiable humans"
+#
+# Demonstrates: managed target album, multi-person must_include,
+# must_exclude_other_identifiable (anyone else recognized → skip).
+#
+# Replace <kid1-id> and <kid2-id> with real Immich person UUIDs.
+name: "Enfants ensemble"
+target_album:
+  type: managed
+  name: "Les enfants"
+match:
+  people:
+    must_include: [<kid1-id>, <kid2-id>]
+    must_exclude_other_identifiable: true
+status: active

@@ -16,9 +16,11 @@ See [`PRD.md`](./PRD.md) for the full product specification.
 
 ## Status
 
-Early development. Currently at **M0 — Skeleton** (Cargo workspace, axum
-`/health`, sqlx migrations, multi-stage Dockerfile, structured logging). The
-roadmap below tracks progress through milestones M0–M7.
+All milestones M0–M7 complete. Deployed as a single container behind Traefik
+with Authentik OIDC; verified end-to-end against a live Immich instance
+(real rule → real Immich poll → real album side-effect). See [`PRD.md`](./PRD.md)
+for scope, [`docs/API.md`](./docs/API.md) for the HTTP surface, and
+[`examples/`](./examples/) for sample rule YAMLs.
 
 ## Workspace layout
 
@@ -81,7 +83,43 @@ docker run --rm -d \
 curl -fsS http://127.0.0.1:18080/health
 ```
 
-The runtime image is `debian:bookworm-slim` (~90 MB total).
+The runtime image is `debian:trixie-slim` (~102 MB total). Trixie is required
+because the Rust 1.91 builder image links against glibc 2.41; pairing with
+`bookworm-slim` (glibc 2.36) yields a runtime `GLIBC_2.39 not found` panic.
+
+## Configuration reference
+
+| Variable                | Required | Purpose                                                                 |
+| ----------------------- | -------- | ----------------------------------------------------------------------- |
+| `HTTP_BIND`             | no       | HTTP listener bind address (default `0.0.0.0:8080`)                     |
+| `LOG_LEVEL`             | no       | `tracing` env-filter directive (default `info`)                         |
+| `DATA_DIR`              | no       | SQLite DB, YOLO model, cache (default `./data`)                         |
+| `DATABASE_URL`          | no       | sqlx URL (default `sqlite://${DATA_DIR}/immich-extended.sqlite?mode=rwc`) |
+| `IMMICH_EXT_MASTER_KEY` | **yes**  | 32-byte hex AES-256-GCM key encrypting stored Immich API keys           |
+| `SESSION_COOKIE_SECURE` | no       | Set to `true` when terminating TLS in front of the service              |
+| `OIDC_ISSUER_URL`       | no       | Enable OIDC login when set; full discovery URL                          |
+| `OIDC_CLIENT_ID`        | with OIDC| OIDC client id                                                          |
+| `OIDC_CLIENT_SECRET`    | with OIDC| OIDC client secret                                                      |
+| `OIDC_REDIRECT_URL`     | with OIDC| Public callback URL (e.g. `https://immich-ext.<DOMAIN>/api/v1/auth/oidc/callback`) |
+| `ORT_DYLIB_PATH`        | dev only | Path to ONNX Runtime `.so` (Docker image bundles its own)              |
+| `WEB_DIST_DIR`          | no       | Frontend bundle directory; omit for API-only mode                       |
+
+## Troubleshooting
+
+- **Container exits with `GLIBC_2.XX not found`** — runtime image glibc is
+  older than the builder's. The shipped Dockerfile pins both to `trixie`; if
+  you change one, change both.
+- **`OIDC discovery failed` at boot** — issuer URL unreachable from the
+  container's network namespace. Check Traefik routing, DNS, and that the
+  issuer's `/.well-known/openid-configuration` returns 200.
+- **Immich API key paste returns 4xx** — the key was rejected by Immich's
+  `/api/users/me`. Re-mint in Immich (Account → API Keys) and paste again.
+- **Rule cycles log `evaluated=N skipped=N` but no `added`** — date or
+  location predicate has zero matching assets in the watermark window.
+  Widen the date predicate or inspect `GET /api/v1/rules/:id/decisions?reason=date_out_of_range`.
+- **`/api/v1/me/people` slow on first call** — Immich paginates persons in
+  pages of 30; the proxy walks them all. Subsequent calls are not cached
+  (per-request fan-out is deliberate).
 
 ## Quality gates
 

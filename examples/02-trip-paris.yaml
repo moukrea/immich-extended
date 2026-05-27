@@ -1,0 +1,19 @@
+# Example: "Paris trip — week of July 15"
+#
+# Demonstrates: existing target album, date + location predicates.
+#
+# Replace <album-uuid> with a real Immich album id visible at
+# GET /api/v1/me/albums. The location center is [latitude, longitude]
+# (note the order); radius_km bounds the haversine search.
+name: "Paris — juillet 2024"
+target_album:
+  type: existing
+  album_id: <album-uuid>
+match:
+  date:
+    from: 2024-07-15T00:00:00+02:00
+    to:   2024-07-22T23:59:59+02:00
+  location:
+    center: [48.8566, 2.3522]
+    radius_km: 60
+status: active

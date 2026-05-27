@@ -1,0 +1,18 @@
+# Example: "Photos of my daughter where only my wife or I are present"
+#
+# Demonstrates: managed target album, people predicates with
+# must_include / may_include / must_exclude_other_identifiable / no_unidentified_humans.
+#
+# Replace <paloma-id>, <manon-id>, <emeric-id> with real Immich person UUIDs
+# (visible at GET /api/v1/me/people once your Immich API key is configured).
+name: "Famille — restreint"
+target_album:
+  type: managed
+  name: "Paloma — Famille proche"
+match:
+  people:
+    must_include: [<paloma-id>]
+    may_include: [<manon-id>, <emeric-id>]
+    must_exclude_other_identifiable: true
+    no_unidentified_humans: true
+status: active
