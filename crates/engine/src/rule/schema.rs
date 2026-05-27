@@ -7,7 +7,14 @@
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 
+use super::match_expr::MatchExpr;
+
 /// A complete rule as authored in YAML.
+///
+/// `match_` is the block-tree shape [`MatchExpr`] as of POSTSHIP T19. Legacy
+/// flat YAML (`match: { date, location, people, media }`) still deserializes
+/// via [`MatchExpr`]'s dual-shape `Deserialize` and converts to a tree at parse
+/// time. Serialization always emits the canonical tree shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -16,7 +23,7 @@ pub struct Rule {
     pub name: String,
     pub target_album: TargetAlbum,
     #[serde(default, rename = "match")]
-    pub match_: MatchSpec,
+    pub match_: MatchExpr,
     #[serde(default)]
     pub status: RuleStatus,
 }

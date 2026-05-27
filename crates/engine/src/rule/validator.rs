@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use super::match_expr::{MatchExpr, MatchLeaf, PersonMode, MAX_TREE_DEPTH};
-use super::schema::{PeoplePredicate, Rule, TargetAlbum};
+use super::schema::{Rule, TargetAlbum};
 
 /// Resolver-layer transport / I/O failure. Distinct from
 /// [`ValidationError`] because "I can't tell" is different from "it's wrong".
@@ -158,34 +158,7 @@ pub async fn validate_rule(
         return Err(ValidationError::EmptyMatch);
     }
 
-    if let Some(loc) = &rule.match_.location {
-        if !(loc.radius_km > 0.0 && loc.radius_km <= 20_000.0) {
-            return Err(ValidationError::InvalidRadius(loc.radius_km));
-        }
-    }
-
-    if let Some(date) = &rule.match_.date {
-        if let (Some(from), Some(to)) = (date.from, date.to) {
-            if from > to {
-                return Err(ValidationError::InvalidDateRange {
-                    from: from.to_rfc3339(),
-                    to: to.to_rfc3339(),
-                });
-            }
-        }
-    }
-
-    if let Some(people) = &rule.match_.people {
-        let referenced: Vec<&str> = referenced_person_ids(people);
-        if !referenced.is_empty() {
-            let known = resolver.known_person_ids(owner_user_id).await?;
-            for id in referenced {
-                if !known.contains(id) {
-                    return Err(ValidationError::ForeignPersonId { id: id.to_string() });
-                }
-            }
-        }
-    }
+    validate_match_expr(&rule.match_, owner_user_id, resolver).await?;
 
     if let TargetAlbum::Existing { album_id } = &rule.target_album {
         if !resolver.is_album_writable(owner_user_id, album_id).await? {
@@ -353,20 +326,6 @@ fn validate_leaf(leaf: &MatchLeaf) -> Result<(), ValidationError> {
     }
 }
 
-fn referenced_person_ids(people: &PeoplePredicate) -> Vec<&str> {
-    let mut out = Vec::with_capacity(
-        people.must_include.len()
-            + people.must_include_any_of.len()
-            + people.may_include.len()
-            + people.must_exclude.len(),
-    );
-    out.extend(people.must_include.iter().map(String::as_str));
-    out.extend(people.must_include_any_of.iter().map(String::as_str));
-    out.extend(people.may_include.iter().map(String::as_str));
-    out.extend(people.must_exclude.iter().map(String::as_str));
-    out
-}
-
 /// Test fixtures. Available in unit tests and (via the `test-util` feature)
 /// to integration tests in dependent crates.
 #[cfg(any(test, feature = "test-util"))]
@@ -460,9 +419,20 @@ mod tests {
                 name: "managed album".to_string(),
                 shared_with: vec![],
             },
-            match_: MatchSpec::default(),
+            match_: MatchExpr::And(Vec::new()),
             status: RuleStatus::Active,
         }
+    }
+
+    /// Test helper: build a [`MatchExpr`] from a legacy [`MatchSpec`] field
+    /// builder. Replaces the pre-T19 `rule.match_.X = Some(Y)` idiom while
+    /// keeping the per-field test ergonomics. Single-field specs convert to
+    /// bare leaves (no redundant `And` wrap) via the `From<&MatchSpec>` impl,
+    /// matching what production parsing of legacy YAML produces.
+    fn legacy_match(f: impl FnOnce(&mut MatchSpec)) -> MatchExpr {
+        let mut spec = MatchSpec::default();
+        f(&mut spec);
+        MatchExpr::from(&spec)
     }
 
     fn resolver_with_persons(persons: &[&str]) -> FakeResourceResolver {
@@ -474,16 +444,18 @@ mod tests {
     #[tokio::test]
     async fn happy_path_ok() {
         let mut rule = base_rule();
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
-        });
-        rule.match_.location = Some(LocationPredicate {
-            center: [48.0, 2.0],
-            radius_km: 60.0,
-        });
-        rule.match_.people = Some(PeoplePredicate {
-            must_include: vec!["p1".into()],
-            ..PeoplePredicate::default()
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
+            s.location = Some(LocationPredicate {
+                center: [48.0, 2.0],
+                radius_km: 60.0,
+            });
+            s.people = Some(PeoplePredicate {
+                must_include: vec!["p1".into()],
+                ..PeoplePredicate::default()
+            });
         });
         let resolver = resolver_with_persons(&["p1", "p2"]);
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
@@ -501,9 +473,11 @@ mod tests {
     #[tokio::test]
     async fn radius_zero_rejected() {
         let mut rule = base_rule();
-        rule.match_.location = Some(LocationPredicate {
-            center: [0.0, 0.0],
-            radius_km: 0.0,
+        rule.match_ = legacy_match(|s| {
+            s.location = Some(LocationPredicate {
+                center: [0.0, 0.0],
+                radius_km: 0.0,
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -516,9 +490,11 @@ mod tests {
     #[tokio::test]
     async fn radius_negative_rejected() {
         let mut rule = base_rule();
-        rule.match_.location = Some(LocationPredicate {
-            center: [0.0, 0.0],
-            radius_km: -1.0,
+        rule.match_ = legacy_match(|s| {
+            s.location = Some(LocationPredicate {
+                center: [0.0, 0.0],
+                radius_km: -1.0,
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -528,9 +504,11 @@ mod tests {
     #[tokio::test]
     async fn radius_too_large_rejected() {
         let mut rule = base_rule();
-        rule.match_.location = Some(LocationPredicate {
-            center: [0.0, 0.0],
-            radius_km: 20_001.0,
+        rule.match_ = legacy_match(|s| {
+            s.location = Some(LocationPredicate {
+                center: [0.0, 0.0],
+                radius_km: 20_001.0,
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -540,9 +518,11 @@ mod tests {
     #[tokio::test]
     async fn radius_at_upper_bound_ok() {
         let mut rule = base_rule();
-        rule.match_.location = Some(LocationPredicate {
-            center: [0.0, 0.0],
-            radius_km: 20_000.0,
+        rule.match_ = legacy_match(|s| {
+            s.location = Some(LocationPredicate {
+                center: [0.0, 0.0],
+                radius_km: 20_000.0,
+            });
         });
         let resolver = FakeResourceResolver::empty();
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
@@ -559,9 +539,11 @@ mod tests {
             .unwrap()
             .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
             .unwrap();
-        rule.match_.date = Some(DatePredicate {
-            from: Some(from),
-            to: Some(to),
+        rule.match_ = legacy_match(|s| {
+            s.date = Some(DatePredicate {
+                from: Some(from),
+                to: Some(to),
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -576,23 +558,30 @@ mod tests {
             .unwrap()
             .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
             .unwrap();
-        rule.match_.date = Some(DatePredicate {
-            from: Some(stamp),
-            to: None,
+        rule.match_ = legacy_match(|s| {
+            s.date = Some(DatePredicate {
+                from: Some(stamp),
+                to: None,
+            });
         });
         let resolver = FakeResourceResolver::empty();
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
 
-        rule.match_.date = Some(DatePredicate {
-            from: None,
-            to: Some(stamp),
+        rule.match_ = legacy_match(|s| {
+            s.date = Some(DatePredicate {
+                from: None,
+                to: Some(stamp),
+            });
         });
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
     }
 
     async fn assert_foreign_in_list(make_people: impl FnOnce() -> PeoplePredicate) {
         let mut rule = base_rule();
-        rule.match_.people = Some(make_people());
+        let people = make_people();
+        rule.match_ = legacy_match(|s| {
+            s.people = Some(people);
+        });
         let resolver = resolver_with_persons(&["manon"]);
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
         match err {
@@ -640,9 +629,11 @@ mod tests {
     #[tokio::test]
     async fn people_predicate_with_no_ids_skips_resolver_call() {
         let mut rule = base_rule();
-        rule.match_.people = Some(PeoplePredicate {
-            no_unidentified_humans: true,
-            ..PeoplePredicate::default()
+        rule.match_ = legacy_match(|s| {
+            s.people = Some(PeoplePredicate {
+                no_unidentified_humans: true,
+                ..PeoplePredicate::default()
+            });
         });
         // Empty resolver; no person IDs to check ⇒ Ok.
         let resolver = FakeResourceResolver::empty();
@@ -655,8 +646,10 @@ mod tests {
         rule.target_album = TargetAlbum::Existing {
             album_id: "albX".to_string(),
         };
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty(); // no albums writable
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -672,8 +665,10 @@ mod tests {
         rule.target_album = TargetAlbum::Existing {
             album_id: "albA".to_string(),
         };
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty().with_writable_album(OWNER, "albA");
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
@@ -682,8 +677,10 @@ mod tests {
     #[tokio::test]
     async fn managed_album_skips_writability_check() {
         let mut rule = base_rule();
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         // Resolver has no writable albums for OWNER — managed target should not care.
         let resolver = FakeResourceResolver::empty();
@@ -694,8 +691,10 @@ mod tests {
     async fn invalid_id_uppercase_rejected() {
         let mut rule = base_rule();
         rule.id = Some("UPPERCASE".to_string());
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -707,8 +706,10 @@ mod tests {
     async fn invalid_id_empty_rejected() {
         let mut rule = base_rule();
         rule.id = Some(String::new());
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -719,8 +720,10 @@ mod tests {
     async fn invalid_id_leading_hyphen_rejected() {
         let mut rule = base_rule();
         rule.id = Some("-bad-start".to_string());
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -731,8 +734,10 @@ mod tests {
     async fn invalid_id_underscore_rejected() {
         let mut rule = base_rule();
         rule.id = Some("snake_case".to_string());
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -743,8 +748,10 @@ mod tests {
     async fn invalid_id_too_long_rejected() {
         let mut rule = base_rule();
         rule.id = Some("a".repeat(65));
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         let err = validate_rule(&rule, OWNER, &resolver).await.unwrap_err();
@@ -755,8 +762,10 @@ mod tests {
     async fn valid_id_slug_ok() {
         let mut rule = base_rule();
         rule.id = Some("valid-slug-123".to_string());
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
@@ -766,8 +775,10 @@ mod tests {
     async fn valid_id_starting_digit_ok() {
         let mut rule = base_rule();
         rule.id = Some("2024-paris".to_string());
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
@@ -777,8 +788,10 @@ mod tests {
     async fn valid_id_single_char_ok() {
         let mut rule = base_rule();
         rule.id = Some("a".to_string());
-        rule.match_.media = Some(MediaPredicate {
-            types: vec![MediaType::Photo],
+        rule.match_ = legacy_match(|s| {
+            s.media = Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            });
         });
         let resolver = FakeResourceResolver::empty();
         validate_rule(&rule, OWNER, &resolver).await.unwrap();
@@ -797,9 +810,11 @@ mod tests {
             }
         }
         let mut rule = base_rule();
-        rule.match_.people = Some(PeoplePredicate {
-            must_include: vec!["p1".into()],
-            ..PeoplePredicate::default()
+        rule.match_ = legacy_match(|s| {
+            s.people = Some(PeoplePredicate {
+                must_include: vec!["p1".into()],
+                ..PeoplePredicate::default()
+            });
         });
         let err = validate_rule(&rule, OWNER, &ErroringResolver)
             .await

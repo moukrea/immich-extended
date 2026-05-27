@@ -44,9 +44,9 @@ use common::crypto::MasterKey;
 use common::decisions::{finish_run, insert_run};
 use common::yolo_cache;
 use engine::predicate::{
-    evaluate_match, AssetSnapshot, AssetType, DecisionReason, PredicateOutcome,
+    evaluate_expr, AssetSnapshot, AssetType, DecisionReason, PredicateOutcome,
 };
-use engine::rule::{parse_rule, MatchSpec, TargetAlbum};
+use engine::rule::{parse_rule, MatchExpr, TargetAlbum};
 use immich_client::{ImmichAsset, ImmichAssetType, ImmichClient, ValidationError};
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -196,7 +196,7 @@ async fn cycle_body(
     let rule = load_rule(pool, rule_id).await?;
     let key = load_key(pool, master_key, &rule.owner_user_id).await?;
     let client = build_client(&key.base_url)?;
-    let match_spec: MatchSpec = serde_json::from_str(&rule.parsed_predicates)
+    let match_expr: MatchExpr = serde_json::from_str(&rule.parsed_predicates)
         .map_err(|e| CycleError::BadParsedPredicates(e.to_string()))?;
 
     // Resolve target album. For Existing-strategy rules `target_album_id` is
@@ -220,7 +220,7 @@ async fn cycle_body(
     let mut decided: Vec<(&ImmichAsset, PredicateOutcome)> = Vec::with_capacity(assets.len());
     for asset in &assets {
         let outcome =
-            decide_with_optional_yolo(pool, &client, &key.api_key, data_dir, &match_spec, asset)
+            decide_with_optional_yolo(pool, &client, &key.api_key, data_dir, &match_expr, asset)
                 .await?;
         decided.push((asset, outcome));
     }
@@ -466,36 +466,36 @@ async fn update_watermark_and_last_run(
     Ok(())
 }
 
-/// Evaluate a single asset against `match_spec`, lazily falling back to YOLO
+/// Evaluate a single asset against `match_expr`, lazily falling back to YOLO
 /// inference when (and only when) the cheaper predicates passed and the rule
-/// opted in via `people.no_unidentified_humans`.
+/// has a YOLO-dependent leaf left to decide.
 ///
 /// Returns the final outcome — the caller persists it as-is. Implements the
-/// pay-zero rule for non-YOLO rules: if the spec doesn't require YOLO, this
-/// function performs a single `evaluate_match` and returns.
+/// pay-zero rule for non-YOLO rules: if the tree doesn't require YOLO, this
+/// function performs a single [`evaluate_expr`] call and returns. The two-pass
+/// path runs only when the first evaluation returns
+/// [`DecisionReason::YoloUnimplemented`], meaning the tree walker exhausted
+/// every cheap branch without deciding and a YOLO sibling is still pending.
 async fn decide_with_optional_yolo(
     pool: &SqlitePool,
     client: &ImmichClient,
     api_key: &str,
     data_dir: &Path,
-    match_spec: &MatchSpec,
+    match_expr: &MatchExpr,
     asset: &ImmichAsset,
 ) -> Result<PredicateOutcome, CycleError> {
     let snapshot = snapshot_from_immich(asset);
-    let outcome = evaluate_match(match_spec, &snapshot);
-    if !match_spec.requires_yolo() {
+    let outcome = evaluate_expr(match_expr, &snapshot);
+    if !match_expr.requires_yolo() {
         return Ok(outcome);
     }
-    // Only re-evaluate when the cheap predicates ALL passed and the only
-    // remaining gate is the YOLO sub-rule. Any other skip reason is final
-    // (cheap-first dispatch already ruled the asset out).
     if outcome.reason != DecisionReason::YoloUnimplemented {
         return Ok(outcome);
     }
     let yolo_count = resolve_yolo_count(pool, client, api_key, data_dir, asset).await?;
     let mut snapshot = snapshot;
     snapshot.yolo_person_count = Some(yolo_count);
-    Ok(evaluate_match(match_spec, &snapshot))
+    Ok(evaluate_expr(match_expr, &snapshot))
 }
 
 /// Cache-aware YOLO dispatch. Returns the person count, downloading +

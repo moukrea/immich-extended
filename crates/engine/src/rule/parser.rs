@@ -91,11 +91,11 @@ status: active
         let rule = roundtrip(APPX_FAMILLE_RESTREINT);
         assert_eq!(rule.name, "Famille — restreint");
         assert!(matches!(rule.target_album, TargetAlbum::Managed { .. }));
-        let people = rule.match_.people.as_ref().expect("people predicate");
-        assert_eq!(people.must_include, vec!["paloma-id"]);
-        assert_eq!(people.may_include, vec!["manon-id", "emeric-id"]);
-        assert!(people.must_exclude_other_identifiable);
-        assert!(people.no_unidentified_humans);
+        let referenced = rule.match_.referenced_person_ids();
+        assert!(referenced.contains(&"paloma-id"));
+        assert!(referenced.contains(&"manon-id"));
+        assert!(referenced.contains(&"emeric-id"));
+        assert!(rule.match_.requires_yolo(), "no_unidentified_humans → YOLO");
         assert_eq!(rule.status, RuleStatus::Active);
     }
 
@@ -107,22 +107,42 @@ status: active
             TargetAlbum::Existing { album_id } => assert_eq!(album_id, "album-uuid-1234"),
             _ => panic!("expected existing target album"),
         }
-        let date = rule.match_.date.as_ref().expect("date predicate");
-        assert!(date.from.is_some());
-        assert!(date.to.is_some());
-        let loc = rule.match_.location.as_ref().expect("location predicate");
-        assert_eq!(loc.center, [48.8566, 2.3522]);
-        assert_eq!(loc.radius_km, 60.0);
+        // Tree shape: top-level AND of DateRange + Location.
+        match &rule.match_ {
+            crate::rule::MatchExpr::And(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(
+                    children.iter().any(|c| matches!(
+                        c,
+                        crate::rule::MatchExpr::Leaf(crate::rule::MatchLeaf::DateRange { .. })
+                    )),
+                    "expected a DateRange leaf"
+                );
+                assert!(
+                    children.iter().any(|c| matches!(
+                        c,
+                        crate::rule::MatchExpr::Leaf(crate::rule::MatchLeaf::Location { .. })
+                    )),
+                    "expected a Location leaf"
+                );
+            }
+            other => panic!("expected And of date+location, got {other:?}"),
+        }
     }
 
     #[test]
     fn appendix_a_enfants_ensemble_roundtrips() {
         let rule = roundtrip(APPX_ENFANTS_ENSEMBLE);
         assert_eq!(rule.name, "Enfants ensemble");
-        let people = rule.match_.people.as_ref().expect("people predicate");
-        assert_eq!(people.must_include, vec!["kid1-id", "kid2-id"]);
-        assert!(people.must_exclude_other_identifiable);
-        assert!(!people.no_unidentified_humans);
+        let referenced = rule.match_.referenced_person_ids();
+        assert!(referenced.contains(&"kid1-id"));
+        assert!(referenced.contains(&"kid2-id"));
+        // must_exclude_other_identifiable=true, no_unidentified_humans=false
+        // → face_recognition leaf with yolo_count_check: false (no YOLO).
+        assert!(
+            !rule.match_.requires_yolo(),
+            "must_exclude_other_identifiable alone doesn't need YOLO"
+        );
     }
 
     #[test]
@@ -153,8 +173,30 @@ status: active
 "#;
         let rule = parse_rule(yaml).expect("canonical example parses");
         assert_eq!(rule.id.as_deref(), Some("paris-voyage-juillet-2024"));
-        assert_eq!(rule.match_.media.as_ref().unwrap().types.len(), 2);
+        // Tree contains a media_type leaf with [photo, video].
+        let has_media = walk_leaves(&rule.match_)
+            .iter()
+            .any(|l| matches!(l, crate::rule::MatchLeaf::MediaType { types } if types.len() == 2));
+        assert!(has_media, "expected media_type leaf with 2 types");
         assert_eq!(rule.target_album.kind(), TargetAlbumKind::Existing);
+    }
+
+    /// Test helper: depth-first collect of every leaf in a tree.
+    fn walk_leaves(expr: &crate::rule::MatchExpr) -> Vec<&crate::rule::MatchLeaf> {
+        fn rec<'a>(e: &'a crate::rule::MatchExpr, out: &mut Vec<&'a crate::rule::MatchLeaf>) {
+            match e {
+                crate::rule::MatchExpr::Leaf(l) => out.push(l),
+                crate::rule::MatchExpr::Not(c) => rec(c, out),
+                crate::rule::MatchExpr::And(cs) | crate::rule::MatchExpr::Or(cs) => {
+                    for c in cs {
+                        rec(c, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        rec(expr, &mut out);
+        out
     }
 
     #[test]
@@ -332,9 +374,16 @@ match:
     from: 2024-07-15T00:00:00+02:00
 "#;
         let rule = parse_rule(yaml).expect("ok");
-        let date = rule.match_.date.as_ref().unwrap();
-        assert!(date.from.is_some());
-        assert!(date.to.is_none());
+        let leaves = walk_leaves(&rule.match_);
+        let date = leaves
+            .iter()
+            .find_map(|l| match l {
+                crate::rule::MatchLeaf::DateRange { from, to } => Some((*from, *to)),
+                _ => None,
+            })
+            .expect("expected a DateRange leaf");
+        assert!(date.0.is_some());
+        assert!(date.1.is_none());
     }
 
     #[test]
@@ -362,7 +411,14 @@ match:
     types: [photo]
 "#;
         let rule = parse_rule(yaml).expect("ok");
-        let media = rule.match_.media.as_ref().unwrap();
-        assert_eq!(media.types, vec![MediaType::Photo]);
+        let leaves = walk_leaves(&rule.match_);
+        let media_types = leaves
+            .iter()
+            .find_map(|l| match l {
+                crate::rule::MatchLeaf::MediaType { types } => Some(types.clone()),
+                _ => None,
+            })
+            .expect("expected a MediaType leaf");
+        assert_eq!(media_types, vec![MediaType::Photo]);
     }
 }

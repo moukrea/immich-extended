@@ -99,7 +99,26 @@ impl PeopleCountOp {
     }
 }
 
+impl Default for MatchExpr {
+    fn default() -> Self {
+        MatchExpr::And(Vec::new())
+    }
+}
+
 impl MatchExpr {
+    /// True iff the tree is structurally empty (no leaves). The validator
+    /// rejects empty matches at CRUD time; the evaluator therefore never sees
+    /// one in practice. Kept as a cheap top-level check.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            MatchExpr::And(children) | MatchExpr::Or(children) => {
+                children.is_empty() || children.iter().all(Self::is_empty)
+            }
+            MatchExpr::Not(child) => child.is_empty(),
+            MatchExpr::Leaf(_) => false,
+        }
+    }
+
     /// True iff evaluating this tree on any asset can require a YOLO call.
     /// Per design doc §3: only `PeopleCount` and `FaceRecognition` with
     /// `yolo_count_check: true` opt in. A plain `FaceRecognition` with
@@ -293,45 +312,63 @@ enum LeafDe {
     },
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum MatchExprDe {
-    Group(GroupDe),
-    Leaf(LeafDe),
-    Legacy(MatchSpec),
-}
-
+/// Key-based dispatcher: materializes the YAML/JSON map once, peeks at keys, then
+/// re-deserializes through the right variant. Compared to the prior
+/// `#[serde(untagged)]` enum this preserves the inner variant's
+/// `deny_unknown_fields` error detail (e.g. "unknown field `magic`" instead of
+/// the generic "data did not match any variant").
 impl<'de> Deserialize<'de> for MatchExpr {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = MatchExprDe::deserialize(d)?;
-        Ok(match raw {
-            MatchExprDe::Group(GroupDe::And { children }) => MatchExpr::And(children),
-            MatchExprDe::Group(GroupDe::Or { children }) => MatchExpr::Or(children),
-            MatchExprDe::Group(GroupDe::Not { child }) => MatchExpr::Not(child),
-            MatchExprDe::Leaf(LeafDe::Person { mode, person_id }) => {
-                MatchExpr::Leaf(MatchLeaf::Person { mode, person_id })
+        // serde_yaml::Value is the universal intermediate: its own Deserialize
+        // impl is format-agnostic (works against any backend), and our parser
+        // already pulls in serde_yaml.
+        let value = serde_yaml::Value::deserialize(d).map_err(serde::de::Error::custom)?;
+        let mapping = match &value {
+            serde_yaml::Value::Mapping(m) => m,
+            // Non-map shapes: only legacy (which is itself a map) is valid;
+            // delegate to it so the error message reflects "expected struct".
+            _ => {
+                let spec = MatchSpec::deserialize(value).map_err(serde::de::Error::custom)?;
+                return Ok(MatchExpr::from(&spec));
             }
-            MatchExprDe::Leaf(LeafDe::PeopleCount { op, value }) => {
-                MatchExpr::Leaf(MatchLeaf::PeopleCount { op, value })
-            }
-            MatchExprDe::Leaf(LeafDe::FaceRecognition {
-                allow_unrecognized,
-                yolo_count_check,
-            }) => MatchExpr::Leaf(MatchLeaf::FaceRecognition {
-                allow_unrecognized,
-                yolo_count_check,
-            }),
-            MatchExprDe::Leaf(LeafDe::DateRange { from, to }) => {
-                MatchExpr::Leaf(MatchLeaf::DateRange { from, to })
-            }
-            MatchExprDe::Leaf(LeafDe::Location { center, radius_km }) => {
-                MatchExpr::Leaf(MatchLeaf::Location { center, radius_km })
-            }
-            MatchExprDe::Leaf(LeafDe::MediaType { types }) => {
-                MatchExpr::Leaf(MatchLeaf::MediaType { types })
-            }
-            MatchExprDe::Legacy(spec) => MatchExpr::from(&spec),
-        })
+        };
+        let has_op = mapping
+            .keys()
+            .any(|k| matches!(k, serde_yaml::Value::String(s) if s == "op"));
+        let has_type = mapping
+            .keys()
+            .any(|k| matches!(k, serde_yaml::Value::String(s) if s == "type"));
+        // `type` wins over `op`: a `people_count` leaf carries both keys
+        // (`type: people_count, op: eq`) and the `op` field there is the
+        // comparison operator, not a tree group discriminator.
+        if has_type {
+            let leaf = LeafDe::deserialize(value).map_err(serde::de::Error::custom)?;
+            return Ok(MatchExpr::Leaf(match leaf {
+                LeafDe::Person { mode, person_id } => MatchLeaf::Person { mode, person_id },
+                LeafDe::PeopleCount { op, value } => MatchLeaf::PeopleCount { op, value },
+                LeafDe::FaceRecognition {
+                    allow_unrecognized,
+                    yolo_count_check,
+                } => MatchLeaf::FaceRecognition {
+                    allow_unrecognized,
+                    yolo_count_check,
+                },
+                LeafDe::DateRange { from, to } => MatchLeaf::DateRange { from, to },
+                LeafDe::Location { center, radius_km } => MatchLeaf::Location { center, radius_km },
+                LeafDe::MediaType { types } => MatchLeaf::MediaType { types },
+            }));
+        }
+        if has_op {
+            let grp = GroupDe::deserialize(value).map_err(serde::de::Error::custom)?;
+            return Ok(match grp {
+                GroupDe::And { children } => MatchExpr::And(children),
+                GroupDe::Or { children } => MatchExpr::Or(children),
+                GroupDe::Not { child } => MatchExpr::Not(child),
+            });
+        }
+        // Neither `op` nor `type` → legacy flat shape.
+        let spec = MatchSpec::deserialize(value).map_err(serde::de::Error::custom)?;
+        Ok(MatchExpr::from(&spec))
     }
 }
 
@@ -341,8 +378,18 @@ impl<'de> Deserialize<'de> for MatchExpr {
 
 impl From<&MatchSpec> for MatchExpr {
     fn from(spec: &MatchSpec) -> Self {
+        // Children are emitted in PRD §7 cheap-first order
+        // (media → date → location → people) so the tree evaluator's
+        // stable cheap-first dispatch picks the same predicate that the old
+        // `evaluate_match` would have, preserving the slug emitted on skip
+        // for existing rules in the DB.
         let mut children: Vec<MatchExpr> = Vec::new();
 
+        if let Some(media) = &spec.media {
+            children.push(MatchExpr::Leaf(MatchLeaf::MediaType {
+                types: media.types.clone(),
+            }));
+        }
         if let Some(date) = &spec.date {
             children.push(MatchExpr::Leaf(MatchLeaf::DateRange {
                 from: date.from,
@@ -353,11 +400,6 @@ impl From<&MatchSpec> for MatchExpr {
             children.push(MatchExpr::Leaf(MatchLeaf::Location {
                 center: loc.center,
                 radius_km: loc.radius_km,
-            }));
-        }
-        if let Some(media) = &spec.media {
-            children.push(MatchExpr::Leaf(MatchLeaf::MediaType {
-                types: media.types.clone(),
             }));
         }
         if let Some(people) = &spec.people {
@@ -391,16 +433,31 @@ impl From<&MatchSpec> for MatchExpr {
                 }));
             }
             for pid in &people.must_exclude {
-                children.push(MatchExpr::Not(Box::new(MatchExpr::Leaf(
-                    MatchLeaf::Person {
-                        mode: PersonMode::Includes,
-                        person_id: pid.clone(),
-                    },
-                ))));
+                // Design doc §6 lists NOT(Person(Includes)) as the canonical tree
+                // shape, but the From conversion uses Person(MustExclude) directly
+                // to preserve the legacy `people_must_exclude_present` decision
+                // slug for assets matched by deployed rules in the DB. The two
+                // tree shapes evaluate identically; the slug is the only
+                // observable difference and the operator-facing contract
+                // prioritizes slug stability for already-recorded rules. New
+                // rules authored via the block builder MAY produce
+                // NOT(Person(Includes)) and that's fine — its skip emits
+                // `not_branch_satisfied` cleanly.
+                children.push(MatchExpr::Leaf(MatchLeaf::Person {
+                    mode: PersonMode::MustExclude,
+                    person_id: pid.clone(),
+                }));
             }
             if people.must_exclude_other_identifiable || people.no_unidentified_humans {
                 children.push(MatchExpr::Leaf(MatchLeaf::FaceRecognition {
-                    allow_unrecognized: false,
+                    // allow_unrecognized inverts must_exclude_other_identifiable.
+                    // When the legacy spec only has `no_unidentified_humans=true`
+                    // (without must_exclude_other_identifiable), the rule
+                    // doesn't enforce a roster — it only checks yolo_count vs
+                    // identified_count. Setting allow_unrecognized=true here
+                    // preserves that semantic; yolo_count_check still triggers
+                    // the YOLO check independently.
+                    allow_unrecognized: !people.must_exclude_other_identifiable,
                     yolo_count_check: people.no_unidentified_humans,
                 }));
             }
@@ -618,7 +675,11 @@ mod tests {
     }
 
     #[test]
-    fn must_exclude_becomes_not_includes() {
+    fn must_exclude_becomes_person_must_exclude() {
+        // From<&MatchSpec> emits Person(MustExclude) (NOT the design-doc
+        // canonical NOT(Person(Includes))) so the deployed rule slug
+        // `people_must_exclude_present` is preserved across the T19 evaluator
+        // swap. See comment on the From impl.
         let spec = MatchSpec {
             people: Some(PeoplePredicate {
                 must_exclude: vec!["stranger".into()],
@@ -627,22 +688,22 @@ mod tests {
             ..Default::default()
         };
         let expr = MatchExpr::from(&spec);
-        match expr {
-            MatchExpr::Not(child) => {
-                assert!(matches!(
-                    child.as_ref(),
-                    MatchExpr::Leaf(MatchLeaf::Person {
-                        mode: PersonMode::Includes,
-                        ..
-                    })
-                ));
-            }
-            other => panic!("expected Not, got {other:?}"),
-        }
+        assert_eq!(
+            expr,
+            MatchExpr::Leaf(MatchLeaf::Person {
+                mode: PersonMode::MustExclude,
+                person_id: "stranger".to_string(),
+            }),
+            "expected Person(MustExclude, stranger) bare leaf, got {expr:?}",
+        );
     }
 
     #[test]
     fn no_unidentified_alone_inserts_yolo_face_recognition() {
+        // Legacy `no_unidentified_humans=true` alone (without
+        // must_exclude_other_identifiable) maps to allow_unrecognized=true so
+        // the recognized-set check stays disabled — only the YOLO count
+        // gate runs. See comment on From<&MatchSpec>.
         let spec = MatchSpec {
             people: Some(PeoplePredicate {
                 no_unidentified_humans: true,
@@ -654,7 +715,7 @@ mod tests {
         assert_eq!(
             expr,
             MatchExpr::Leaf(MatchLeaf::FaceRecognition {
-                allow_unrecognized: false,
+                allow_unrecognized: true,
                 yolo_count_check: true,
             })
         );

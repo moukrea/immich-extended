@@ -13,10 +13,13 @@
 //! (media → date → location → people) and short-circuits on the first
 //! non-match.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 
 use crate::rule::{
-    DatePredicate, LocationPredicate, MatchSpec, MediaPredicate, MediaType, PeoplePredicate,
+    DatePredicate, LocationPredicate, MatchExpr, MatchLeaf, MatchSpec, MediaPredicate, MediaType,
+    PeopleCountOp, PeoplePredicate, PersonMode,
 };
 
 /// Immich asset kind, normalized for predicate dispatch.
@@ -241,6 +244,245 @@ pub fn eval_people(p: &PeoplePredicate, asset: &AssetSnapshot) -> PredicateOutco
         }
     }
     if p.no_unidentified_humans {
+        let Some(yolo_count) = asset.yolo_person_count else {
+            return PredicateOutcome::skipped(DecisionReason::YoloUnimplemented);
+        };
+        let identified = u32::try_from(asset.face_person_ids.len()).unwrap_or(u32::MAX);
+        if yolo_count > identified {
+            return PredicateOutcome::skipped(DecisionReason::PeopleUnidentifiedHumanPresent {
+                yolo_count,
+                identified,
+            });
+        }
+    }
+    PredicateOutcome::matched()
+}
+
+/// Block-tree evaluator (POSTSHIP T19). Walks a [`MatchExpr`] recursively,
+/// dispatching cheap (Immich-metadata) children before YOLO-gated ones at every
+/// `AND` / `OR` node, and short-circuiting on the first decisive child.
+///
+/// **Three-state semantics**. Each subtree returns one of:
+/// * `matched: true, reason: Matched` — the subtree said yes.
+/// * `matched: false, reason: <specific>` — the subtree said no, with a concrete
+///   reason slug from the leaf or `tree_short_circuit_or` / `not_branch_satisfied`
+///   for groups.
+/// * `matched: false, reason: YoloUnimplemented` — the subtree's verdict
+///   depends on a YOLO count that isn't in the snapshot. The caller (engine
+///   cycle) is expected to fetch YOLO, populate `snapshot.yolo_person_count`,
+///   and re-evaluate. This is the existing M5-T6 lazy-YOLO contract — reusing
+///   the slug keeps the engine-cycle path unchanged.
+///
+/// **Cheap-first**. Within each AND/OR, children are evaluated in two passes:
+/// first the cheap ones (`requires_yolo() == false`), then the YOLO-gated
+/// ones. AND short-circuits on the first `false`; OR short-circuits on the
+/// first `true`. If cheap children alone can't decide and a YOLO sibling
+/// remains, the returned outcome is `YoloUnimplemented` so the caller fetches
+/// once and retries — never twice (a single asset gets at most one YOLO call
+/// per cycle; coalescence is implicit because the snapshot is the only shared
+/// state and every YOLO leaf reads the same `Some(n)` after retry).
+///
+/// **`face_recognition(allow_unrecognized: false)`**. The leaf checks every
+/// face Immich resolved on the asset against the rule's "recognized set" — the
+/// union of all `person_id`s referenced anywhere in the tree (any mode). The
+/// recognized set is computed once at the top of [`evaluate_expr`] and passed
+/// down via the recursive context.
+pub fn evaluate_expr(expr: &MatchExpr, asset: &AssetSnapshot) -> PredicateOutcome {
+    let recognized: HashSet<&str> = expr.referenced_person_ids().into_iter().collect();
+    evaluate_node(expr, asset, &recognized)
+}
+
+fn evaluate_node(
+    expr: &MatchExpr,
+    asset: &AssetSnapshot,
+    recognized: &HashSet<&str>,
+) -> PredicateOutcome {
+    match expr {
+        MatchExpr::Leaf(leaf) => evaluate_leaf(leaf, asset, recognized),
+        MatchExpr::Not(child) => {
+            let inner = evaluate_node(child, asset, recognized);
+            if inner.reason == DecisionReason::YoloUnimplemented {
+                return inner;
+            }
+            if inner.matched {
+                PredicateOutcome::skipped(DecisionReason::NotBranchSatisfied)
+            } else {
+                PredicateOutcome::matched()
+            }
+        }
+        MatchExpr::And(children) => evaluate_and(children, asset, recognized),
+        MatchExpr::Or(children) => evaluate_or(children, asset, recognized),
+    }
+}
+
+/// AND walker: cheap children first, short-circuit on first non-YOLO `false`.
+/// Empty AND matches (consistent with `evaluate_match` on an empty `MatchSpec`,
+/// preserved for the validator-rejects-empty-at-CRUD invariant).
+fn evaluate_and(
+    children: &[MatchExpr],
+    asset: &AssetSnapshot,
+    recognized: &HashSet<&str>,
+) -> PredicateOutcome {
+    let order = cheap_first_order(children);
+    let mut pending_yolo: Option<PredicateOutcome> = None;
+    for i in order {
+        let outcome = evaluate_node(&children[i], asset, recognized);
+        if outcome.reason == DecisionReason::YoloUnimplemented {
+            pending_yolo = Some(outcome);
+            continue;
+        }
+        if !outcome.matched {
+            return outcome;
+        }
+    }
+    if let Some(p) = pending_yolo {
+        return p;
+    }
+    PredicateOutcome::matched()
+}
+
+/// OR walker: cheap children first, short-circuit on first non-YOLO `true`.
+/// All-cheap-fail with no YOLO sibling → `tree_short_circuit_or`. If the
+/// cheap children couldn't establish a match and a YOLO sibling is pending,
+/// return `YoloUnimplemented` so the caller fetches YOLO and retries.
+fn evaluate_or(
+    children: &[MatchExpr],
+    asset: &AssetSnapshot,
+    recognized: &HashSet<&str>,
+) -> PredicateOutcome {
+    let order = cheap_first_order(children);
+    let mut pending_yolo: Option<PredicateOutcome> = None;
+    for i in order {
+        let outcome = evaluate_node(&children[i], asset, recognized);
+        if outcome.reason == DecisionReason::YoloUnimplemented {
+            pending_yolo = Some(outcome);
+            continue;
+        }
+        if outcome.matched {
+            return PredicateOutcome::matched();
+        }
+    }
+    if let Some(p) = pending_yolo {
+        return p;
+    }
+    PredicateOutcome::skipped(DecisionReason::TreeShortCircuitOr)
+}
+
+/// Indices into `children` in cost-ascending order: non-YOLO first, then YOLO.
+/// Within each class the original order is preserved (stable sort) so the
+/// operator's authored ordering still influences which siblings short-circuit
+/// first inside a class.
+fn cheap_first_order(children: &[MatchExpr]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..children.len()).collect();
+    indices.sort_by_key(|&i| u8::from(children[i].requires_yolo()));
+    indices
+}
+
+fn evaluate_leaf(
+    leaf: &MatchLeaf,
+    asset: &AssetSnapshot,
+    recognized: &HashSet<&str>,
+) -> PredicateOutcome {
+    match leaf {
+        MatchLeaf::DateRange { from, to } => eval_date(
+            &DatePredicate {
+                from: *from,
+                to: *to,
+            },
+            asset,
+        ),
+        MatchLeaf::Location { center, radius_km } => eval_location(
+            &LocationPredicate {
+                center: *center,
+                radius_km: *radius_km,
+            },
+            asset,
+        ),
+        MatchLeaf::MediaType { types } => eval_media(
+            &MediaPredicate {
+                types: types.clone(),
+            },
+            asset,
+        ),
+        MatchLeaf::Person { mode, person_id } => evaluate_person(*mode, person_id, asset),
+        MatchLeaf::PeopleCount { op, value } => evaluate_people_count(*op, *value, asset),
+        MatchLeaf::FaceRecognition {
+            allow_unrecognized,
+            yolo_count_check,
+        } => evaluate_face_recognition(*allow_unrecognized, *yolo_count_check, asset, recognized),
+    }
+}
+
+fn evaluate_person(mode: PersonMode, person_id: &str, asset: &AssetSnapshot) -> PredicateOutcome {
+    let present = asset.face_person_ids.iter().any(|id| id == person_id);
+    match mode {
+        PersonMode::MustInclude | PersonMode::Includes => {
+            if present {
+                PredicateOutcome::matched()
+            } else {
+                PredicateOutcome::skipped(DecisionReason::PeopleMustIncludeMissing {
+                    missing_id: person_id.to_string(),
+                })
+            }
+        }
+        // `may_include` never alone determines pass/fail; it's a hint for the
+        // `face_recognition` recognized-set lookup. As a leaf it always
+        // matches — the actual exclusion of foreign faces happens in the
+        // `face_recognition` leaf that also has to be present (design doc §3).
+        PersonMode::MayInclude => PredicateOutcome::matched(),
+        PersonMode::MustExclude => {
+            if present {
+                PredicateOutcome::skipped(DecisionReason::PeopleMustExcludePresent {
+                    id: person_id.to_string(),
+                })
+            } else {
+                PredicateOutcome::matched()
+            }
+        }
+    }
+}
+
+fn evaluate_people_count(
+    op: PeopleCountOp,
+    target: u32,
+    asset: &AssetSnapshot,
+) -> PredicateOutcome {
+    let Some(observed) = asset.yolo_person_count else {
+        return PredicateOutcome::skipped(DecisionReason::YoloUnimplemented);
+    };
+    if op.compare(observed, target) {
+        PredicateOutcome::matched()
+    } else {
+        PredicateOutcome::skipped(DecisionReason::PeopleCountMismatch {
+            op,
+            target,
+            observed,
+        })
+    }
+}
+
+fn evaluate_face_recognition(
+    allow_unrecognized: bool,
+    yolo_count_check: bool,
+    asset: &AssetSnapshot,
+    recognized: &HashSet<&str>,
+) -> PredicateOutcome {
+    // Two independent sub-rules. Either, both, or neither may be active. The
+    // design doc §3 phrasing ("yolo_count_check only matters when
+    // allow_unrecognized=false") is intentionally relaxed here: the legacy
+    // `no_unidentified_humans=true && must_exclude_other_identifiable=false`
+    // spec rolled to a `FaceRecognition { allow_unrecognized: true,
+    // yolo_count_check: true }` leaf and must keep firing the YOLO check.
+    if !allow_unrecognized {
+        for face_id in &asset.face_person_ids {
+            if !recognized.contains(face_id.as_str()) {
+                return PredicateOutcome::skipped(DecisionReason::PeopleOtherIdentifiablePresent {
+                    id: face_id.clone(),
+                });
+            }
+        }
+    }
+    if yolo_count_check {
         let Some(yolo_count) = asset.yolo_person_count else {
             return PredicateOutcome::skipped(DecisionReason::YoloUnimplemented);
         };
@@ -935,5 +1177,341 @@ mod tests {
             DecisionReason::NotBranchSatisfied.slug(),
             "not_branch_satisfied"
         );
+    }
+
+    // ---- evaluate_expr (T19 tree walker) ----
+
+    use crate::rule::{MatchExpr, MatchLeaf, PeopleCountOp, PersonMode};
+
+    fn paloma_must_include() -> MatchExpr {
+        MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::MustInclude,
+            person_id: "paloma".into(),
+        })
+    }
+
+    fn emeric_must_include() -> MatchExpr {
+        MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::MustInclude,
+            person_id: "emeric".into(),
+        })
+    }
+
+    fn people_count_eq(n: u32) -> MatchExpr {
+        MatchExpr::Leaf(MatchLeaf::PeopleCount {
+            op: PeopleCountOp::Eq,
+            value: n,
+        })
+    }
+
+    fn photo_with_face(face: &str) -> AssetSnapshot {
+        AssetSnapshot {
+            face_person_ids: vec![face.into()],
+            ..photo()
+        }
+    }
+
+    #[test]
+    fn evaluate_expr_single_leaf_matches() {
+        let expr = paloma_must_include();
+        assert!(evaluate_expr(&expr, &photo_with_face("paloma")).matched);
+    }
+
+    #[test]
+    fn evaluate_expr_single_leaf_skips() {
+        let expr = paloma_must_include();
+        let outcome = evaluate_expr(&expr, &photo_with_face("manon"));
+        assert!(!outcome.matched);
+        assert_eq!(
+            outcome.reason,
+            DecisionReason::PeopleMustIncludeMissing {
+                missing_id: "paloma".into()
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_expr_and_short_circuits_on_first_miss() {
+        // AND(date_in_future, people=paloma): asset has paloma but date fails
+        // on a future bound. Expected outcome: date_out_of_range, NOT
+        // people_must_include_missing.
+        let date_future = MatchExpr::Leaf(MatchLeaf::DateRange {
+            from: Some(fixed(2099, 1, 1)),
+            to: None,
+        });
+        let expr = MatchExpr::And(vec![date_future, paloma_must_include()]);
+        let outcome = evaluate_expr(&expr, &photo_with_face("paloma"));
+        assert!(!outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::DateOutOfRange);
+    }
+
+    #[test]
+    fn evaluate_expr_or_short_circuits_on_first_match() {
+        // OR(paloma, emeric): asset has emeric → match. The cheap-first walker
+        // visits cheap children first (both cheap here) in authored order.
+        let expr = MatchExpr::Or(vec![paloma_must_include(), emeric_must_include()]);
+        let outcome = evaluate_expr(&expr, &photo_with_face("emeric"));
+        assert!(outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::Matched);
+    }
+
+    #[test]
+    fn evaluate_expr_or_all_fail_emits_tree_short_circuit() {
+        let expr = MatchExpr::Or(vec![paloma_must_include(), emeric_must_include()]);
+        let outcome = evaluate_expr(&expr, &photo_with_face("manon"));
+        assert!(!outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::TreeShortCircuitOr);
+    }
+
+    #[test]
+    fn evaluate_expr_not_inverts() {
+        // NOT(person=manon): asset without manon → match.
+        let inner = MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::MustInclude,
+            person_id: "manon".into(),
+        });
+        let expr = MatchExpr::Not(Box::new(inner));
+        assert!(evaluate_expr(&expr, &photo_with_face("paloma")).matched);
+    }
+
+    #[test]
+    fn evaluate_expr_not_branch_satisfied_when_inner_matches() {
+        // NOT(paloma_must_include): asset HAS paloma → inner matches → NOT
+        // skips with `not_branch_satisfied`.
+        let expr = MatchExpr::Not(Box::new(paloma_must_include()));
+        let outcome = evaluate_expr(&expr, &photo_with_face("paloma"));
+        assert!(!outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::NotBranchSatisfied);
+    }
+
+    #[test]
+    fn evaluate_expr_or_cheap_first_skips_yolo_when_cheap_matches() {
+        // OR(paloma, people_count==2): asset has paloma and NO yolo count.
+        // Cheap leaf matches → walker short-circuits → YOLO never consulted.
+        let expr = MatchExpr::Or(vec![paloma_must_include(), people_count_eq(2)]);
+        let asset = AssetSnapshot {
+            face_person_ids: vec!["paloma".into()],
+            yolo_person_count: None,
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset);
+        assert!(outcome.matched, "cheap leaf should match before YOLO fires");
+        assert_eq!(outcome.reason, DecisionReason::Matched);
+    }
+
+    #[test]
+    fn evaluate_expr_or_cheap_fails_returns_yolo_unimplemented() {
+        // OR(paloma, people_count==2): asset has neither paloma face nor
+        // yolo count. Cheap fails → walker pivots to YOLO sibling → returns
+        // YoloUnimplemented so caller fetches.
+        let expr = MatchExpr::Or(vec![paloma_must_include(), people_count_eq(2)]);
+        let asset = AssetSnapshot {
+            face_person_ids: vec!["manon".into()],
+            yolo_person_count: None,
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset);
+        assert!(!outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::YoloUnimplemented);
+    }
+
+    #[test]
+    fn evaluate_expr_or_yolo_count_match_after_cheap_fail() {
+        // Same OR but yolo count is populated (engine-cycle retry path).
+        // people_count_eq(2) with observed=2 → match.
+        let expr = MatchExpr::Or(vec![paloma_must_include(), people_count_eq(2)]);
+        let asset = AssetSnapshot {
+            face_person_ids: vec!["manon".into()],
+            yolo_person_count: Some(2),
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset);
+        assert!(outcome.matched);
+    }
+
+    #[test]
+    fn evaluate_expr_and_cheap_fails_skips_yolo() {
+        // AND(date_in_future, people_count==2): cheap fails on date → no YOLO.
+        let date_future = MatchExpr::Leaf(MatchLeaf::DateRange {
+            from: Some(fixed(2099, 1, 1)),
+            to: None,
+        });
+        let expr = MatchExpr::And(vec![date_future, people_count_eq(2)]);
+        let asset = AssetSnapshot {
+            yolo_person_count: None,
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset);
+        assert!(!outcome.matched);
+        // Should be DateOutOfRange (cheap first), NOT YoloUnimplemented.
+        assert_eq!(outcome.reason, DecisionReason::DateOutOfRange);
+    }
+
+    #[test]
+    fn evaluate_expr_people_count_mismatch_carries_op_target_observed() {
+        let expr = people_count_eq(1);
+        let asset = AssetSnapshot {
+            yolo_person_count: Some(3),
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset);
+        assert!(!outcome.matched);
+        assert_eq!(
+            outcome.reason,
+            DecisionReason::PeopleCountMismatch {
+                op: PeopleCountOp::Eq,
+                target: 1,
+                observed: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_expr_face_recognition_recognized_set_includes_tree_person_ids() {
+        // AND(person=paloma, face_recognition(allow_unrecognized=false, no
+        // YOLO check)): asset has only paloma → recognized set = {paloma}
+        // → all faces recognized → match.
+        let expr = MatchExpr::And(vec![
+            paloma_must_include(),
+            MatchExpr::Leaf(MatchLeaf::FaceRecognition {
+                allow_unrecognized: false,
+                yolo_count_check: false,
+            }),
+        ]);
+        let asset = AssetSnapshot {
+            face_person_ids: vec!["paloma".into()],
+            ..photo()
+        };
+        assert!(evaluate_expr(&expr, &asset).matched);
+    }
+
+    #[test]
+    fn evaluate_expr_face_recognition_rejects_unrecognized_face() {
+        // Same shape but asset has paloma AND stranger → stranger not in
+        // recognized set → PeopleOtherIdentifiablePresent.
+        let expr = MatchExpr::And(vec![
+            paloma_must_include(),
+            MatchExpr::Leaf(MatchLeaf::FaceRecognition {
+                allow_unrecognized: false,
+                yolo_count_check: false,
+            }),
+        ]);
+        let asset = AssetSnapshot {
+            face_person_ids: vec!["paloma".into(), "stranger".into()],
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset);
+        assert!(!outcome.matched);
+        assert_eq!(
+            outcome.reason,
+            DecisionReason::PeopleOtherIdentifiablePresent {
+                id: "stranger".into()
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_expr_face_recognition_allow_unrecognized_with_yolo_count_check() {
+        // Legacy `no_unidentified_humans=true && must_exclude_other_identifiable=false`
+        // → allow_unrecognized=true + yolo_count_check=true. YOLO is consulted;
+        // recognized-set check is skipped.
+        let expr = MatchExpr::Leaf(MatchLeaf::FaceRecognition {
+            allow_unrecognized: true,
+            yolo_count_check: true,
+        });
+        // YOLO 1 == identified 1 → match.
+        let asset_ok = AssetSnapshot {
+            face_person_ids: vec!["paloma".into()],
+            yolo_person_count: Some(1),
+            ..photo()
+        };
+        assert!(evaluate_expr(&expr, &asset_ok).matched);
+        // YOLO 3 > identified 1 → skip with PeopleUnidentifiedHumanPresent.
+        let asset_bad = AssetSnapshot {
+            face_person_ids: vec!["paloma".into()],
+            yolo_person_count: Some(3),
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset_bad);
+        assert!(!outcome.matched);
+        assert_eq!(
+            outcome.reason,
+            DecisionReason::PeopleUnidentifiedHumanPresent {
+                yolo_count: 3,
+                identified: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_expr_nested_and_or_not_combination() {
+        // AND(OR(paloma, emeric), NOT(manon), people_count==1)
+        // Asset: faces=[paloma], yolo_count=1 → match.
+        let expr = MatchExpr::And(vec![
+            MatchExpr::Or(vec![paloma_must_include(), emeric_must_include()]),
+            MatchExpr::Not(Box::new(MatchExpr::Leaf(MatchLeaf::Person {
+                mode: PersonMode::MustInclude,
+                person_id: "manon".into(),
+            }))),
+            people_count_eq(1),
+        ]);
+        let asset = AssetSnapshot {
+            face_person_ids: vec!["paloma".into()],
+            yolo_person_count: Some(1),
+            ..photo()
+        };
+        assert!(evaluate_expr(&expr, &asset).matched);
+
+        // Same expr, asset has manon → NOT(manon) inner matches → NOT skips
+        // → AND short-circuits.
+        let asset_bad = AssetSnapshot {
+            face_person_ids: vec!["paloma".into(), "manon".into()],
+            yolo_person_count: Some(2),
+            ..photo()
+        };
+        let outcome = evaluate_expr(&expr, &asset_bad);
+        assert!(!outcome.matched);
+        assert_eq!(outcome.reason, DecisionReason::NotBranchSatisfied);
+    }
+
+    #[test]
+    fn evaluate_expr_legacy_spec_via_from_matches_evaluate_match() {
+        // Spot-check that From<&MatchSpec> + evaluate_expr produces the same
+        // matching verdict as the legacy evaluate_match on the original spec.
+        let spec = MatchSpec {
+            media: Some(MediaPredicate {
+                types: vec![MediaType::Photo],
+            }),
+            date: Some(DatePredicate {
+                from: Some(fixed(2025, 1, 1)),
+                to: Some(fixed(2025, 12, 31)),
+            }),
+            people: Some(PeoplePredicate {
+                must_include: vec!["paloma".into()],
+                must_exclude: vec!["stranger".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let expr = MatchExpr::from(&spec);
+
+        let asset_match = AssetSnapshot {
+            face_person_ids: vec!["paloma".into()],
+            ..photo()
+        };
+        assert_eq!(
+            evaluate_match(&spec, &asset_match).matched,
+            evaluate_expr(&expr, &asset_match).matched,
+        );
+
+        let asset_skip = AssetSnapshot {
+            face_person_ids: vec!["paloma".into(), "stranger".into()],
+            ..photo()
+        };
+        let legacy = evaluate_match(&spec, &asset_skip);
+        let tree = evaluate_expr(&expr, &asset_skip);
+        assert_eq!(legacy.matched, tree.matched);
+        // Both should skip with people_must_exclude_present.
+        assert_eq!(legacy.reason.slug(), tree.reason.slug());
     }
 }
