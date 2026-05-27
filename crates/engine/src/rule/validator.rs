@@ -37,6 +37,7 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use thiserror::Error;
 
+use super::match_expr::{MatchExpr, MatchLeaf, PersonMode, MAX_TREE_DEPTH};
 use super::schema::{PeoplePredicate, Rule, TargetAlbum};
 
 /// Resolver-layer transport / I/O failure. Distinct from
@@ -73,6 +74,25 @@ pub enum ValidationError {
     ForeignPersonId { id: String },
     #[error("target album {album_id:?} is not writable by the rule owner")]
     UnwritableAlbum { album_id: String },
+    // ---- T18 (block-tree) extensions ----
+    #[error("match tree nests beyond MAX_TREE_DEPTH ({MAX_TREE_DEPTH}); got depth {depth}")]
+    MatchTreeTooDeep { depth: usize },
+    #[error("group must have at least 2 children; remove the redundant wrapper")]
+    RedundantGroup,
+    #[error("`not` may not directly wrap another `not`; remove both")]
+    DoubleNot,
+    #[error("`date_range` must specify at least one of `from` or `to`")]
+    EmptyDateRange,
+    #[error("location.center latitude must be in [-90, 90], got {0}")]
+    InvalidLatitude(f64),
+    #[error("location.center longitude must be in [-180, 180], got {0}")]
+    InvalidLongitude(f64),
+    #[error("`person.person_id` must be non-empty")]
+    EmptyPersonId,
+    #[error("`media_type.types` must be non-empty")]
+    EmptyMediaTypes,
+    #[error("`person.mode = includes` is only legal as the direct child of a `not`")]
+    IncludesOutsideNot,
     #[error(transparent)]
     Resolver(#[from] ResolverError),
 }
@@ -88,6 +108,15 @@ impl ValidationError {
             ValidationError::InvalidId(_) => "invalid_id",
             ValidationError::ForeignPersonId { .. } => "foreign_person_id",
             ValidationError::UnwritableAlbum { .. } => "unwritable_album",
+            ValidationError::MatchTreeTooDeep { .. } => "match_tree_too_deep",
+            ValidationError::RedundantGroup => "redundant_group",
+            ValidationError::DoubleNot => "double_not",
+            ValidationError::EmptyDateRange => "empty_date_range",
+            ValidationError::InvalidLatitude(_) => "invalid_latitude",
+            ValidationError::InvalidLongitude(_) => "invalid_longitude",
+            ValidationError::EmptyPersonId => "empty_person_id",
+            ValidationError::EmptyMediaTypes => "empty_media_types",
+            ValidationError::IncludesOutsideNot => "includes_outside_not",
             ValidationError::Resolver(_) => "resolver_error",
         }
     }
@@ -184,6 +213,144 @@ fn is_valid_slug(s: &str) -> bool {
         .iter()
         .skip(1)
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Block-tree semantic validator (T18). Mirrors [`validate_rule`] but walks
+/// a [`MatchExpr`] tree instead of the flat [`super::schema::MatchSpec`].
+///
+/// Cheap (sync) checks first: structure (depth, arity, NOT rules), leaf
+/// parameters (radius, date order, non-empty id/media types). Then the
+/// resolver-backed checks: every `person_id` must belong to the rule owner.
+pub async fn validate_match_expr(
+    expr: &MatchExpr,
+    owner_user_id: &str,
+    resolver: &dyn RuleResourceResolver,
+) -> Result<(), ValidationError> {
+    validate_tree_structure(expr, 1)?;
+    validate_includes_scope(expr, false)?;
+    validate_tree_leaves(expr)?;
+
+    let referenced = expr.referenced_person_ids();
+    if !referenced.is_empty() {
+        let known = resolver.known_person_ids(owner_user_id).await?;
+        for id in referenced {
+            if !known.contains(id) {
+                return Err(ValidationError::ForeignPersonId { id: id.to_string() });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_tree_structure(expr: &MatchExpr, depth: usize) -> Result<(), ValidationError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(ValidationError::MatchTreeTooDeep { depth });
+    }
+    match expr {
+        MatchExpr::And(children) | MatchExpr::Or(children) => {
+            if children.is_empty() {
+                return Err(ValidationError::EmptyMatch);
+            }
+            if children.len() == 1 {
+                return Err(ValidationError::RedundantGroup);
+            }
+            for child in children {
+                validate_tree_structure(child, depth + 1)?;
+            }
+            Ok(())
+        }
+        MatchExpr::Not(child) => {
+            if matches!(child.as_ref(), MatchExpr::Not(_)) {
+                return Err(ValidationError::DoubleNot);
+            }
+            validate_tree_structure(child.as_ref(), depth + 1)
+        }
+        MatchExpr::Leaf(_) => Ok(()),
+    }
+}
+
+fn validate_includes_scope(expr: &MatchExpr, inside_not: bool) -> Result<(), ValidationError> {
+    match expr {
+        MatchExpr::And(children) | MatchExpr::Or(children) => {
+            for child in children {
+                validate_includes_scope(child, false)?;
+            }
+            Ok(())
+        }
+        MatchExpr::Not(child) => validate_includes_scope(child.as_ref(), true),
+        MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::Includes,
+            ..
+        }) => {
+            if inside_not {
+                Ok(())
+            } else {
+                Err(ValidationError::IncludesOutsideNot)
+            }
+        }
+        MatchExpr::Leaf(_) => Ok(()),
+    }
+}
+
+fn validate_tree_leaves(expr: &MatchExpr) -> Result<(), ValidationError> {
+    match expr {
+        MatchExpr::And(children) | MatchExpr::Or(children) => {
+            for child in children {
+                validate_tree_leaves(child)?;
+            }
+            Ok(())
+        }
+        MatchExpr::Not(child) => validate_tree_leaves(child.as_ref()),
+        MatchExpr::Leaf(leaf) => validate_leaf(leaf),
+    }
+}
+
+fn validate_leaf(leaf: &MatchLeaf) -> Result<(), ValidationError> {
+    match leaf {
+        MatchLeaf::Person { person_id, .. } => {
+            if person_id.is_empty() {
+                return Err(ValidationError::EmptyPersonId);
+            }
+            Ok(())
+        }
+        MatchLeaf::PeopleCount { .. } => Ok(()),
+        MatchLeaf::FaceRecognition { .. } => Ok(()),
+        MatchLeaf::DateRange { from, to } => {
+            if from.is_none() && to.is_none() {
+                return Err(ValidationError::EmptyDateRange);
+            }
+            if let (Some(f), Some(t)) = (from, to) {
+                if f > t {
+                    return Err(ValidationError::InvalidDateRange {
+                        from: f.to_rfc3339(),
+                        to: t.to_rfc3339(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        MatchLeaf::Location { center, radius_km } => {
+            let lat = center[0];
+            let lng = center[1];
+            if !(-90.0..=90.0).contains(&lat) {
+                return Err(ValidationError::InvalidLatitude(lat));
+            }
+            if !(-180.0..=180.0).contains(&lng) {
+                return Err(ValidationError::InvalidLongitude(lng));
+            }
+            if !(*radius_km > 0.0 && *radius_km <= 20_000.0) {
+                return Err(ValidationError::InvalidRadius(*radius_km));
+            }
+            Ok(())
+        }
+        MatchLeaf::MediaType { types } => {
+            if types.is_empty() {
+                return Err(ValidationError::EmptyMediaTypes);
+            }
+            Ok(())
+        }
+    }
 }
 
 fn referenced_person_ids(people: &PeoplePredicate) -> Vec<&str> {
@@ -642,5 +809,370 @@ mod tests {
             other => panic!("expected Resolver(NoApiKey), got {other:?}"),
         }
         assert_eq!(err.slug(), "resolver_error");
+    }
+
+    // ------------------------------------------------------------------
+    // T18: tree validator tests.
+    // ------------------------------------------------------------------
+
+    use crate::rule::match_expr::{
+        parse_match_expr, MatchExpr, MatchLeaf, PeopleCountOp, PersonMode,
+    };
+
+    fn leaf_person_must_include(id: &str) -> MatchExpr {
+        MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::MustInclude,
+            person_id: id.into(),
+        })
+    }
+
+    fn leaf_media_photo() -> MatchExpr {
+        MatchExpr::Leaf(MatchLeaf::MediaType {
+            types: vec![MediaType::Photo],
+        })
+    }
+
+    #[tokio::test]
+    async fn tree_happy_path_ok() {
+        let tree = MatchExpr::And(vec![leaf_media_photo(), leaf_person_must_include("paloma")]);
+        let resolver = resolver_with_persons(&["paloma"]);
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tree_single_leaf_root_ok() {
+        let tree = leaf_media_photo();
+        let resolver = FakeResourceResolver::empty();
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tree_empty_and_rejected_as_empty_match() {
+        let tree = MatchExpr::And(Vec::new());
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::EmptyMatch));
+    }
+
+    #[tokio::test]
+    async fn tree_empty_or_rejected_as_empty_match() {
+        let tree = MatchExpr::Or(Vec::new());
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::EmptyMatch));
+    }
+
+    #[tokio::test]
+    async fn tree_single_child_and_rejected_as_redundant_group() {
+        let tree = MatchExpr::And(vec![leaf_media_photo()]);
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::RedundantGroup));
+        assert_eq!(err.slug(), "redundant_group");
+    }
+
+    #[tokio::test]
+    async fn tree_single_child_or_rejected_as_redundant_group() {
+        let tree = MatchExpr::Or(vec![leaf_media_photo()]);
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::RedundantGroup));
+    }
+
+    #[tokio::test]
+    async fn tree_double_not_rejected() {
+        let tree = MatchExpr::Not(Box::new(MatchExpr::Not(Box::new(
+            leaf_person_must_include("paloma"),
+        ))));
+        let resolver = resolver_with_persons(&["paloma"]);
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::DoubleNot));
+        assert_eq!(err.slug(), "double_not");
+    }
+
+    #[tokio::test]
+    async fn tree_too_deep_rejected() {
+        // Build a chain of MAX_TREE_DEPTH+1 nested ANDs (each with 2 children
+        // so they don't get caught by RedundantGroup); innermost holds 2
+        // leaves. Outermost reaches depth MAX_TREE_DEPTH+1.
+        fn nest(depth: usize) -> MatchExpr {
+            if depth == 0 {
+                MatchExpr::And(vec![leaf_media_photo(), leaf_media_photo()])
+            } else {
+                MatchExpr::And(vec![nest(depth - 1), leaf_media_photo()])
+            }
+        }
+        let tree = nest(MAX_TREE_DEPTH);
+        assert!(tree.depth() > MAX_TREE_DEPTH);
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::MatchTreeTooDeep { .. }));
+        assert_eq!(err.slug(), "match_tree_too_deep");
+    }
+
+    #[tokio::test]
+    async fn tree_depth_at_cap_ok() {
+        // A tree exactly at MAX_TREE_DEPTH should validate.
+        fn nest(depth: usize) -> MatchExpr {
+            if depth == 0 {
+                leaf_media_photo()
+            } else {
+                MatchExpr::And(vec![nest(depth - 1), leaf_media_photo()])
+            }
+        }
+        let tree = nest(MAX_TREE_DEPTH - 1);
+        assert_eq!(tree.depth(), MAX_TREE_DEPTH);
+        let resolver = FakeResourceResolver::empty();
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tree_invalid_radius_rejected() {
+        let tree = MatchExpr::Leaf(MatchLeaf::Location {
+            center: [0.0, 0.0],
+            radius_km: 0.0,
+        });
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidRadius(_)));
+    }
+
+    #[tokio::test]
+    async fn tree_invalid_latitude_rejected() {
+        let tree = MatchExpr::Leaf(MatchLeaf::Location {
+            center: [91.0, 0.0],
+            radius_km: 5.0,
+        });
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidLatitude(_)));
+    }
+
+    #[tokio::test]
+    async fn tree_invalid_longitude_rejected() {
+        let tree = MatchExpr::Leaf(MatchLeaf::Location {
+            center: [0.0, 181.0],
+            radius_km: 5.0,
+        });
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidLongitude(_)));
+    }
+
+    #[tokio::test]
+    async fn tree_invalid_date_range_from_after_to_rejected() {
+        let from = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2025, 6, 2, 0, 0, 0)
+            .unwrap();
+        let to = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2025, 6, 1, 0, 0, 0)
+            .unwrap();
+        let tree = MatchExpr::Leaf(MatchLeaf::DateRange {
+            from: Some(from),
+            to: Some(to),
+        });
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidDateRange { .. }));
+    }
+
+    #[tokio::test]
+    async fn tree_empty_date_range_rejected() {
+        let tree = MatchExpr::Leaf(MatchLeaf::DateRange {
+            from: None,
+            to: None,
+        });
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::EmptyDateRange));
+    }
+
+    #[tokio::test]
+    async fn tree_empty_person_id_rejected() {
+        let tree = MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::MustInclude,
+            person_id: String::new(),
+        });
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::EmptyPersonId));
+    }
+
+    #[tokio::test]
+    async fn tree_empty_media_types_rejected() {
+        let tree = MatchExpr::Leaf(MatchLeaf::MediaType { types: vec![] });
+        let resolver = FakeResourceResolver::empty();
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::EmptyMediaTypes));
+    }
+
+    #[tokio::test]
+    async fn tree_includes_outside_not_rejected() {
+        let tree = MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::Includes,
+            person_id: "x".into(),
+        });
+        let resolver = resolver_with_persons(&["x"]);
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::IncludesOutsideNot));
+        assert_eq!(err.slug(), "includes_outside_not");
+    }
+
+    #[tokio::test]
+    async fn tree_includes_inside_not_ok() {
+        let tree = MatchExpr::Not(Box::new(MatchExpr::Leaf(MatchLeaf::Person {
+            mode: PersonMode::Includes,
+            person_id: "x".into(),
+        })));
+        let resolver = resolver_with_persons(&["x"]);
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tree_foreign_person_id_rejected() {
+        let tree = MatchExpr::And(vec![
+            leaf_media_photo(),
+            leaf_person_must_include("intruder"),
+        ]);
+        let resolver = resolver_with_persons(&["paloma", "manon"]);
+        let err = validate_match_expr(&tree, OWNER, &resolver)
+            .await
+            .unwrap_err();
+        match err {
+            ValidationError::ForeignPersonId { id } => assert_eq!(id, "intruder"),
+            other => panic!("expected ForeignPersonId, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_or_with_people_count_validates() {
+        // Operator's Example D condensed: (paloma AND count=1) OR (count>=2)
+        let tree = MatchExpr::Or(vec![
+            MatchExpr::And(vec![
+                leaf_person_must_include("paloma"),
+                MatchExpr::Leaf(MatchLeaf::PeopleCount {
+                    op: PeopleCountOp::Eq,
+                    value: 1,
+                }),
+            ]),
+            MatchExpr::Leaf(MatchLeaf::PeopleCount {
+                op: PeopleCountOp::Gte,
+                value: 2,
+            }),
+        ]);
+        let resolver = resolver_with_persons(&["paloma"]);
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
+        assert!(tree.requires_yolo());
+    }
+
+    #[tokio::test]
+    async fn tree_resolver_no_api_key_bubbles() {
+        struct ErroringResolver;
+        #[async_trait]
+        impl RuleResourceResolver for ErroringResolver {
+            async fn known_person_ids(&self, _: &str) -> Result<HashSet<String>, ResolverError> {
+                Err(ResolverError::NoApiKey)
+            }
+            async fn is_album_writable(&self, _: &str, _: &str) -> Result<bool, ResolverError> {
+                Ok(true)
+            }
+        }
+        let tree = leaf_person_must_include("x");
+        let err = validate_match_expr(&tree, OWNER, &ErroringResolver)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::Resolver(ResolverError::NoApiKey)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tree_appendix_a_paris_yaml_validates_via_legacy_path() {
+        // PRD §6 Appendix A "Paris — juillet 2024" rule body — legacy flat
+        // YAML — must continue to parse and validate after T18.
+        let yaml = r#"
+date:
+  from: 2024-07-15T00:00:00+02:00
+  to:   2024-07-22T23:59:59+02:00
+location:
+  center: [48.8566, 2.3522]
+  radius_km: 60
+"#;
+        let tree = parse_match_expr(yaml).expect("legacy parse");
+        let resolver = FakeResourceResolver::empty();
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tree_appendix_a_famille_restreint_yaml_validates() {
+        let yaml = r#"
+people:
+  must_include: [paloma-id]
+  may_include: [manon-id, emeric-id]
+  must_exclude_other_identifiable: true
+  no_unidentified_humans: true
+"#;
+        let tree = parse_match_expr(yaml).expect("legacy parse");
+        let resolver = resolver_with_persons(&["paloma-id", "manon-id", "emeric-id"]);
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
+        assert!(tree.requires_yolo());
+    }
+
+    #[tokio::test]
+    async fn tree_operator_example_d_validates_via_tree_yaml() {
+        let yaml = r#"
+op: and
+children:
+  - op: or
+    children:
+      - op: and
+        children:
+          - { type: person, mode: must_include, person_id: paloma }
+          - { type: people_count, op: eq, value: 1 }
+      - op: and
+        children:
+          - { type: person, mode: must_include, person_id: paloma }
+          - { type: person, mode: must_include, person_id: emeric }
+          - { type: people_count, op: gte, value: 2 }
+  - op: not
+    child:
+      type: person
+      mode: includes
+      person_id: manon
+"#;
+        let tree = parse_match_expr(yaml).expect("tree parse");
+        let resolver = resolver_with_persons(&["paloma", "emeric", "manon"]);
+        validate_match_expr(&tree, OWNER, &resolver).await.unwrap();
     }
 }

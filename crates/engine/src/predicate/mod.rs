@@ -51,6 +51,11 @@ pub struct AssetSnapshot {
 /// which is what gets persisted into `asset_decisions.reason`. Structured
 /// fields carry the "which id" detail the UI needs (M6) but are intentionally
 /// not part of the slug.
+///
+/// T18 adds the block-tree slugs (`tree_short_circuit_or`,
+/// `people_count_mismatch`, `not_branch_satisfied`); T19 will emit them from
+/// the tree evaluator. They are registered here so dashboards/typescript
+/// clients can pin the contract in advance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionReason {
     Matched,
@@ -58,12 +63,31 @@ pub enum DecisionReason {
     MediaTypeMismatch,
     LocationOutOfRange,
     LocationMissingGps,
-    PeopleMustIncludeMissing { missing_id: String },
+    PeopleMustIncludeMissing {
+        missing_id: String,
+    },
     PeopleMustIncludeAnyOfMissing,
-    PeopleMustExcludePresent { id: String },
-    PeopleOtherIdentifiablePresent { id: String },
-    PeopleUnidentifiedHumanPresent { yolo_count: u32, identified: u32 },
+    PeopleMustExcludePresent {
+        id: String,
+    },
+    PeopleOtherIdentifiablePresent {
+        id: String,
+    },
+    PeopleUnidentifiedHumanPresent {
+        yolo_count: u32,
+        identified: u32,
+    },
     YoloUnimplemented,
+    /// Every child of an `op: or` group returned false.
+    TreeShortCircuitOr,
+    /// A `people_count` block's comparison disagreed (T19 emits).
+    PeopleCountMismatch {
+        op: crate::rule::PeopleCountOp,
+        target: u32,
+        observed: u32,
+    },
+    /// A `not(child)` group's child returned true.
+    NotBranchSatisfied,
 }
 
 impl DecisionReason {
@@ -84,6 +108,9 @@ impl DecisionReason {
                 "people_unidentified_human_present"
             }
             DecisionReason::YoloUnimplemented => "yolo_unimplemented",
+            DecisionReason::TreeShortCircuitOr => "tree_short_circuit_or",
+            DecisionReason::PeopleCountMismatch { .. } => "people_count_mismatch",
+            DecisionReason::NotBranchSatisfied => "not_branch_satisfied",
         }
     }
 }
@@ -890,6 +917,23 @@ mod tests {
         assert_eq!(
             DecisionReason::YoloUnimplemented.slug(),
             "yolo_unimplemented"
+        );
+        assert_eq!(
+            DecisionReason::TreeShortCircuitOr.slug(),
+            "tree_short_circuit_or"
+        );
+        assert_eq!(
+            DecisionReason::PeopleCountMismatch {
+                op: crate::rule::PeopleCountOp::Eq,
+                target: 1,
+                observed: 2
+            }
+            .slug(),
+            "people_count_mismatch"
+        );
+        assert_eq!(
+            DecisionReason::NotBranchSatisfied.slug(),
+            "not_branch_satisfied"
         );
     }
 }
