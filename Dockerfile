@@ -34,16 +34,24 @@ COPY web/ ./
 RUN npm run build
 
 FROM debian:trixie-slim AS runtime
+ARG ONNXRUNTIME_VERSION=1.22.0
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates wget \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates wget ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget -qO /tmp/onnxruntime.tgz \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz" \
+    && tar -xzf /tmp/onnxruntime.tgz -C /tmp \
+    && cp -P /tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime*.so* /usr/local/lib/ \
+    && ldconfig \
+    && rm -rf /tmp/onnxruntime*
 WORKDIR /app
 COPY --from=builder /app/target/release/immich-extended /usr/local/bin/immich-extended
 COPY migrations/ /app/migrations/
 COPY --from=frontend /web/dist /app/web/dist
 ENV DATA_DIR=/data \
     HTTP_BIND=0.0.0.0:8080 \
-    WEB_DIST_DIR=/app/web/dist
+    WEB_DIST_DIR=/app/web/dist \
+    ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8080/health || exit 1
