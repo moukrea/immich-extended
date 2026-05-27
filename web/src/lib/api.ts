@@ -240,12 +240,39 @@ export interface MeAlbum {
   is_writable: boolean;
 }
 
-export function fetchPeople(): Promise<ApiResult<MePerson[]>> {
-  return request<MePerson[]>("/api/v1/me/people", { method: "GET" });
+/**
+ * Result of fetching a per-user Immich resource. The `noImmichKey` branch is
+ * how the SPA distinguishes "this user hasn't pasted a key yet" (412) from
+ * any other failure — the rule builder swaps in a CTA to `/me` instead of
+ * the misleading "library is empty" copy.
+ */
+export type MeFetchResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; noImmichKey: true }
+  | { ok: false; noImmichKey?: false; status: number; error: ApiError };
+
+async function requestMeResource<T>(path: string): Promise<MeFetchResult<T>> {
+  const result = await request<T>(path, { method: "GET" });
+  if (result.ok) {
+    return { ok: true, data: result.data };
+  }
+  if (result.status === 412 && result.error.error === "no_immich_key") {
+    return { ok: false, noImmichKey: true };
+  }
+  return {
+    ok: false,
+    noImmichKey: false,
+    status: result.status,
+    error: result.error,
+  };
 }
 
-export function fetchAlbums(): Promise<ApiResult<MeAlbum[]>> {
-  return request<MeAlbum[]>("/api/v1/me/albums", { method: "GET" });
+export function fetchPeople(): Promise<MeFetchResult<MePerson[]>> {
+  return requestMeResource<MePerson[]>("/api/v1/me/people");
+}
+
+export function fetchAlbums(): Promise<MeFetchResult<MeAlbum[]>> {
+  return requestMeResource<MeAlbum[]>("/api/v1/me/albums");
 }
 
 export interface ImmichKeyInfo {

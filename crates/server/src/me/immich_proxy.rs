@@ -9,6 +9,8 @@
 //!
 //! All non-2xx responses share the `{"error":"<slug>"}` shape:
 //!   * `no_immich_key` (412): user hasn't completed Immich onboarding yet.
+//!     Body also carries a `hint` field naming the `/me` settings page so
+//!     the SPA can render a deterministic CTA instead of guessing.
 //!   * `decrypt_failed` (500): stored ciphertext could not be decrypted with
 //!     the current `MASTER_KEY` (key rotated without re-paste).
 //!   * `invalid_base_url` (500): stored `base_url` no longer parses (should
@@ -149,10 +151,7 @@ async fn load_resolved_key(state: &AppState, user_id: &str) -> Result<ResolvedKe
         internal_error()
     })?;
 
-    let row = row.ok_or((
-        StatusCode::PRECONDITION_FAILED,
-        Json(json!({"error": "no_immich_key"})),
-    ))?;
+    let row = row.ok_or_else(no_immich_key_response)?;
 
     let plaintext = state
         .master_key
@@ -175,10 +174,7 @@ async fn load_resolved_key(state: &AppState, user_id: &str) -> Result<ResolvedKe
         // but the column is NULL the user is in an inconsistent state — make
         // them re-paste their key.
         tracing::warn!(user_id = %user_id, "immich_api_keys row missing immich_user_id");
-        (
-            StatusCode::PRECONDITION_FAILED,
-            Json(json!({"error": "no_immich_key"})),
-        )
+        no_immich_key_response()
     })?;
 
     let base = Url::parse(&row.base_url).map_err(|err| {
@@ -237,5 +233,15 @@ fn internal_error() -> ErrorResponse {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": "internal_error"})),
+    )
+}
+
+fn no_immich_key_response() -> ErrorResponse {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(json!({
+            "error": "no_immich_key",
+            "hint": "Add your Immich API key at /me to connect this account to Immich.",
+        })),
     )
 }

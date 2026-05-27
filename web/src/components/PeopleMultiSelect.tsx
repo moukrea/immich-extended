@@ -5,6 +5,7 @@ import {
   Show,
   type Component,
 } from "solid-js";
+import { A } from "@solidjs/router";
 import { usePeople } from "./PeopleContext";
 
 interface PeopleMultiSelectProps {
@@ -19,7 +20,9 @@ const PeopleMultiSelect: Component<PeopleMultiSelectProps> = (props) => {
   const [query, setQuery] = createSignal("");
   const people = usePeople();
 
-  const all = () => people?.() ?? [];
+  const listing = () => people?.();
+  const all = () => listing()?.people ?? [];
+  const noImmichKey = () => listing()?.noImmichKey === true;
 
   const filtered = createMemo(() => {
     const list = all();
@@ -50,61 +53,79 @@ const PeopleMultiSelect: Component<PeopleMultiSelectProps> = (props) => {
       <Show when={props.description}>
         <p class="mt-0.5 text-xs text-slate-500">{props.description}</p>
       </Show>
-      <input
-        type="search"
-        placeholder="Filter people…"
-        value={query()}
-        onInput={(e) => setQuery(e.currentTarget.value)}
-        disabled={props.disabled}
-        class="mt-2 block w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100 disabled:text-slate-400"
-        aria-label={`${props.label} — filter`}
-      />
-      <Show when={loading()}>
-        <p class="mt-2 text-xs text-slate-500">Loading people…</p>
-      </Show>
-      <Show when={!loading() && all().length === 0}>
-        <p class="mt-2 text-xs text-slate-500">
-          No people in your Immich library yet.
-        </p>
-      </Show>
-      <Show when={!loading() && all().length > 0 && filtered().length === 0}>
-        <p class="mt-2 text-xs text-slate-500">No matches.</p>
-      </Show>
-      <Show when={!loading() && filtered().length > 0}>
-        <ul
-          class="mt-2 flex flex-wrap gap-2"
-          aria-label={`${props.label} — options`}
+      <Show when={!loading() && noImmichKey()} fallback={
+        <>
+          <input
+            type="search"
+            placeholder="Filter people…"
+            value={query()}
+            onInput={(e) => setQuery(e.currentTarget.value)}
+            disabled={props.disabled}
+            class="mt-2 block w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100 disabled:text-slate-400"
+            aria-label={`${props.label} — filter`}
+          />
+          <Show when={loading()}>
+            <p class="mt-2 text-xs text-slate-500">Loading people…</p>
+          </Show>
+          <Show when={!loading() && all().length === 0}>
+            <p class="mt-2 text-xs text-slate-500">
+              No people in your Immich library yet.
+            </p>
+          </Show>
+          <Show when={!loading() && all().length > 0 && filtered().length === 0}>
+            <p class="mt-2 text-xs text-slate-500">No matches.</p>
+          </Show>
+          <Show when={!loading() && filtered().length > 0}>
+            <ul
+              class="mt-2 flex flex-wrap gap-2"
+              aria-label={`${props.label} — options`}
+            >
+              <For each={filtered()}>
+                {(person) => {
+                  const selected = () => selectedSet().has(person.id);
+                  return (
+                    <li>
+                      <button
+                        type="button"
+                        aria-pressed={selected()}
+                        aria-label={`${selected() ? "Remove" : "Add"} ${person.name} (${props.label})`}
+                        disabled={props.disabled}
+                        onClick={() => toggle(person.id)}
+                        class={
+                          selected()
+                            ? "inline-flex items-center gap-2 rounded-full border border-indigo-500 bg-indigo-50 px-3 py-1 text-sm text-indigo-900 hover:bg-indigo-100 disabled:opacity-60"
+                            : "inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1 text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+                        }
+                      >
+                        <img
+                          src={person.thumbnail_url}
+                          alt=""
+                          class="h-6 w-6 rounded-full bg-slate-200 object-cover"
+                          loading="lazy"
+                        />
+                        <span>{person.name}</span>
+                      </button>
+                    </li>
+                  );
+                }}
+              </For>
+            </ul>
+          </Show>
+        </>
+      }>
+        <p
+          class="mt-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900"
+          role="status"
         >
-          <For each={filtered()}>
-            {(person) => {
-              const selected = () => selectedSet().has(person.id);
-              return (
-                <li>
-                  <button
-                    type="button"
-                    aria-pressed={selected()}
-                    aria-label={`${selected() ? "Remove" : "Add"} ${person.name} (${props.label})`}
-                    disabled={props.disabled}
-                    onClick={() => toggle(person.id)}
-                    class={
-                      selected()
-                        ? "inline-flex items-center gap-2 rounded-full border border-indigo-500 bg-indigo-50 px-3 py-1 text-sm text-indigo-900 hover:bg-indigo-100 disabled:opacity-60"
-                        : "inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1 text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-60"
-                    }
-                  >
-                    <img
-                      src={person.thumbnail_url}
-                      alt=""
-                      class="h-6 w-6 rounded-full bg-slate-200 object-cover"
-                      loading="lazy"
-                    />
-                    <span>{person.name}</span>
-                  </button>
-                </li>
-              );
-            }}
-          </For>
-        </ul>
+          Connect your Immich account at{" "}
+          <A
+            href="/me"
+            class="font-semibold text-amber-900 underline hover:text-amber-950"
+          >
+            Settings
+          </A>{" "}
+          to pick people for this rule.
+        </p>
       </Show>
     </div>
   );

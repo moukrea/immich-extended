@@ -299,6 +299,11 @@ async fn proxies_return_412_when_no_immich_key_is_configured() {
         );
         let body = body_json(resp).await;
         assert_eq!(body["error"], "no_immich_key", "{path}");
+        let hint = body["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("/me"),
+            "{path} hint must reference /me settings page; got {hint:?}",
+        );
     }
 }
 

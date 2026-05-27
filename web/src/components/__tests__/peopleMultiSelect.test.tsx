@@ -4,6 +4,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSignal, untrack } from "solid-js";
 import { cleanup, fireEvent, render } from "@solidjs/testing-library";
 
+vi.mock("@solidjs/router", () => {
+  return {
+    A: (props: {
+      href: string;
+      class?: string;
+      children?: unknown;
+    }) => (
+      <a href={props.href} class={props.class}>
+        {props.children as unknown}
+      </a>
+    ),
+  };
+});
+
 import PeopleMultiSelect from "../PeopleMultiSelect";
 import { PeopleProvider } from "../PeopleContext";
 
@@ -126,5 +140,62 @@ describe("PeopleMultiSelect", () => {
     expect(queryByText("Alice")).toBeNull();
     expect(queryByText("Bob")).toBeTruthy();
     expect(queryByText("Carol")).toBeNull();
+  });
+
+  it("renders the Settings CTA when the user has no Immich API key", async () => {
+    // /me/people returns 412 no_immich_key when the user hasn't pasted a key.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: "no_immich_key",
+          hint: "Add your Immich API key at /me to connect this account to Immich.",
+        },
+        412,
+      ),
+    );
+    const accessor = () => [] as string[];
+    const onChange = () => {};
+
+    const { findByRole, queryByLabelText, queryByText } = render(() => (
+      <PeopleProvider>
+        <PeopleMultiSelect
+          label="Must include all"
+          value={accessor}
+          onChange={onChange}
+        />
+      </PeopleProvider>
+    ));
+
+    const status = await findByRole("status");
+    expect(status.textContent ?? "").toMatch(/Connect your Immich account/i);
+
+    const settingsLink = status.querySelector("a");
+    expect(settingsLink?.getAttribute("href")).toBe("/me");
+
+    // The misleading "No people in your Immich library yet." copy must NOT
+    // render when the no-key CTA is shown.
+    expect(queryByText(/No people in your Immich library yet/i)).toBeNull();
+    // Filter input is suppressed too — there's nothing to filter.
+    expect(queryByLabelText("Must include all — filter")).toBeNull();
+  });
+
+  it("still shows the legacy 'No people' empty-state when the key is set but the library is empty", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+    const accessor = () => [] as string[];
+    const onChange = () => {};
+
+    const { findByText, queryByRole } = render(() => (
+      <PeopleProvider>
+        <PeopleMultiSelect
+          label="Must include all"
+          value={accessor}
+          onChange={onChange}
+        />
+      </PeopleProvider>
+    ));
+
+    await findByText(/No people in your Immich library yet/i);
+    // The no-key CTA must NOT render in this case.
+    expect(queryByRole("status")).toBeNull();
   });
 });
