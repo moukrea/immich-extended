@@ -18,6 +18,7 @@ import MeSettings from "./pages/MeSettings";
 import RulesList from "./pages/rules/RulesList";
 import RuleBuilder from "./pages/rules/RuleBuilder";
 import RuleDecisions from "./pages/rules/RuleDecisions";
+import RuleActivity from "./pages/rules/RuleActivity";
 
 interface BootstrapValue {
   setupState: Accessor<SetupState | null>;
@@ -109,6 +110,11 @@ const ShelledRuleDecisions: Component = () => (
     <RuleDecisions />
   </AppShell>
 );
+const ShelledRuleActivity: Component = () => (
+  <AppShell>
+    <RuleActivity />
+  </AppShell>
+);
 
 const App: Component = () => (
   <Router root={(props) => <Bootstrap>{props.children}</Bootstrap>}>
@@ -120,6 +126,7 @@ const App: Component = () => (
     <Route path="/rules/new" component={ShelledRuleBuilder} />
     <Route path="/rules/:id" component={ShelledRuleBuilder} />
     <Route path="/rules/:id/decisions" component={ShelledRuleDecisions} />
+    <Route path="/rules/:id/activity" component={ShelledRuleActivity} />
     <Route path="*" component={NotFound} />
   </Router>
 );

@@ -491,6 +491,12 @@ const RuleBuilder: Component = () => {
           <div class="flex items-center gap-2">
             <Show when={mode() === "edit" && params.id}>
               <A
+                href={`/rules/${params.id}/activity`}
+                class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+              >
+                Activity
+              </A>
+              <A
                 href={`/rules/${params.id}/decisions`}
                 class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
               >

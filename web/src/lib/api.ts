@@ -240,6 +240,42 @@ export function fetchDecisions(
   return request<DecisionsResponse>(path, { method: "GET" });
 }
 
+export interface RuleRunItem {
+  id: string;
+  started_at: number;
+  finished_at: number | null;
+  assets_evaluated: number;
+  assets_added: number;
+  assets_skipped: number;
+  error_message: string | null;
+}
+
+export interface RuleRunsResponse {
+  runs: RuleRunItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface FetchRuleRunsParams {
+  limit?: number;
+  offset?: number;
+}
+
+export function fetchRuleRuns(
+  ruleId: string,
+  params: FetchRuleRunsParams = {},
+): Promise<ApiResult<RuleRunsResponse>> {
+  const search = new URLSearchParams();
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+  if (params.offset !== undefined) search.set("offset", String(params.offset));
+  const qs = search.toString();
+  const path = `/api/v1/rules/${encodeURIComponent(ruleId)}/runs${
+    qs ? `?${qs}` : ""
+  }`;
+  return request<RuleRunsResponse>(path, { method: "GET" });
+}
+
 export interface MePerson {
   id: string;
   name: string;
