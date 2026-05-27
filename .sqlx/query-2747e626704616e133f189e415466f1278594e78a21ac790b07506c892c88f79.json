@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE rules SET status = COALESCE(?, status), poll_interval_seconds = COALESCE(?, poll_interval_seconds), updated_at = ? WHERE id = ? AND owner_user_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "2747e626704616e133f189e415466f1278594e78a21ac790b07506c892c88f79"
+}

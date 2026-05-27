@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT expires_at, last_seen_at FROM sessions WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "expires_at",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_seen_at",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "bd521c25724ceed09384a3bd1c7f97aa765b48aafeb0fd0afd9f25049e517ad4"
+}

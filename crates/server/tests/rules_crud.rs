@@ -708,3 +708,234 @@ async fn delete_idempotent_on_missing() {
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn poll_interval_defaults_to_300_when_absent() {
+    let (state, _pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::POST,
+            "/api/v1/rules",
+            Some(serde_json::json!({"yaml_source": YAML_RULE_A_BASE})),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{id}"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = body_json(resp).await;
+    assert_eq!(detail["poll_interval_seconds"], 300);
+}
+
+#[tokio::test]
+async fn poll_interval_round_trips_on_create_and_get() {
+    let (state, _pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::POST,
+            "/api/v1/rules",
+            Some(serde_json::json!({
+                "yaml_source": YAML_RULE_A_BASE,
+                "poll_interval_seconds": 1800,
+            })),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{id}"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    let detail = body_json(resp).await;
+    assert_eq!(detail["poll_interval_seconds"], 1800);
+}
+
+#[tokio::test]
+async fn poll_interval_below_minimum_rejected() {
+    let (state, _pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::POST,
+            "/api/v1/rules",
+            Some(serde_json::json!({
+                "yaml_source": YAML_RULE_A_BASE,
+                "poll_interval_seconds": 59,
+            })),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "invalid_poll_interval");
+    assert_eq!(body["min"], 60);
+    assert_eq!(body["max"], 86_400);
+}
+
+#[tokio::test]
+async fn poll_interval_above_maximum_rejected() {
+    let (state, _pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::POST,
+            "/api/v1/rules",
+            Some(serde_json::json!({
+                "yaml_source": YAML_RULE_A_BASE,
+                "poll_interval_seconds": 86_401,
+            })),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "invalid_poll_interval");
+}
+
+#[tokio::test]
+async fn patch_poll_interval_only_updates_it_without_touching_yaml() {
+    let (state, _pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+
+    // Create with default interval.
+    let resp = call(
+        &state,
+        req(
+            Method::POST,
+            "/api/v1/rules",
+            Some(serde_json::json!({"yaml_source": YAML_RULE_A_BASE})),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    // PATCH only the interval.
+    let resp = call(
+        &state,
+        req(
+            Method::PATCH,
+            &format!("/api/v1/rules/{id}"),
+            Some(serde_json::json!({"poll_interval_seconds": 600})),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Re-GET — yaml + name preserved, interval updated.
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{id}"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    let detail = body_json(resp).await;
+    assert_eq!(detail["poll_interval_seconds"], 600);
+    assert_eq!(detail["name"], "Alice's rule");
+    assert!(detail["yaml_source"]
+        .as_str()
+        .unwrap()
+        .contains("Alice's rule"));
+}
+
+#[tokio::test]
+async fn patch_with_no_fields_rejects_with_empty_patch() {
+    let (state, _pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::POST,
+            "/api/v1/rules",
+            Some(serde_json::json!({"yaml_source": YAML_RULE_A_BASE})),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    let resp = call(
+        &state,
+        req(
+            Method::PATCH,
+            &format!("/api/v1/rules/{id}"),
+            Some(serde_json::json!({})),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "empty_patch");
+}
+
+#[tokio::test]
+async fn patch_invalid_poll_interval_rejected() {
+    let (state, _pool, _a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+
+    let resp = call(
+        &state,
+        req(
+            Method::POST,
+            "/api/v1/rules",
+            Some(serde_json::json!({"yaml_source": YAML_RULE_A_BASE})),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    let resp = call(
+        &state,
+        req(
+            Method::PATCH,
+            &format!("/api/v1/rules/{id}"),
+            Some(serde_json::json!({"poll_interval_seconds": 30})),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "invalid_poll_interval");
+}

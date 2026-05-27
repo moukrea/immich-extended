@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, name, yaml_source, status, target_album_strategy, target_album_id, created_at, updated_at FROM rules WHERE id = ? AND owner_user_id = ?",
+  "query": "SELECT id, name, yaml_source, status, target_album_strategy, target_album_id, poll_interval_seconds, created_at, updated_at FROM rules WHERE id = ? AND owner_user_id = ?",
   "describe": {
     "columns": [
       {
@@ -34,13 +34,18 @@
         "type_info": "Text"
       },
       {
-        "name": "created_at",
+        "name": "poll_interval_seconds",
         "ordinal": 6,
         "type_info": "Integer"
       },
       {
-        "name": "updated_at",
+        "name": "created_at",
         "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 8,
         "type_info": "Integer"
       }
     ],
@@ -55,8 +60,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "bf5aef9651ab08bce3e2e35eff359f082d33671ac8dc2c7c9b11cc5c44825892"
+  "hash": "c93e929ff5c8593b7338d7ca780b97fdb9c805184a738a7ac8d1a5716b14cbc4"
 }

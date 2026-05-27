@@ -1,26 +1,26 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT name, target_album_strategy FROM rules WHERE id = ? AND owner_user_id = ?",
+  "query": "SELECT issuer AS \"issuer!\", subject AS \"subject!\" FROM oidc_identities",
   "describe": {
     "columns": [
       {
-        "name": "name",
+        "name": "issuer!",
         "ordinal": 0,
         "type_info": "Text"
       },
       {
-        "name": "target_album_strategy",
+        "name": "subject!",
         "ordinal": 1,
         "type_info": "Text"
       }
     ],
     "parameters": {
-      "Right": 2
+      "Right": 0
     },
     "nullable": [
       false,
       false
     ]
   },
-  "hash": "439db45bc739d06c26f72b2ba6950aaff960433782fb5fc5f6e847569e34d343"
+  "hash": "32b4ef76f10beedf48c6ceeae1635975f3d5e939e50ebeb12a3160d1d28ace46"
 }

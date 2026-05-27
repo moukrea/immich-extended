@@ -16,6 +16,8 @@ import {
   deleteRule,
   fetchAlbums,
   getRule,
+  MAX_POLL_INTERVAL_SECONDS,
+  MIN_POLL_INTERVAL_SECONDS,
   postLogout,
   updateRule,
   type MeAlbum,
@@ -23,6 +25,7 @@ import {
   type RuleStatus,
 } from "../../lib/api";
 import {
+  BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
   defaultBuilderState,
   formStateToYaml,
   yamlToFormState,
@@ -62,8 +65,15 @@ function readFileAsText(file: Blob): Promise<string> {
 function deriveStateFromRule(rule: Rule): RuleBuilderState {
   const parsed = yamlToFormState(rule.yaml_source);
   // Server-side status is the lifecycle-button authoritative source; pin it
-  // over whatever the YAML happens to declare.
-  return { ...parsed.state, id: rule.id, status: rule.status };
+  // over whatever the YAML happens to declare. `poll_interval_seconds` is
+  // row-level (never round-tripped through YAML) so it always comes from the
+  // server payload directly.
+  return {
+    ...parsed.state,
+    id: rule.id,
+    status: rule.status,
+    poll_interval_seconds: rule.poll_interval_seconds,
+  };
 }
 
 const RuleBuilder: Component = () => {
@@ -225,6 +235,25 @@ const RuleBuilder: Component = () => {
       | "people_no_unidentified_humans",
     next: boolean,
   ) => mutateForm((s) => ({ ...s, [key]: next }));
+
+  const onPollIntervalInput = (raw: string) => {
+    // Empty / non-numeric input falls back to the default; otherwise clamp on
+    // the client side so the value matches what the server would accept. The
+    // server validator is the final authority — this keeps the form usable
+    // while typing without flashing transient out-of-bounds states.
+    const trimmed = raw.trim();
+    if (trimmed === "") {
+      mutateForm((s) => ({
+        ...s,
+        poll_interval_seconds: BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
+      }));
+      return;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return;
+    const rounded = Math.round(parsed);
+    mutateForm((s) => ({ ...s, poll_interval_seconds: rounded }));
+  };
 
   const onToggleMedia = (enabled: boolean) =>
     mutateForm((s) => ({ ...s, media_enabled: enabled }));
@@ -399,8 +428,13 @@ const RuleBuilder: Component = () => {
     setSaving(true);
     setError(null);
 
+    const pollInterval = state().poll_interval_seconds;
+
     if (mode() === "new") {
-      const result = await createRule(yaml);
+      const result = await createRule({
+        yaml_source: yaml,
+        poll_interval_seconds: pollInterval,
+      });
       setSaving(false);
       if (!result.ok) {
         if (result.status === 401) {
@@ -420,7 +454,10 @@ const RuleBuilder: Component = () => {
       setSaving(false);
       return;
     }
-    const result = await updateRule(id, { yaml_source: yaml });
+    const result = await updateRule(id, {
+      yaml_source: yaml,
+      poll_interval_seconds: pollInterval,
+    });
     setSaving(false);
     if (!result.ok) {
       if (result.status === 401) {
@@ -791,6 +828,34 @@ const RuleBuilder: Component = () => {
                   </label>
                 </div>
               </Show>
+            </fieldset>
+
+            <fieldset class="rounded-md border border-slate-200 bg-white p-4">
+              <legend class="px-1 text-sm font-semibold text-slate-700">
+                Poll interval
+              </legend>
+              <label
+                class="block text-xs font-medium text-slate-600"
+                for="rule-poll-interval"
+              >
+                How often the engine evaluates this rule (seconds)
+              </label>
+              <input
+                id="rule-poll-interval"
+                type="number"
+                min={MIN_POLL_INTERVAL_SECONDS}
+                max={MAX_POLL_INTERVAL_SECONDS}
+                step="1"
+                value={state().poll_interval_seconds}
+                onInput={(e) => onPollIntervalInput(e.currentTarget.value)}
+                aria-label="Poll interval seconds"
+                class="mt-1 block w-40 rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <p class="mt-1 text-xs text-slate-500">
+                Minimum {MIN_POLL_INTERVAL_SECONDS}s, maximum{" "}
+                {MAX_POLL_INTERVAL_SECONDS}s (1 day). We suggest 300s (5 min)
+                for most rules.
+              </p>
             </fieldset>
 
             <div class="rounded-md border border-slate-200 bg-white">

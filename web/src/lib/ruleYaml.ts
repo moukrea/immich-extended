@@ -26,6 +26,9 @@ export interface RuleBuilderState {
   name: string;
   status: RuleStatusValue;
   target: TargetAlbumState;
+  // Row-level operational cadence; NOT a YAML predicate. Defaults to
+  // `DEFAULT_POLL_INTERVAL_SECONDS`, bounded by the server validator.
+  poll_interval_seconds: number;
   date_enabled: boolean;
   date_from: string;
   date_to: string;
@@ -53,6 +56,7 @@ export interface RuleBuilderState {
 
 export const DEFAULT_LOCATION_CENTER: [number, number] = [48.8566, 2.3522];
 export const DEFAULT_LOCATION_RADIUS_KM = 60;
+export const BUILDER_DEFAULT_POLL_INTERVAL_SECONDS = 300;
 
 export function defaultBuilderState(): RuleBuilderState {
   return {
@@ -60,6 +64,7 @@ export function defaultBuilderState(): RuleBuilderState {
     name: "",
     status: "active",
     target: { kind: "managed", name: "", shared_with: [] },
+    poll_interval_seconds: BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
     date_enabled: false,
     date_from: "",
     date_to: "",

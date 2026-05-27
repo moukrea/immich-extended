@@ -333,6 +333,76 @@ describe("RuleBuilder — visual ↔ YAML sync", () => {
     expect(parsed.target_album).toEqual({ type: "managed", name: "Paris" });
   });
 
+  it("poll-interval input defaults to 300 and is included in the POST body", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: "new-rule-id",
+        name: "Cadence rule",
+        status: "active",
+        target_album_strategy: "managed",
+        updated_at: 1747000000,
+      }),
+    );
+
+    const { findByLabelText, getByLabelText, getByRole } = render(() => (
+      <RuleBuilder />
+    ));
+
+    const intervalInput = (await findByLabelText(
+      "Poll interval seconds",
+    )) as HTMLInputElement;
+    expect(intervalInput.value).toBe("300");
+    expect(intervalInput.getAttribute("min")).toBe("60");
+    expect(intervalInput.getAttribute("max")).toBe("86400");
+
+    fireEvent.input(intervalInput, { target: { value: "900" } });
+    expect(
+      (getByLabelText("Poll interval seconds") as HTMLInputElement).value,
+    ).toBe("900");
+
+    const nameInput = getByLabelText(/^Name$/) as HTMLInputElement;
+    fireEvent.input(nameInput, { target: { value: "Cadence rule" } });
+    const managedName = getByLabelText(
+      "Managed album name",
+    ) as HTMLInputElement;
+    fireEvent.input(managedName, { target: { value: "Cadence album" } });
+
+    const saveButton = getByRole("button", { name: /^Save$/ });
+    fireEvent.click(saveButton);
+
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+    const [, saveCall] = fetchMock.mock.calls;
+    const init = saveCall![1] as RequestInit;
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(String(init.body)) as {
+      yaml_source: string;
+      poll_interval_seconds: number;
+    };
+    expect(body.poll_interval_seconds).toBe(900);
+    const parsed = yaml.load(body.yaml_source) as Record<string, unknown>;
+    // Poll interval is row-level, NOT a YAML field.
+    expect("poll_interval_seconds" in parsed).toBe(false);
+  });
+
+  it("blanking the poll-interval input restores the default 300", async () => {
+    fetchMock.mockResolvedValueOnce(albumsResponse());
+
+    const { findByLabelText, getByLabelText } = render(() => (
+      <RuleBuilder />
+    ));
+
+    const intervalInput = (await findByLabelText(
+      "Poll interval seconds",
+    )) as HTMLInputElement;
+    fireEvent.input(intervalInput, { target: { value: "" } });
+    expect(
+      (getByLabelText("Poll interval seconds") as HTMLInputElement).value,
+    ).toBe("300");
+  });
+
   it("importing a YAML file replaces the form state", async () => {
     fetchMock.mockResolvedValueOnce(albumsResponse());
 

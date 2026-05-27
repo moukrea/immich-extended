@@ -143,9 +143,16 @@ export interface Rule {
   status: RuleStatus;
   target_album_strategy: TargetAlbumStrategy;
   target_album_id: string;
+  poll_interval_seconds: number;
   created_at: number;
   updated_at: number;
 }
+
+/// Bounds enforced server-side; mirrored here so the UI can render a matching
+/// `<input min/max>` and surface validation feedback without a round-trip.
+export const DEFAULT_POLL_INTERVAL_SECONDS = 300;
+export const MIN_POLL_INTERVAL_SECONDS = 60;
+export const MAX_POLL_INTERVAL_SECONDS = 86_400;
 
 export function listRules(): Promise<ApiResult<ListRulesResponse>> {
   return request<ListRulesResponse>("/api/v1/rules", { method: "GET" });
@@ -157,18 +164,26 @@ export function getRule(id: string): Promise<ApiResult<Rule>> {
   });
 }
 
+export interface CreateRulePayload {
+  yaml_source: string;
+  poll_interval_seconds?: number;
+}
+
 export function createRule(
-  yaml_source: string,
+  payload: CreateRulePayload | string,
 ): Promise<ApiResult<RuleSummary>> {
+  const body =
+    typeof payload === "string" ? { yaml_source: payload } : payload;
   return request<RuleSummary>("/api/v1/rules", {
     method: "POST",
-    body: JSON.stringify({ yaml_source }),
+    body: JSON.stringify(body),
   });
 }
 
 export interface UpdateRulePayload {
   yaml_source?: string;
   status?: RuleStatus;
+  poll_interval_seconds?: number;
 }
 
 export function updateRule(

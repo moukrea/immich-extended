@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT target_album_id FROM rules WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "target_album_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a2dc2174dcb7f09b110885bf5be7b5184d3f0de103bf4d3cd96b232e8f61e708"
+}

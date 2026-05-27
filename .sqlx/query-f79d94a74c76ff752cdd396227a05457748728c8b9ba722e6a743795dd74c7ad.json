@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT base_url, nonce, ciphertext, immich_user_id, last_validated_at FROM immich_api_keys WHERE user_id = (SELECT id FROM users WHERE email = ?)",
+  "describe": {
+    "columns": [
+      {
+        "name": "base_url",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "nonce",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "ciphertext",
+        "ordinal": 2,
+        "type_info": "Blob"
+      },
+      {
+        "name": "immich_user_id",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "last_validated_at",
+        "ordinal": 4,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "f79d94a74c76ff752cdd396227a05457748728c8b9ba722e6a743795dd74c7ad"
+}

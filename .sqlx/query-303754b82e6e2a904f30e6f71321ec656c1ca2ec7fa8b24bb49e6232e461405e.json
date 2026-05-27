@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO rules (id, owner_user_id, name, yaml_source, parsed_predicates, target_album_id, target_album_strategy, managed_album_name, poll_interval_seconds, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 12
+    },
+    "nullable": []
+  },
+  "hash": "303754b82e6e2a904f30e6f71321ec656c1ca2ec7fa8b24bb49e6232e461405e"
+}

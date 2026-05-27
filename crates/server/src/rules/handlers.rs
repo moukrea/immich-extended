@@ -49,6 +49,8 @@ type ErrorResponse = (StatusCode, Json<serde_json::Value>);
 #[derive(Debug, Deserialize)]
 pub struct CreateRuleRequest {
     pub yaml_source: String,
+    #[serde(default)]
+    pub poll_interval_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +59,37 @@ pub struct UpdateRuleRequest {
     pub yaml_source: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub poll_interval_seconds: Option<i64>,
+}
+
+/// Default cadence for newly created rules that don't supply a value.
+/// Matches the SQL column default seeded by `migrations/0004_rules.sql`.
+pub const DEFAULT_POLL_INTERVAL_SECONDS: i64 = 300;
+
+/// Minimum operator-settable poll cadence (1 minute). Below this we'd hammer
+/// the upstream Immich for diminishing returns.
+pub const MIN_POLL_INTERVAL_SECONDS: i64 = 60;
+
+/// Maximum operator-settable poll cadence (24 hours). Beyond this the UX of
+/// "did the rule even run?" gets miserable.
+pub const MAX_POLL_INTERVAL_SECONDS: i64 = 86_400;
+
+fn validate_poll_interval(value: i64) -> Result<(), ErrorResponse> {
+    if !(MIN_POLL_INTERVAL_SECONDS..=MAX_POLL_INTERVAL_SECONDS).contains(&value) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_poll_interval",
+                "detail": format!(
+                    "poll_interval_seconds must be between {MIN_POLL_INTERVAL_SECONDS} and {MAX_POLL_INTERVAL_SECONDS}, got {value}",
+                ),
+                "min": MIN_POLL_INTERVAL_SECONDS,
+                "max": MAX_POLL_INTERVAL_SECONDS,
+            })),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +109,7 @@ pub struct RuleDetail {
     pub status: String,
     pub target_album_strategy: String,
     pub target_album_id: String,
+    pub poll_interval_seconds: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -96,6 +130,11 @@ pub(super) async fn create_rule(
     AuthenticatedUser(UserId(uid)): AuthenticatedUser,
     Json(req): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<RuleSummary>), ErrorResponse> {
+    let poll_interval = req
+        .poll_interval_seconds
+        .unwrap_or(DEFAULT_POLL_INTERVAL_SECONDS);
+    validate_poll_interval(poll_interval)?;
+
     let mut rule = parse_rule(&req.yaml_source).map_err(parse_error_response)?;
 
     // Generate an id if the YAML didn't carry one. We do this BEFORE validation
@@ -133,8 +172,8 @@ pub(super) async fn create_rule(
         "INSERT INTO rules \
             (id, owner_user_id, name, yaml_source, parsed_predicates, \
              target_album_id, target_album_strategy, managed_album_name, \
-             status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             poll_interval_seconds, status, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         id,
         uid,
         rule.name,
@@ -143,6 +182,7 @@ pub(super) async fn create_rule(
         target_album_id_str,
         target_album_strategy,
         managed_album_name,
+        poll_interval,
         status_db,
         now,
         now,
@@ -222,7 +262,7 @@ pub(super) async fn get_rule(
 ) -> Result<Json<RuleDetail>, ErrorResponse> {
     let row = sqlx::query!(
         "SELECT id, name, yaml_source, status, target_album_strategy, \
-                target_album_id, created_at, updated_at \
+                target_album_id, poll_interval_seconds, created_at, updated_at \
          FROM rules WHERE id = ? AND owner_user_id = ?",
         id,
         uid,
@@ -243,6 +283,7 @@ pub(super) async fn get_rule(
         status: row.status,
         target_album_strategy: row.target_album_strategy,
         target_album_id: row.target_album_id,
+        poll_interval_seconds: row.poll_interval_seconds,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }))
@@ -263,14 +304,18 @@ pub(super) async fn update_rule(
     Path(id): Path<String>,
     Json(req): Json<UpdateRuleRequest>,
 ) -> Result<Json<RuleSummary>, ErrorResponse> {
-    if req.yaml_source.is_none() && req.status.is_none() {
+    if req.yaml_source.is_none() && req.status.is_none() && req.poll_interval_seconds.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "empty_patch",
-                "detail": "request must include yaml_source or status",
+                "detail": "request must include yaml_source, status, or poll_interval_seconds",
             })),
         ));
+    }
+
+    if let Some(interval) = req.poll_interval_seconds {
+        validate_poll_interval(interval)?;
     }
 
     // Establish that the row exists and belongs to the caller. The actual
@@ -340,11 +385,16 @@ pub(super) async fn update_rule(
         };
         let status_db = rule.status.as_str();
 
+        // `poll_interval_seconds` is optional on PATCH; COALESCE keeps the
+        // existing value when the body omits the field.
+        let interval_arg = req.poll_interval_seconds;
         sqlx::query!(
             "UPDATE rules SET \
                 name = ?, yaml_source = ?, parsed_predicates = ?, \
                 target_album_id = ?, target_album_strategy = ?, \
-                managed_album_name = ?, status = ?, updated_at = ? \
+                managed_album_name = ?, status = ?, \
+                poll_interval_seconds = COALESCE(?, poll_interval_seconds), \
+                updated_at = ? \
              WHERE id = ? AND owner_user_id = ?",
             rule.name,
             yaml_source,
@@ -353,6 +403,7 @@ pub(super) async fn update_rule(
             target_album_strategy,
             managed_album_name,
             status_db,
+            interval_arg,
             now,
             id,
             uid,
@@ -377,17 +428,25 @@ pub(super) async fn update_rule(
         }));
     }
 
-    // Status-only update path. `req.status` is `Some` here — the
-    // none-both early-return at the top of the function rules out
-    // both being absent.
-    let status_str = req.status.as_deref().unwrap_or("");
-    let new_status = parse_status_str(status_str).ok_or_else(|| invalid_status(status_str))?;
-    let status_db = new_status.as_str();
+    // No yaml_source — at least one of `status` / `poll_interval_seconds` is
+    // present (empty-patch is rejected above). Both are COALESCE'd so omitting
+    // one keeps the existing column.
+    let new_status_db: Option<&str> = if let Some(status_str) = req.status.as_deref() {
+        let parsed = parse_status_str(status_str).ok_or_else(|| invalid_status(status_str))?;
+        Some(parsed.as_str())
+    } else {
+        None
+    };
+    let interval_arg = req.poll_interval_seconds;
 
     sqlx::query!(
-        "UPDATE rules SET status = ?, updated_at = ? \
+        "UPDATE rules SET \
+            status = COALESCE(?, status), \
+            poll_interval_seconds = COALESCE(?, poll_interval_seconds), \
+            updated_at = ? \
          WHERE id = ? AND owner_user_id = ?",
-        status_db,
+        new_status_db,
+        interval_arg,
         now,
         id,
         uid,
@@ -395,12 +454,12 @@ pub(super) async fn update_rule(
     .execute(&state.db)
     .await
     .map_err(|err| {
-        tracing::warn!(error = %err, "failed to update rule status");
+        tracing::warn!(error = %err, "failed to update rule status/interval");
         internal_error()
     })?;
 
     let row = sqlx::query!(
-        "SELECT name, target_album_strategy FROM rules \
+        "SELECT name, status, target_album_strategy FROM rules \
          WHERE id = ? AND owner_user_id = ?",
         id,
         uid,
@@ -408,18 +467,18 @@ pub(super) async fn update_rule(
     .fetch_one(&state.db)
     .await
     .map_err(|err| {
-        tracing::warn!(error = %err, "failed to re-read rule after status patch");
+        tracing::warn!(error = %err, "failed to re-read rule after metadata patch");
         internal_error()
     })?;
 
     if let Err(err) = state.scheduler.on_rule_changed(&id).await {
-        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after status patch failed");
+        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after metadata patch failed");
     }
 
     Ok(Json(RuleSummary {
         id,
         name: row.name,
-        status: status_db.to_string(),
+        status: row.status,
         target_album_strategy: row.target_album_strategy,
         updated_at: now,
     }))
