@@ -247,3 +247,31 @@ export function fetchPeople(): Promise<ApiResult<MePerson[]>> {
 export function fetchAlbums(): Promise<ApiResult<MeAlbum[]>> {
   return request<MeAlbum[]>("/api/v1/me/albums", { method: "GET" });
 }
+
+export interface ImmichKeyInfo {
+  base_url: string;
+  immich_user_id: string | null;
+  last_validated_at: number;
+}
+
+export interface PasteImmichKeyPayload {
+  base_url: string;
+  api_key: string;
+}
+
+export function fetchImmichKey(): Promise<ApiResult<ImmichKeyInfo>> {
+  return request<ImmichKeyInfo>("/api/v1/me/immich-key", { method: "GET" });
+}
+
+export function pasteImmichKey(
+  payload: PasteImmichKeyPayload,
+): Promise<ApiResult<ImmichKeyInfo>> {
+  return request<ImmichKeyInfo>("/api/v1/me/immich-key", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteImmichKey(): Promise<ApiResult<void>> {
+  return request<void>("/api/v1/me/immich-key", { method: "DELETE" });
+}

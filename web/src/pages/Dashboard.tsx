@@ -25,13 +25,21 @@ const Dashboard: Component = () => {
       <header class="bg-white border-b border-slate-200">
         <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
           <h1 class="text-lg font-semibold text-slate-900">immich-extended</h1>
-          <button
-            type="button"
-            onClick={onLogout}
-            class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
-          >
-            Sign out
-          </button>
+          <nav class="flex items-center gap-2">
+            <A
+              href="/me"
+              class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+            >
+              Settings
+            </A>
+            <button
+              type="button"
+              onClick={onLogout}
+              class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+            >
+              Sign out
+            </button>
+          </nav>
         </div>
       </header>
 

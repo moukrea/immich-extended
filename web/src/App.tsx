@@ -13,6 +13,7 @@ import { decideBootstrapNavigation } from "./lib/route";
 import Login from "./pages/Login";
 import Setup from "./pages/Setup";
 import Dashboard from "./pages/Dashboard";
+import MeSettings from "./pages/MeSettings";
 import RulesList from "./pages/rules/RulesList";
 import RuleBuilder from "./pages/rules/RuleBuilder";
 import RuleDecisions from "./pages/rules/RuleDecisions";
@@ -84,6 +85,7 @@ const App: Component = () => (
     <Route path="/login" component={LoginRoute} />
     <Route path="/setup" component={Setup} />
     <Route path="/" component={Dashboard} />
+    <Route path="/me" component={MeSettings} />
     <Route path="/rules" component={RulesList} />
     <Route path="/rules/new" component={RuleBuilder} />
     <Route path="/rules/:id" component={RuleBuilder} />
