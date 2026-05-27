@@ -6,18 +6,18 @@ import {
   Suspense,
   type Component,
 } from "solid-js";
-import { A, useNavigate } from "@solidjs/router";
+import { useNavigate } from "@solidjs/router";
 import {
   deleteImmichKey,
   fetchImmichKey,
   getMe,
   pasteImmichKey,
-  postLogout,
   type ApiResult,
   type ImmichKeyInfo,
   type Me,
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
+import { Button, Card, Field, Input, Label } from "../components/ui";
 
 type KeyState =
   | { kind: "loading" }
@@ -146,215 +146,178 @@ const MeSettings: Component = () => {
     setFormError(humanKeyError(result.error.error ?? "internal_error"));
   };
 
-  const onLogout = async () => {
-    await postLogout();
-    navigate("/login", { replace: true });
-  };
-
   return (
-    <main class="min-h-screen bg-slate-50">
-      <header class="bg-white border-b border-slate-200">
-        <div class="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div class="flex items-center gap-4">
-            <A
-              href="/"
-              class="text-sm text-slate-500 hover:text-slate-700"
-              aria-label="Back to dashboard"
-            >
-              ← Dashboard
-            </A>
-            <h1 class="text-lg font-semibold text-slate-900">Settings</h1>
-          </div>
-          <button
-            type="button"
-            onClick={onLogout}
-            class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
-          >
-            Sign out
-          </button>
-        </div>
+    <section class="max-w-3xl mx-auto space-y-6">
+      <header class="mb-2">
+        <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
+        <p class="mt-1 text-sm text-ui-muted">
+          Account info and your Immich connection.
+        </p>
       </header>
 
-      <section class="max-w-3xl mx-auto px-4 py-8 space-y-6">
-        <section
-          aria-labelledby="account-heading"
-          class="rounded-lg border border-slate-200 bg-white p-5 shadow-sm"
+      <Card padding="lg" aria-labelledby="account-heading">
+        <h2
+          id="account-heading"
+          class="text-xs font-semibold uppercase tracking-wide text-ui-muted"
         >
-          <h2
-            id="account-heading"
-            class="text-sm font-semibold uppercase tracking-wide text-slate-500"
+          Account
+        </h2>
+        <Suspense fallback={<p class="mt-2 text-ui-muted">Loading…</p>}>
+          <Show
+            when={me()}
+            fallback={<p class="mt-2 text-ui-muted">Not signed in.</p>}
           >
-            Account
-          </h2>
-          <Suspense fallback={<p class="mt-2 text-slate-500">Loading…</p>}>
-            <Show
-              when={me()}
-              fallback={<p class="mt-2 text-slate-500">Not signed in.</p>}
-            >
-              {(user) => (
-                <p class="mt-2 text-slate-700">
-                  Signed in as{" "}
-                  <span class="font-medium">{user().email}</span>
-                  <Show when={user().display_name}>
-                    {(name) => (
-                      <span class="text-slate-500"> ({name()})</span>
-                    )}
-                  </Show>
-                  .
-                </p>
+            {(user) => (
+              <p class="mt-2 text-immich-fg dark:text-immich-dark-fg">
+                Signed in as{" "}
+                <span class="font-medium">{user().email}</span>
+                <Show when={user().display_name}>
+                  {(name) => (
+                    <span class="text-ui-muted"> ({name()})</span>
+                  )}
+                </Show>
+                .
+              </p>
+            )}
+          </Show>
+        </Suspense>
+      </Card>
+
+      <Card padding="lg" aria-labelledby="immich-heading">
+        <h2
+          id="immich-heading"
+          class="text-xs font-semibold uppercase tracking-wide text-ui-muted"
+        >
+          Immich account
+        </h2>
+        <p class="mt-1 text-sm text-ui-muted">
+          Connect your personal Immich API key so this account can browse its
+          own people, albums, and assets.
+        </p>
+
+        <Suspense fallback={<p class="mt-4 text-ui-muted">Loading…</p>}>
+          <Show
+            when={keyResource() !== undefined}
+            fallback={<p class="mt-4 text-ui-muted">Loading…</p>}
+          >
+            <Show when={connectedInfo()} keyed>
+              {(info) => (
+                <div class="mt-4 space-y-3">
+                  <dl class="text-sm text-immich-fg dark:text-immich-dark-fg space-y-1">
+                    <div class="flex gap-2">
+                      <dt class="font-medium text-ui-muted w-40">
+                        Immich URL
+                      </dt>
+                      <dd class="break-all">{info.base_url}</dd>
+                    </div>
+                    <div class="flex gap-2">
+                      <dt class="font-medium text-ui-muted w-40">
+                        Immich user
+                      </dt>
+                      <dd class="break-all">
+                        {info.immich_user_id ?? "—"}
+                      </dd>
+                    </div>
+                    <div class="flex gap-2">
+                      <dt class="font-medium text-ui-muted w-40">
+                        Last validated
+                      </dt>
+                      <dd>{formatTimestamp(info.last_validated_at)}</dd>
+                    </div>
+                  </dl>
+                  <div class="flex flex-wrap gap-2 pt-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={openReplaceForm}
+                    >
+                      Replace key
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => setConfirmingDisconnect(true)}
+                    >
+                      Disconnect
+                    </Button>
+                  </div>
+                </div>
               )}
             </Show>
-          </Suspense>
-        </section>
 
-        <section
-          aria-labelledby="immich-heading"
-          class="rounded-lg border border-slate-200 bg-white p-5 shadow-sm"
-        >
-          <h2
-            id="immich-heading"
-            class="text-sm font-semibold uppercase tracking-wide text-slate-500"
-          >
-            Immich account
-          </h2>
-          <p class="mt-1 text-sm text-slate-500">
-            Connect your personal Immich API key so this account can browse its
-            own people, albums, and assets.
-          </p>
-
-          <Suspense fallback={<p class="mt-4 text-slate-500">Loading…</p>}>
-            <Show
-              when={keyResource() !== undefined}
-              fallback={<p class="mt-4 text-slate-500">Loading…</p>}
-            >
-              <Show when={connectedInfo()} keyed>
-                {(info) => (
-                  <div class="mt-4 space-y-3">
-                    <dl class="text-sm text-slate-700 space-y-1">
-                      <div class="flex gap-2">
-                        <dt class="font-medium text-slate-500 w-40">
-                          Immich URL
-                        </dt>
-                        <dd class="break-all">{info.base_url}</dd>
-                      </div>
-                      <div class="flex gap-2">
-                        <dt class="font-medium text-slate-500 w-40">
-                          Immich user
-                        </dt>
-                        <dd class="break-all">
-                          {info.immich_user_id ?? "—"}
-                        </dd>
-                      </div>
-                      <div class="flex gap-2">
-                        <dt class="font-medium text-slate-500 w-40">
-                          Last validated
-                        </dt>
-                        <dd>{formatTimestamp(info.last_validated_at)}</dd>
-                      </div>
-                    </dl>
-                    <div class="flex flex-wrap gap-2 pt-2">
-                      <button
-                        type="button"
-                        onClick={openReplaceForm}
-                        class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
-                      >
-                        Replace key
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmingDisconnect(true)}
-                        class="rounded-md border border-red-300 bg-white px-3 py-1.5 text-sm text-red-700 hover:bg-red-50"
-                      >
-                        Disconnect
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </Show>
-
-              <Show when={showEmptyForm()}>
-                <form class="mt-4 space-y-4" onSubmit={onSubmit}>
-                  <p class="text-sm text-slate-600">
-                    Not connected to Immich. Paste an Immich API key minted in
-                    Immich → Account settings → API Keys.
+            <Show when={showEmptyForm()}>
+              <form class="mt-4 space-y-4" onSubmit={onSubmit}>
+                <p class="text-sm text-immich-fg dark:text-immich-dark-fg">
+                  Not connected to Immich. Paste an Immich API key minted in
+                  Immich → Account settings → API Keys.
+                </p>
+                <Field label="Immich base URL" for_="me-immich-url">
+                  <Input
+                    id="me-immich-url"
+                    type="url"
+                    required
+                    placeholder="https://immich.example.com"
+                    autocomplete="url"
+                    value={baseUrl()}
+                    onInput={(e) => setBaseUrl(e.currentTarget.value)}
+                  />
+                </Field>
+                <div class="space-y-1.5">
+                  <Label for="me-immich-key">Immich API key</Label>
+                  <textarea
+                    id="me-immich-key"
+                    required
+                    rows="3"
+                    autocomplete="off"
+                    spellcheck={false}
+                    class="w-full rounded-xl bg-slate-200 dark:bg-gray-600 text-sm text-immich-fg dark:text-immich-dark-fg placeholder:text-gray-500 dark:placeholder:text-gray-300 px-3 py-3 border border-transparent font-mono transition ease-immich duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-immich-primary dark:focus-visible:ring-immich-dark-primary"
+                    value={apiKey()}
+                    onInput={(e) => setApiKey(e.currentTarget.value)}
+                  />
+                  <p class="text-xs text-ui-muted">
+                    Keys are encrypted at rest with AES-256-GCM. We never
+                    display the key back to you after submission.
                   </p>
-                  <div>
-                    <label
-                      class="block text-sm font-medium text-slate-700"
-                      for="me-immich-url"
-                    >
-                      Immich base URL
-                    </label>
-                    <input
-                      id="me-immich-url"
-                      type="url"
-                      required
-                      placeholder="https://immich.example.com"
-                      autocomplete="url"
-                      class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                      value={baseUrl()}
-                      onInput={(e) => setBaseUrl(e.currentTarget.value)}
-                    />
-                  </div>
-                  <div>
-                    <label
-                      class="block text-sm font-medium text-slate-700"
-                      for="me-immich-key"
-                    >
-                      Immich API key
-                    </label>
-                    <textarea
-                      id="me-immich-key"
-                      required
-                      rows="3"
-                      autocomplete="off"
-                      spellcheck={false}
-                      class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                      value={apiKey()}
-                      onInput={(e) => setApiKey(e.currentTarget.value)}
-                    />
-                    <p class="mt-1 text-xs text-slate-500">
-                      Keys are encrypted at rest with AES-256-GCM. We never
-                      display the key back to you after submission.
-                    </p>
-                  </div>
+                </div>
 
-                  <Show when={formError()}>
-                    <p class="text-sm text-red-600" role="alert">
-                      {formError()}
-                    </p>
-                  </Show>
+                <Show when={formError()}>
+                  <p class="text-sm text-ui-danger" role="alert">
+                    {formError()}
+                  </p>
+                </Show>
 
-                  <button
-                    type="submit"
-                    disabled={submitting()}
-                    class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-1 disabled:opacity-60"
-                  >
-                    {submitting() ? "Connecting…" : "Connect Immich"}
-                  </button>
-                </form>
-              </Show>
-
-              <Show when={errorState()} keyed>
-                {(state) => (
-                  <div class="mt-4 space-y-3" role="alert">
-                    <p class="text-sm text-red-600">
-                      {humanKeyError(state.code)}
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => refetch()}
-                      class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
-              </Show>
+                <Button
+                  type="submit"
+                  loading={submitting()}
+                  disabled={submitting()}
+                >
+                  {submitting() ? "Connecting…" : "Connect Immich"}
+                </Button>
+              </form>
             </Show>
-          </Suspense>
-        </section>
-      </section>
+
+            <Show when={errorState()} keyed>
+              {(state) => (
+                <div class="mt-4 space-y-3" role="alert">
+                  <p class="text-sm text-ui-danger">
+                    {humanKeyError(state.code)}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => refetch()}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              )}
+            </Show>
+          </Show>
+        </Suspense>
+      </Card>
 
       <ConfirmDialog
         open={confirmingDisconnect()}
@@ -365,7 +328,7 @@ const MeSettings: Component = () => {
         onConfirm={onDisconnectConfirm}
         onCancel={() => setConfirmingDisconnect(false)}
       />
-    </main>
+    </section>
   );
 };
 

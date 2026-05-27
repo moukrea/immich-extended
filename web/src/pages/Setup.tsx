@@ -1,6 +1,7 @@
 import { createMemo, createSignal, Show, type Component } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import { postSetupInitial } from "../lib/api";
+import { Button, Card, Field, Input } from "../components/ui";
 
 const Setup: Component = () => {
   const navigate = useNavigate();
@@ -57,123 +58,99 @@ const Setup: Component = () => {
   };
 
   return (
-    <main class="min-h-screen flex items-center justify-center bg-slate-50 px-4 py-10">
-      <div class="w-full max-w-md bg-white shadow rounded-lg p-6">
-        <h1 class="text-xl font-semibold text-slate-900">First-time setup</h1>
-        <p class="mt-1 text-sm text-slate-500">
-          Create the initial admin account.
-        </p>
+    <main class="min-h-screen flex items-center justify-center bg-immich-bg text-immich-fg dark:bg-immich-dark-bg dark:text-immich-dark-fg px-4 py-10">
+      <div class="w-full max-w-md">
+        <div class="mb-6 text-center">
+          <h1 class="text-2xl font-semibold tracking-tight">
+            First-time setup
+          </h1>
+          <p class="mt-1 text-sm text-ui-muted">
+            Create the initial admin account.
+          </p>
+        </div>
+        <Card padding="lg">
+          <form class="space-y-4" onSubmit={onSubmit}>
+            <Field label="Email" for_="setup-email" required>
+              <Input
+                id="setup-email"
+                type="email"
+                required
+                autocomplete="username"
+                value={email()}
+                onInput={(e) => setEmail(e.currentTarget.value)}
+              />
+            </Field>
+            <Field label="Password" for_="setup-password" required>
+              <Input
+                id="setup-password"
+                type="password"
+                required
+                autocomplete="new-password"
+                value={password()}
+                onInput={(e) => setPassword(e.currentTarget.value)}
+              />
+            </Field>
+            <Field
+              label="Display name"
+              for_="setup-display-name"
+              help="Optional — shown next to your email."
+            >
+              <Input
+                id="setup-display-name"
+                type="text"
+                value={displayName()}
+                onInput={(e) => setDisplayName(e.currentTarget.value)}
+              />
+            </Field>
 
-        <form class="mt-5 space-y-4" onSubmit={onSubmit}>
-          <div>
-            <label
-              class="block text-sm font-medium text-slate-700"
-              for="setup-email"
-            >
-              Email
-            </label>
-            <input
-              id="setup-email"
-              type="email"
-              required
-              autocomplete="username"
-              class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              value={email()}
-              onInput={(e) => setEmail(e.currentTarget.value)}
-            />
-          </div>
-          <div>
-            <label
-              class="block text-sm font-medium text-slate-700"
-              for="setup-password"
-            >
-              Password
-            </label>
-            <input
-              id="setup-password"
-              type="password"
-              required
-              autocomplete="new-password"
-              class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              value={password()}
-              onInput={(e) => setPassword(e.currentTarget.value)}
-            />
-          </div>
-          <div>
-            <label
-              class="block text-sm font-medium text-slate-700"
-              for="setup-display-name"
-            >
-              Display name <span class="text-slate-400">(optional)</span>
-            </label>
-            <input
-              id="setup-display-name"
-              type="text"
-              class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              value={displayName()}
-              onInput={(e) => setDisplayName(e.currentTarget.value)}
-            />
-          </div>
-
-          <fieldset class="border-t border-slate-200 pt-4">
-            <legend class="text-sm font-medium text-slate-700">
-              Connect Immich <span class="text-slate-400">(optional)</span>
-            </legend>
-            <p class="mt-1 text-xs text-slate-500">
-              Provide both fields, or leave both blank.
-            </p>
-            <div class="mt-3 space-y-3">
-              <div>
-                <label
-                  class="block text-sm font-medium text-slate-700"
-                  for="setup-immich-url"
-                >
-                  Immich base URL
-                </label>
-                <input
-                  id="setup-immich-url"
-                  type="url"
-                  placeholder="https://immich.example.com"
-                  required={immichPartial() === "url"}
-                  class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  value={immichUrl()}
-                  onInput={(e) => setImmichUrl(e.currentTarget.value)}
-                />
+            <fieldset class="border-t border-ui-border pt-4 dark:border-gray-700">
+              <legend class="px-1 text-sm font-medium text-immich-fg dark:text-immich-dark-fg">
+                Connect Immich{" "}
+                <span class="text-ui-muted">(optional)</span>
+              </legend>
+              <p class="mt-1 text-xs text-ui-muted">
+                Provide both fields, or leave both blank.
+              </p>
+              <div class="mt-3 space-y-4">
+                <Field label="Immich base URL" for_="setup-immich-url">
+                  <Input
+                    id="setup-immich-url"
+                    type="url"
+                    placeholder="https://immich.example.com"
+                    required={immichPartial() === "url"}
+                    value={immichUrl()}
+                    onInput={(e) => setImmichUrl(e.currentTarget.value)}
+                  />
+                </Field>
+                <Field label="Immich API key" for_="setup-immich-key">
+                  <Input
+                    id="setup-immich-key"
+                    type="password"
+                    autocomplete="off"
+                    required={immichPartial() === "key"}
+                    value={immichKey()}
+                    onInput={(e) => setImmichKey(e.currentTarget.value)}
+                  />
+                </Field>
               </div>
-              <div>
-                <label
-                  class="block text-sm font-medium text-slate-700"
-                  for="setup-immich-key"
-                >
-                  Immich API key
-                </label>
-                <input
-                  id="setup-immich-key"
-                  type="password"
-                  autocomplete="off"
-                  required={immichPartial() === "key"}
-                  class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  value={immichKey()}
-                  onInput={(e) => setImmichKey(e.currentTarget.value)}
-                />
-              </div>
-            </div>
-          </fieldset>
+            </fieldset>
 
-          <Show when={error()}>
-            <p class="text-red-600 text-sm" role="alert">
-              {error()}
-            </p>
-          </Show>
+            <Show when={error()}>
+              <p class="text-sm text-ui-danger" role="alert">
+                {error()}
+              </p>
+            </Show>
 
-          <button
-            type="submit"
-            disabled={submitting()}
-            class="w-full rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white shadow hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-1 disabled:opacity-60"
-          >
-            {submitting() ? "Creating account…" : "Create admin account"}
-          </button>
-        </form>
+            <Button
+              type="submit"
+              class="w-full"
+              loading={submitting()}
+              disabled={submitting()}
+            >
+              {submitting() ? "Creating account…" : "Create admin account"}
+            </Button>
+          </form>
+        </Card>
       </div>
     </main>
   );

@@ -9,12 +9,12 @@ import { A, useNavigate } from "@solidjs/router";
 import {
   deleteRule,
   listRules,
-  postLogout,
   updateRule,
   type RuleStatus,
   type RuleSummary,
 } from "../../lib/api";
 import ConfirmDialog from "../../components/ConfirmDialog";
+import { Button } from "../../components/ui";
 import { humanRuleError } from "./errors";
 
 type PendingAction =
@@ -42,11 +42,6 @@ const RulesList: Component = () => {
       return result.data.rules;
     },
   );
-
-  const onLogout = async () => {
-    await postLogout();
-    navigate("/login", { replace: true });
-  };
 
   const setStatus = async (rule: RuleSummary, status: RuleStatus) => {
     setBusyId(rule.id);
@@ -104,60 +99,39 @@ const RulesList: Component = () => {
   };
 
   return (
-    <main class="min-h-screen bg-slate-50">
-      <header class="bg-white border-b border-slate-200">
-        <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div class="flex items-center gap-4">
-            <A
-              href="/"
-              class="text-sm text-slate-500 hover:text-slate-700"
-              aria-label="Back to dashboard"
-            >
-              ← Dashboard
-            </A>
-            <h1 class="text-lg font-semibold text-slate-900">Rules</h1>
-          </div>
-          <button
-            type="button"
-            onClick={onLogout}
-            class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
-          >
-            Sign out
-          </button>
-        </div>
-      </header>
-
-      <section class="max-w-5xl mx-auto px-4 py-8">
-        <div class="flex items-center justify-between mb-4">
-          <p class="text-slate-600 text-sm">
-            Automation rules that decide which assets land in which albums.
-          </p>
-          <A
-            href="/rules/new"
-            class="rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow hover:bg-indigo-500"
-          >
-            New rule
-          </A>
-        </div>
-
-        <Show when={error()}>
-          <div
-            class="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-            role="alert"
-          >
-            {error()}
-          </div>
-        </Show>
-
-        <Show
-          when={!rulesResource.loading}
-          fallback={<p class="text-slate-500">Loading rules…</p>}
+    <section class="max-w-5xl mx-auto">
+      <div class="mb-6 flex flex-wrap items-baseline gap-3">
+        <h1 class="text-2xl font-semibold tracking-tight">Rules</h1>
+        <p class="text-sm text-ui-muted">
+          Automation rules that decide which assets land in which albums.
+        </p>
+        <A
+          href="/rules/new"
+          class="ml-auto inline-flex items-center justify-center gap-2 rounded-lg bg-immich-primary px-4 py-2 text-sm font-medium text-white shadow-md shadow-ui-primary/20 transition ease-immich duration-150 hover:bg-immich-primary/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-immich-primary dark:bg-immich-dark-primary dark:text-immich-dark-bg dark:hover:bg-immich-dark-primary/90"
         >
-          <Show
-            when={(rulesResource() ?? []).length > 0}
-            fallback={<EmptyState />}
-          >
-            <ul class="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white shadow-sm">
+          New rule
+        </A>
+      </div>
+
+      <Show when={error()}>
+        <div
+          class="mb-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-700/40 dark:bg-red-900/20 dark:text-red-200"
+          role="alert"
+        >
+          {error()}
+        </div>
+      </Show>
+
+      <Show
+        when={!rulesResource.loading}
+        fallback={<p class="text-ui-muted">Loading rules…</p>}
+      >
+        <Show
+          when={(rulesResource() ?? []).length > 0}
+          fallback={<EmptyState />}
+        >
+          <div class="rounded-2xl border border-ui-border bg-white shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray">
+            <ul class="divide-y divide-ui-border dark:divide-gray-700">
               <For each={rulesResource() ?? []}>
                 {(rule) => {
                   const isBusy = () => busyId() === rule.id;
@@ -166,14 +140,14 @@ const RulesList: Component = () => {
                     rule.status === "paused" ? "Resume" : "Pause";
                   return (
                     <li
-                      class="flex items-center justify-between gap-4 px-4 py-3"
+                      class="flex items-center justify-between gap-4 px-5 py-4"
                       classList={{ "opacity-60": dimmed() }}
                     >
                       <div class="min-w-0 flex-1">
-                        <p class="truncate text-sm font-medium text-slate-900">
+                        <p class="truncate text-sm font-medium text-immich-fg dark:text-immich-dark-fg">
                           {rule.name}
                         </p>
-                        <p class="mt-0.5 text-xs text-slate-500">
+                        <p class="mt-0.5 text-xs text-ui-muted">
                           {rule.target_album_strategy === "managed"
                             ? "Managed album"
                             : "Existing album"}{" "}
@@ -184,45 +158,48 @@ const RulesList: Component = () => {
                       <div class="flex items-center gap-2">
                         <A
                           href={`/rules/${rule.id}`}
-                          class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                          class="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-200 px-3 py-1.5 text-xs font-medium text-immich-fg transition ease-immich duration-150 hover:bg-slate-300 dark:bg-gray-700 dark:text-immich-dark-fg dark:hover:bg-gray-600"
                         >
                           Edit
                         </A>
                         <Show when={rule.status !== "archived"}>
-                          <button
+                          <Button
                             type="button"
+                            variant="secondary"
+                            size="sm"
                             disabled={isBusy()}
                             onClick={() => onTogglePause(rule)}
-                            class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
                           >
                             {pauseLabel()}
-                          </button>
-                          <button
+                          </Button>
+                          <Button
                             type="button"
+                            variant="secondary"
+                            size="sm"
                             disabled={isBusy()}
                             onClick={() => onArchiveClick(rule)}
-                            class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
                           >
                             Archive
-                          </button>
+                          </Button>
                         </Show>
-                        <button
+                        <Button
                           type="button"
+                          variant="destructive"
+                          size="sm"
                           disabled={isBusy()}
                           onClick={() => onDeleteClick(rule)}
-                          class="rounded-md border border-red-300 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-60"
                         >
                           {isBusy() ? "Working…" : "Delete"}
-                        </button>
+                        </Button>
                       </div>
                     </li>
                   );
                 }}
               </For>
             </ul>
-          </Show>
+          </div>
         </Show>
-      </section>
+      </Show>
 
       <ConfirmDialog
         open={pending()?.kind === "archive"}
@@ -241,19 +218,21 @@ const RulesList: Component = () => {
         onConfirm={onConfirmPending}
         onCancel={onCancelPending}
       />
-    </main>
+    </section>
   );
 };
 
 const EmptyState: Component = () => (
-  <div class="rounded-md border border-dashed border-slate-300 bg-white px-6 py-12 text-center">
-    <h2 class="text-base font-medium text-slate-900">No rules yet</h2>
-    <p class="mt-1 text-sm text-slate-500">
+  <div class="rounded-2xl border border-dashed border-ui-border bg-white px-6 py-12 text-center dark:border-gray-700 dark:bg-immich-dark-gray">
+    <h2 class="text-base font-medium text-immich-fg dark:text-immich-dark-fg">
+      No rules yet
+    </h2>
+    <p class="mt-1 text-sm text-ui-muted">
       Author your first rule by pasting YAML.
     </p>
     <A
       href="/rules/new"
-      class="mt-4 inline-block rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-500"
+      class="mt-4 inline-flex items-center justify-center gap-2 rounded-lg bg-immich-primary px-4 py-2 text-sm font-medium text-white shadow-md shadow-ui-primary/20 hover:bg-immich-primary/90 dark:bg-immich-dark-primary dark:text-immich-dark-bg dark:hover:bg-immich-dark-primary/90"
     >
       Create your first rule
     </A>
@@ -264,11 +243,11 @@ const StatusBadge: Component<{ status: RuleStatus }> = (props) => {
   const styles = () => {
     switch (props.status) {
       case "active":
-        return "bg-green-100 text-green-800 ring-green-200";
+        return "bg-emerald-100 text-emerald-800 ring-emerald-200 dark:bg-emerald-500/20 dark:text-emerald-200 dark:ring-emerald-500/30";
       case "paused":
-        return "bg-amber-100 text-amber-800 ring-amber-200";
+        return "bg-amber-100 text-amber-800 ring-amber-200 dark:bg-amber-500/20 dark:text-amber-200 dark:ring-amber-500/30";
       case "archived":
-        return "bg-slate-100 text-slate-700 ring-slate-200";
+        return "bg-slate-100 text-slate-700 ring-slate-200 dark:bg-gray-700 dark:text-gray-200 dark:ring-gray-600";
     }
   };
   return (
