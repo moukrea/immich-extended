@@ -96,6 +96,7 @@ const Login: Component<LoginProps> = (props) => {
           <div class="mt-4 border-t border-slate-200 pt-4">
             <a
               href="/api/v1/auth/oidc/login"
+              rel="external"
               class="block w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white text-center hover:bg-slate-800"
             >
               Sign in with SSO
