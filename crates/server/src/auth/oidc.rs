@@ -35,9 +35,12 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use openidconnect::{
-    core::{CoreAuthenticationFlow, CoreClient, CoreIdTokenVerifier, CoreProviderMetadata},
+    core::{
+        CoreAuthenticationFlow, CoreClient, CoreIdTokenVerifier, CoreProviderMetadata,
+        CoreUserInfoClaims,
+    },
     reqwest, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, TokenResponse,
+    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, TokenResponse,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -57,6 +60,14 @@ use crate::{
 /// under any IdP's auth-code-grant validity window.
 const HANDSHAKE_TTL_SECONDS: i64 = 600;
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 30 * 86_400;
+
+/// Operator-facing hint returned alongside `missing_email_claim`. The
+/// regression that prompted POSTSHIP-T6 was Authentik shipping with empty
+/// `property_mappings` on the immich-extended OAuth2Provider: callers got a
+/// bare `missing_email_claim` and had nothing to go on. The hint names the
+/// exact knob to check.
+const MISSING_EMAIL_AUTHENTIK_HINT: &str =
+    "OIDC provider returned no email — for Authentik, check OAuth2Provider.property_mappings includes the email scope mapping";
 
 /// Errors raised while building the OIDC client at startup. Boot-time failures
 /// propagate so the operator notices immediately — silent disabling on bad
@@ -322,19 +333,64 @@ async fn callback(
     })?;
 
     let issuer = claims.issuer().as_str().to_string();
-    let subject = claims.subject().as_str().to_string();
-    let email = claims
-        .email()
-        .map(|e| e.as_str().to_string())
-        .ok_or_else(|| {
-            tracing::warn!("oidc: id_token missing email claim");
-            oidc_bad_request("missing_email_claim")
-        })?;
-    let display_name = claims
+    let subject_id = claims.subject().clone();
+    let subject = subject_id.as_str().to_string();
+
+    let mut email = claims.email().map(|e| e.as_str().to_string());
+    let mut display_name = claims
         .name()
         .and_then(|n| n.get(None))
         .map(|n| n.as_str().to_string())
         .or_else(|| claims.preferred_username().map(|n| n.as_str().to_string()));
+
+    // POSTSHIP-T6 (OIDC regression 002): some OPs (notably Authentik when the
+    // OAuth2Provider's `property_mappings` is empty) ship an ID token with no
+    // `email` claim even when `email` was in the requested scopes. Fall back to
+    // the userinfo endpoint before failing — and if the fallback also yields
+    // no email, return a hint that points the operator at the actual fix.
+    if email.is_none() {
+        let access_token = token_response.access_token().clone();
+        let userinfo_request = client
+            .inner
+            .user_info(access_token, Some(subject_id.clone()))
+            .map_err(|err| {
+                tracing::warn!(
+                    error = %err,
+                    "oidc: id_token missing email and userinfo endpoint not advertised in discovery",
+                );
+                oidc_bad_request_with_hint("missing_email_claim", MISSING_EMAIL_AUTHENTIK_HINT)
+            })?;
+        let userinfo: CoreUserInfoClaims = userinfo_request
+            .request_async(&client.http)
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    error = %err,
+                    "oidc: id_token missing email and userinfo request failed",
+                );
+                oidc_bad_request_with_hint("missing_email_claim", MISSING_EMAIL_AUTHENTIK_HINT)
+            })?;
+        email = userinfo.email().map(|e| e.as_str().to_string());
+        if display_name.is_none() {
+            display_name = userinfo
+                .name()
+                .and_then(|n| n.get(None))
+                .map(|n| n.as_str().to_string())
+                .or_else(|| {
+                    userinfo
+                        .preferred_username()
+                        .map(|n| n.as_str().to_string())
+                });
+        }
+    }
+
+    let Some(email) = email else {
+        tracing::warn!("oidc: id_token AND userinfo both missing email claim");
+        return Err(oidc_bad_request_with_hint(
+            "missing_email_claim",
+            MISSING_EMAIL_AUTHENTIK_HINT,
+        ));
+    };
 
     let user_id = upsert_oidc_user(&app.db, &issuer, &subject, &email, display_name.as_deref())
         .await
@@ -406,6 +462,17 @@ async fn upsert_oidc_user(
 
 fn oidc_bad_request(code: &str) -> ErrorResponse {
     (StatusCode::BAD_REQUEST, Json(json!({"error": code})))
+}
+
+/// Variant of [`oidc_bad_request`] that carries a human-readable `hint` string
+/// alongside the machine-readable `error` code. Use it when the most likely
+/// fix is a configuration knob the operator can't infer from the error code
+/// alone — see [`MISSING_EMAIL_AUTHENTIK_HINT`].
+fn oidc_bad_request_with_hint(code: &str, hint: &str) -> ErrorResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": code, "hint": hint})),
+    )
 }
 
 fn internal_error() -> ErrorResponse {

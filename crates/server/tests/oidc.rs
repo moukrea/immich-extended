@@ -32,7 +32,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{header, Method, Request, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -89,9 +89,22 @@ fn keys() -> &'static RsaTestKeys {
 #[derive(Clone)]
 struct TokenSpec {
     sub: String,
-    email: String,
+    /// `None` means *omit the email claim entirely* — emulates an Authentik
+    /// OAuth2Provider whose `property_mappings` is missing the email scope,
+    /// which is the exact regression POSTSHIP-T6 defends against.
+    email: Option<String>,
     name: Option<String>,
     nonce: String,
+}
+
+/// Controls the JSON body the mock's `/userinfo` route returns. `None` means
+/// the userinfo endpoint should respond 404 — useful for asserting the
+/// fallback can't paper over a totally broken IdP.
+#[derive(Clone)]
+struct UserInfoSpec {
+    sub: String,
+    email: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -103,6 +116,10 @@ struct MockState {
     /// without a primed spec something has gone wrong in the test flow and we
     /// want a loud panic rather than a silent default.
     next: Arc<Mutex<Option<TokenSpec>>>,
+    /// Test primes this when it expects the server to fall back to the
+    /// userinfo endpoint. `None` -> the route 404s, which surfaces in the
+    /// production code as a userinfo request failure.
+    next_userinfo: Arc<Mutex<Option<UserInfoSpec>>>,
 }
 
 async fn discovery_doc(State(s): State<MockState>) -> Json<serde_json::Value> {
@@ -114,6 +131,11 @@ async fn discovery_doc(State(s): State<MockState>) -> Json<serde_json::Value> {
         "authorization_endpoint": format!("{}/authorize", s.issuer),
         "token_endpoint": format!("{}/token", s.issuer),
         "jwks_uri": format!("{}/jwks.json", s.issuer),
+        // Advertised so the openidconnect client's EndpointMaybeSet variant
+        // allows `client.inner.user_info(...)` instead of returning a
+        // ConfigurationError::MissingUrl. The POSTSHIP-T6 fallback path
+        // depends on this being present.
+        "userinfo_endpoint": format!("{}/userinfo", s.issuer),
         "response_types_supported": ["code"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
@@ -157,11 +179,15 @@ async fn token(State(s): State<MockState>) -> impl IntoResponse {
         "iss": s.issuer,
         "aud": s.audience,
         "sub": spec.sub,
-        "email": spec.email,
         "nonce": spec.nonce,
         "iat": now,
         "exp": now + 3600,
     });
+    // Conditional insertion: omitting the field on `None` is the whole point —
+    // it lets a test reproduce the Authentik "no email scope mapping" failure.
+    if let Some(email) = &spec.email {
+        claims["email"] = serde_json::Value::String(email.clone());
+    }
     if let Some(name) = &spec.name {
         claims["name"] = serde_json::Value::String(name.clone());
     }
@@ -176,6 +202,23 @@ async fn token(State(s): State<MockState>) -> impl IntoResponse {
     }))
 }
 
+/// Mock `/userinfo`. Returns 404 unless the test has primed `next_userinfo`.
+/// Doesn't bother validating the bearer token — the assertions we care about
+/// happen on the client side of the openidconnect crate.
+async fn userinfo(State(s): State<MockState>) -> Response {
+    let Some(spec) = s.next_userinfo.lock().unwrap().clone() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response();
+    };
+    let mut body = serde_json::json!({ "sub": spec.sub });
+    if let Some(email) = &spec.email {
+        body["email"] = serde_json::Value::String(email.clone());
+    }
+    if let Some(name) = &spec.name {
+        body["name"] = serde_json::Value::String(name.clone());
+    }
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 /// Bind a fresh axum server on `127.0.0.1:0` and spawn its accept loop. The
 /// returned `MockState` lets the test prime `next` between calls.
 async fn start_mock_issuer() -> (String, MockState) {
@@ -186,12 +229,14 @@ async fn start_mock_issuer() -> (String, MockState) {
         issuer: issuer.clone(),
         audience: CLIENT_ID.to_string(),
         next: Arc::new(Mutex::new(None)),
+        next_userinfo: Arc::new(Mutex::new(None)),
     };
     let app = Router::new()
         .route("/.well-known/openid-configuration", get(discovery_doc))
         .route("/jwks.json", get(jwks))
         .route("/authorize", get(authorize))
         .route("/token", post(token))
+        .route("/userinfo", get(userinfo))
         .with_state(state.clone());
     tokio::spawn(async move {
         // Errors here surface as "test made no progress" — the test will fail
@@ -313,7 +358,7 @@ async fn callback_creates_user_and_session_on_first_login() {
     let nonce = fetch_nonce(&pool, &state_value).await;
     *mock.next.lock().unwrap() = Some(TokenSpec {
         sub: "user-xyz".to_string(),
-        email: "u@mock".to_string(),
+        email: Some("u@mock".to_string()),
         name: Some("Mock User".to_string()),
         nonce,
     });
@@ -389,7 +434,7 @@ async fn callback_with_same_subject_reuses_user() {
         let nonce = fetch_nonce(&pool, &state_value).await;
         *mock.next.lock().unwrap() = Some(TokenSpec {
             sub: "stable-sub".to_string(),
-            email: "stable@mock".to_string(),
+            email: Some("stable@mock".to_string()),
             name: Some("Stable User".to_string()),
             nonce,
         });
@@ -475,7 +520,7 @@ async fn callback_sets_production_cookie_with_host_prefix_invariants() {
     let nonce = fetch_nonce(&pool, &state_value).await;
     *mock.next.lock().unwrap() = Some(TokenSpec {
         sub: "user-prod".to_string(),
-        email: "p@mock".to_string(),
+        email: Some("p@mock".to_string()),
         name: Some("Prod User".to_string()),
         nonce,
     });
@@ -514,4 +559,132 @@ async fn callback_sets_production_cookie_with_host_prefix_invariants() {
         set_cookie.contains("SameSite=Lax"),
         "production cookie must be SameSite=Lax (Strict would drop the IdP-redirect cookie): {set_cookie}",
     );
+}
+
+/// POSTSHIP-T6 — userinfo fallback supplies email when the ID token omits it.
+///
+/// Reproduces the cycle-2 Authentik regression: the OAuth2Provider was
+/// shipped with empty `property_mappings`, so Authentik happily returned a
+/// signed ID token with `sub` + `nonce` but no `email`. Pre-T6 the server
+/// 400-ed `missing_email_claim` and the SPA showed the bare error. T6's
+/// contract: call `/userinfo` with the access token; if it carries `email`
+/// the login succeeds, `users.email` is populated from userinfo, and
+/// `display_name` falls back to userinfo's `name` too if the ID token
+/// didn't carry it.
+#[tokio::test]
+async fn callback_falls_back_to_userinfo_when_id_token_lacks_email() {
+    let (issuer, mock) = start_mock_issuer().await;
+    let (state, pool) = fresh_state_with_oidc(&issuer).await;
+
+    let login = call_login(&state).await;
+    assert_eq!(login.status(), StatusCode::SEE_OTHER);
+    let location = login
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let state_value = query_value(&location, "state").unwrap();
+    let nonce = fetch_nonce(&pool, &state_value).await;
+
+    // ID token: no email, no name — emulates Authentik with empty
+    // property_mappings.
+    *mock.next.lock().unwrap() = Some(TokenSpec {
+        sub: "ui-sub".to_string(),
+        email: None,
+        name: None,
+        nonce,
+    });
+    // Userinfo: same sub (otherwise openidconnect's expected_subject check
+    // rejects the response), populated email + name.
+    *mock.next_userinfo.lock().unwrap() = Some(UserInfoSpec {
+        sub: "ui-sub".to_string(),
+        email: Some("recovered@mock".to_string()),
+        name: Some("Recovered User".to_string()),
+    });
+
+    let cb = call_callback(&state, &state_value, "code-ui").await;
+    assert_eq!(
+        cb.status(),
+        StatusCode::SEE_OTHER,
+        "fallback path must land at /, not 400",
+    );
+
+    // Plain sqlx::query rather than the offline-checked `query!` macro to
+    // avoid regenerating `.sqlx/` for a single test-only join.
+    let email: String = sqlx::query_scalar(
+        "SELECT email FROM users WHERE id = \
+         (SELECT user_id FROM oidc_identities WHERE subject = 'ui-sub')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(email, "recovered@mock");
+    let display_name: Option<String> = sqlx::query_scalar(
+        "SELECT display_name FROM users WHERE id = \
+         (SELECT user_id FROM oidc_identities WHERE subject = 'ui-sub')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(display_name.as_deref(), Some("Recovered User"));
+}
+
+/// POSTSHIP-T6 — negative path: ID token AND userinfo both lack email.
+///
+/// We must NOT silently succeed (a user with no email is unauthenticatable
+/// in this app). The contract is 400 with `error=missing_email_claim` AND a
+/// `hint` field that points the operator at the actual fix knob.
+#[tokio::test]
+async fn callback_fails_with_hint_when_id_token_and_userinfo_both_lack_email() {
+    let (issuer, mock) = start_mock_issuer().await;
+    let (state, pool) = fresh_state_with_oidc(&issuer).await;
+
+    let login = call_login(&state).await;
+    let location = login
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let state_value = query_value(&location, "state").unwrap();
+    let nonce = fetch_nonce(&pool, &state_value).await;
+
+    *mock.next.lock().unwrap() = Some(TokenSpec {
+        sub: "no-email-sub".to_string(),
+        email: None,
+        name: None,
+        nonce,
+    });
+    *mock.next_userinfo.lock().unwrap() = Some(UserInfoSpec {
+        sub: "no-email-sub".to_string(),
+        email: None,
+        name: None,
+    });
+
+    let cb = call_callback(&state, &state_value, "code-no-email").await;
+    assert_eq!(cb.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(cb).await;
+    assert_eq!(body["error"], "missing_email_claim");
+    let hint = body["hint"]
+        .as_str()
+        .expect("hint field must be a string so operators get an actionable error");
+    assert!(
+        hint.to_lowercase().contains("authentik"),
+        "hint should name Authentik so the operator knows where to look: {hint}",
+    );
+    assert!(
+        hint.to_lowercase().contains("property_mappings")
+            || hint.to_lowercase().contains("property mappings"),
+        "hint should name property_mappings (the actual knob): {hint}",
+    );
+
+    // No user row should have been created.
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users, 0);
 }
