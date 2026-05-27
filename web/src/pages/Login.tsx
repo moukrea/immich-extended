@@ -94,6 +94,10 @@ const Login: Component<LoginProps> = (props) => {
 
         <Show when={props.oidcEnabled()}>
           <div class="mt-4 border-t border-slate-200 pt-4">
+            {/* rel="external" opts this link out of SolidJS Router interception
+                so the browser performs a real navigation to the server-rendered
+                /api/v1/auth/oidc/login redirect. Without it the click is
+                hijacked into client-side routing and lands on NotFound. */}
             <a
               href="/api/v1/auth/oidc/login"
               rel="external"
