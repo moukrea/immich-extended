@@ -1,3 +1,53 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root,
+  .light {
+    --immich-primary: 66 80 175;
+    --immich-bg: 255 255 255;
+    --immich-fg: 0 0 0;
+    --immich-dark-primary: 172 203 250;
+    --immich-dark-bg: 10 10 10;
+    --immich-dark-fg: 229 231 235;
+    --immich-dark-gray: 33 33 33;
+    --immich-ui-primary: 66 80 175;
+    --immich-ui-success: 16 188 99;
+    --immich-ui-danger: 200 60 60;
+    --immich-ui-warning: 216 143 64;
+    --immich-ui-info: 8 111 230;
+    --immich-ui-muted: 161 161 161;
+    --immich-ui-gray: 246 246 246;
+    --immich-ui-dark: 20 22 26;
+    --immich-ui-light: 255 255 255;
+    --immich-ui-default-border: 209 213 219;
+  }
+  .dark {
+    --immich-ui-primary: 172 203 250;
+    --immich-ui-success: 72 237 152;
+    --immich-ui-danger: 246 125 125;
+    --immich-ui-warning: 254 197 132;
+    --immich-ui-info: 121 183 254;
+    --immich-ui-muted: 212 212 212;
+    --immich-ui-gray: 33 33 33;
+    --immich-ui-dark: 229 231 235;
+    --immich-ui-light: 0 0 0;
+    --immich-ui-default-border: 33 33 33;
+  }
+  html,
+  body {
+    background-color: rgb(var(--immich-bg));
+    color: rgb(var(--immich-fg));
+    font-family:
+      "Overpass", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  html.dark,
+  html.dark body {
+    background-color: rgb(var(--immich-dark-bg));
+    color: rgb(var(--immich-dark-fg));
+  }
+}

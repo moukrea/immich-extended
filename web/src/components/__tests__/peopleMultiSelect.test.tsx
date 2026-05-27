@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createSignal, untrack } from "solid-js";
+import { createSignal, untrack, type JSX } from "solid-js";
 import { cleanup, fireEvent, render } from "@solidjs/testing-library";
 
 vi.mock("@solidjs/router", () => {
@@ -12,7 +12,7 @@ vi.mock("@solidjs/router", () => {
       children?: unknown;
     }) => (
       <a href={props.href} class={props.class}>
-        {props.children as unknown}
+        {props.children as JSX.Element}
       </a>
     ),
   };
