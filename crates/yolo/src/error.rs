@@ -14,8 +14,6 @@ pub enum YoloError {
     Image(#[from] image::ImageError),
     #[error("Model path not found: {0}")]
     ModelMissing(PathBuf),
-    #[error("Model URL/SHA256 not configured (set YOLO_MODEL_URL and YOLO_MODEL_SHA256)")]
-    ModelNotConfigured,
     #[error("ffmpeg failed: {0}")]
     Ffmpeg(String),
 }

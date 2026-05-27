@@ -38,19 +38,27 @@ ffmpeg -y -loop 1 -i one_person.jpg -t 10 \
 
 At `fps=0.5` this clip yields exactly **5 extracted frames** (t = 0, 2, 4, 6, 8 s).
 
-## `yolo11n.onnx` (≈5 MB, optional)
+## `yolo11n.onnx` (≈10 MB, optional)
 
-Ultralytics YOLOv11n nano model, exported to ONNX with `imgsz=640`. AGPL-3.0; we use it
-only for test inference, not redistribute. The fixture is bundled so CI does not need
-network access. If the file is absent, the integration tests fall back to
-`ensure_model` which reads `YOLO_MODEL_URL` + `YOLO_MODEL_SHA256` from the environment.
+Ultralytics YOLOv11n nano model, exported to ONNX with `imgsz=640`. AGPL-3.0; we
+redistribute the exported bytes from a GitHub release of this repo for end-user
+convenience only. The fixture is bundled so CI does not need network access. If
+the file is absent, the integration tests fall back to `ensure_model`, which
+downloads from [`yolo::DEFAULT_MODEL_URL`] (a release asset on this repo) and
+verifies the bytes against [`yolo::DEFAULT_MODEL_SHA256`]. The env vars
+`YOLO_MODEL_URL` / `YOLO_MODEL_SHA256` remain as optional overrides for advanced
+operators who want to swap in a different ONNX model.
 
-To re-export:
+To re-export and update the baked constants:
 
 ```bash
 python3 -m venv /tmp/yenv && source /tmp/yenv/bin/activate
 pip install ultralytics
 yolo export model=yolo11n.pt format=onnx imgsz=640
 mv yolo11n.onnx crates/yolo/tests/fixtures/
-sha256sum crates/yolo/tests/fixtures/yolo11n.onnx  # update creds.env YOLO_MODEL_SHA256
+NEW_SHA=$(sha256sum crates/yolo/tests/fixtures/yolo11n.onnx | awk '{print $1}')
+echo "new SHA: $NEW_SHA"
+gh release upload models-yolo11n-vN crates/yolo/tests/fixtures/yolo11n.onnx \
+  --repo moukrea/immich-extended  # or `create` for a new tag
+# then update DEFAULT_MODEL_URL + DEFAULT_MODEL_SHA256 in crates/yolo/src/model.rs
 ```

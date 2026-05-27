@@ -12,20 +12,33 @@ pub const PERSON_CLASS_ID: usize = 0;
 pub const CONF_THRESHOLD: f32 = 0.5;
 pub const NMS_IOU_THRESHOLD: f32 = 0.5;
 
+/// Default model download URL — a pinned GitHub release asset on this repo.
+/// Operators may override with the `YOLO_MODEL_URL` env var; the downloaded
+/// bytes are always verified against the configured (default or override) SHA256.
+pub const DEFAULT_MODEL_URL: &str =
+    "https://github.com/moukrea/immich-extended/releases/download/models-yolo11n-v1/yolo11n.onnx";
+
+/// Default model SHA256 — matches the bytes of the GitHub release asset above
+/// and `crates/yolo/tests/fixtures/yolo11n.onnx`. Operators may override with
+/// the `YOLO_MODEL_SHA256` env var; the override is the value that must match
+/// the downloaded bytes.
+pub const DEFAULT_MODEL_SHA256: &str =
+    "aad852905370fe1b9cfb684690022013f2e0fa75ed699f472320cb38671bb04f";
+
 const MODEL_REL_PATH: &str = "models/yolo.onnx";
 
 pub fn model_path(data_dir: &Path) -> PathBuf {
     data_dir.join(MODEL_REL_PATH)
 }
 
-pub fn model_url_from_env() -> Option<String> {
-    std::env::var("YOLO_MODEL_URL").ok()
+pub fn model_url() -> String {
+    std::env::var("YOLO_MODEL_URL").unwrap_or_else(|_| DEFAULT_MODEL_URL.to_string())
 }
 
-pub fn expected_sha256_from_env() -> Option<String> {
+pub fn expected_sha256() -> String {
     std::env::var("YOLO_MODEL_SHA256")
-        .ok()
-        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|_| DEFAULT_MODEL_SHA256.to_string())
+        .to_lowercase()
 }
 
 async fn sha256_file(path: &Path) -> Result<String, YoloError> {
@@ -95,10 +108,13 @@ pub async fn ensure_model_with(
     Ok(path)
 }
 
-/// Convenience wrapper that reads `YOLO_MODEL_URL` and `YOLO_MODEL_SHA256` from env.
+/// Convenience wrapper using the baked-in [`DEFAULT_MODEL_URL`] +
+/// [`DEFAULT_MODEL_SHA256`] constants. Operators may override either with
+/// `YOLO_MODEL_URL` / `YOLO_MODEL_SHA256` env vars (the SHA256 of the
+/// downloaded bytes is still verified against the configured value).
 pub async fn ensure_model(data_dir: &Path) -> Result<PathBuf, YoloError> {
-    let url = model_url_from_env().ok_or(YoloError::ModelNotConfigured)?;
-    let sha = expected_sha256_from_env().ok_or(YoloError::ModelNotConfigured)?;
+    let url = model_url();
+    let sha = expected_sha256();
     ensure_model_with(data_dir, &url, &sha).await
 }
 
@@ -169,5 +185,31 @@ mod tests {
             model_path(dp),
             std::path::PathBuf::from("/data/models/yolo.onnx")
         );
+    }
+
+    #[test]
+    fn default_constants_are_well_formed() {
+        assert!(DEFAULT_MODEL_URL.starts_with("https://"));
+        assert!(DEFAULT_MODEL_URL.ends_with(".onnx"));
+        assert_eq!(DEFAULT_MODEL_SHA256.len(), 64);
+        assert!(
+            DEFAULT_MODEL_SHA256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "DEFAULT_MODEL_SHA256 must be lower-case hex"
+        );
+    }
+
+    /// Belt-and-suspenders: the public resolver returns SOME non-empty value
+    /// without panicking, whether or not the env var is set in this test
+    /// process. We don't mutate env (Rust 2024 made set/remove unsafe and the
+    /// crate forbids unsafe); we just exercise the call path.
+    #[test]
+    fn resolvers_return_non_empty_string() {
+        let url = model_url();
+        assert!(url.starts_with("http"), "model_url: {url}");
+        let sha = expected_sha256();
+        assert_eq!(sha.len(), 64);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
