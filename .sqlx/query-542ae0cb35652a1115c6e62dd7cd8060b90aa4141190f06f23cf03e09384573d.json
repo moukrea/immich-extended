@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO asset_index_state (user_id, last_updated_at, last_swept_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_updated_at = excluded.last_updated_at, last_swept_at = excluded.last_swept_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "542ae0cb35652a1115c6e62dd7cd8060b90aa4141190f06f23cf03e09384573d"
+}

@@ -659,4 +659,157 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 0, "local_credentials row should cascade-delete");
     }
+
+    #[tokio::test]
+    async fn migrations_create_asset_index() {
+        let pool = fresh_pool().await;
+        let cols = columns(&pool, "asset_index").await;
+        for c in [
+            "user_id",
+            "asset_id",
+            "filename",
+            "updated_at",
+            "taken_at",
+            "lat",
+            "lng",
+            "media_type",
+            "person_ids",
+            "face_count",
+            "indexed_at",
+        ] {
+            assert_has(&cols, c);
+        }
+
+        let user_id = cols.iter().find(|c| c.name == "user_id").unwrap();
+        let asset_id = cols.iter().find(|c| c.name == "asset_id").unwrap();
+        assert!(
+            user_id.pk > 0 && asset_id.pk > 0,
+            "(user_id, asset_id) should be the composite PK"
+        );
+
+        for required_notnull in [
+            "user_id",
+            "asset_id",
+            "filename",
+            "updated_at",
+            "media_type",
+        ] {
+            let col = cols.iter().find(|c| c.name == required_notnull).unwrap();
+            assert_eq!(col.notnull, 1, "'{required_notnull}' should be NOT NULL");
+        }
+        for nullable in ["taken_at", "lat", "lng"] {
+            let col = cols.iter().find(|c| c.name == nullable).unwrap();
+            assert_eq!(col.notnull, 0, "'{nullable}' should be NULL-able");
+        }
+
+        let person_ids = cols.iter().find(|c| c.name == "person_ids").unwrap();
+        assert_eq!(
+            person_ids._dflt.as_deref(),
+            Some("'[]'"),
+            "'person_ids' should default to '[]'"
+        );
+        let face_count = cols.iter().find(|c| c.name == "face_count").unwrap();
+        assert_eq!(
+            face_count._dflt.as_deref(),
+            Some("0"),
+            "'face_count' should default to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrations_create_asset_index_indexes() {
+        let pool = fresh_pool().await;
+        let indexes: Vec<PragmaIndex> = sqlx::query_as("PRAGMA index_list('asset_index')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let names: Vec<&str> = indexes.iter().map(|i| i.name.as_str()).collect();
+        for required in ["asset_index_user_idx", "asset_index_user_updated_idx"] {
+            assert!(names.contains(&required), "missing {required}: {names:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn migrations_create_asset_index_state() {
+        let pool = fresh_pool().await;
+        let cols = columns(&pool, "asset_index_state").await;
+        for c in ["user_id", "last_updated_at", "last_swept_at"] {
+            assert_has(&cols, c);
+        }
+        let pk = cols.iter().find(|c| c.name == "user_id").unwrap();
+        assert_eq!(pk.pk, 1, "'user_id' should be PRIMARY KEY");
+        let last_updated = cols.iter().find(|c| c.name == "last_updated_at").unwrap();
+        assert_eq!(
+            last_updated.notnull, 1,
+            "'last_updated_at' should be NOT NULL"
+        );
+        assert_eq!(
+            last_updated._dflt.as_deref(),
+            Some("0"),
+            "'last_updated_at' should default to 0"
+        );
+        let last_swept = cols.iter().find(|c| c.name == "last_swept_at").unwrap();
+        assert_eq!(last_swept.notnull, 0, "'last_swept_at' should be NULL-able");
+    }
+
+    #[tokio::test]
+    async fn asset_index_fks_cascade_on_user_delete() {
+        let pool = fresh_pool().await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)")
+            .bind("u-idx")
+            .bind("idx@example.com")
+            .bind(Option::<String>::None)
+            .bind(0_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO asset_index \
+                (user_id, asset_id, filename, updated_at, media_type, indexed_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("u-idx")
+        .bind("asset-1")
+        .bind("IMG_0001.jpg")
+        .bind(1_000_i64)
+        .bind("photo")
+        .bind(1_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO asset_index_state (user_id, last_updated_at, last_swept_at) \
+             VALUES (?, ?, ?)",
+        )
+        .bind("u-idx")
+        .bind(1_000_i64)
+        .bind(2_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind("u-idx")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let idx_remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset_index")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(idx_remaining, 0, "asset_index should cascade-delete");
+        let state_remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset_index_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state_remaining, 0,
+            "asset_index_state should cascade-delete"
+        );
+    }
 }

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod config;
 pub mod engine_cycle;
 pub mod engine_scheduler;
+pub mod indexer;
 pub mod me;
 pub mod rules;
 pub mod setup;

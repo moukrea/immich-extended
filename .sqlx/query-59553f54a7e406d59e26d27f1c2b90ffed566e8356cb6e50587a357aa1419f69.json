@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO asset_index (user_id, asset_id, filename, updated_at, taken_at, lat, lng, media_type, person_ids, face_count, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, asset_id) DO UPDATE SET filename = excluded.filename, updated_at = excluded.updated_at, taken_at = excluded.taken_at, lat = excluded.lat, lng = excluded.lng, media_type = excluded.media_type, person_ids = excluded.person_ids, face_count = excluded.face_count, indexed_at = excluded.indexed_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "59553f54a7e406d59e26d27f1c2b90ffed566e8356cb6e50587a357aa1419f69"
+}

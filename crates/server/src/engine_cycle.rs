@@ -790,6 +790,7 @@ mod tests {
         let exif = Utc.with_ymd_and_hms(2025, 6, 1, 9, 0, 0).unwrap();
         let asset = ImmichAsset {
             id: "a1".into(),
+            filename: "IMG_0001.jpg".into(),
             asset_type: ImmichAssetType::Video,
             file_created_at: None,
             exif_date_time_original: Some(exif),
@@ -814,6 +815,7 @@ mod tests {
         let file_created = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let asset = ImmichAsset {
             id: "a1".into(),
+            filename: "IMG_0001.jpg".into(),
             asset_type: ImmichAssetType::Image,
             file_created_at: Some(file_created),
             exif_date_time_original: None,
@@ -832,6 +834,7 @@ mod tests {
         use chrono::TimeZone;
         let asset = ImmichAsset {
             id: "a1".into(),
+            filename: "IMG_0001.jpg".into(),
             asset_type: ImmichAssetType::Other,
             file_created_at: None,
             exif_date_time_original: None,

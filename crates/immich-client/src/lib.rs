@@ -211,6 +211,10 @@ impl ImmichAssetType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImmichAsset {
     pub id: String,
+    /// Immich `originalFileName`. Defaults to an empty string when a (older or
+    /// unusual) Immich payload omits it. Backs `asset_index.filename` and the
+    /// decisions/live-log UI so the operator sees a name, not a raw UUID.
+    pub filename: String,
     pub asset_type: ImmichAssetType,
     pub file_created_at: Option<DateTime<Utc>>,
     pub exif_date_time_original: Option<DateTime<Utc>>,
@@ -238,6 +242,8 @@ struct RawPerson {
 #[derive(Debug, Deserialize)]
 struct RawAsset {
     id: String,
+    #[serde(rename = "originalFileName", default)]
+    original_file_name: String,
     #[serde(rename = "type", default)]
     type_: String,
     #[serde(rename = "fileCreatedAt", default)]
@@ -258,6 +264,7 @@ impl From<RawAsset> for ImmichAsset {
         };
         Self {
             id: r.id,
+            filename: r.original_file_name,
             asset_type: ImmichAssetType::from_str(&r.type_),
             file_created_at: r.file_created_at,
             exif_date_time_original: exif_dt,
@@ -910,6 +917,7 @@ mod tests {
         // Use a representative Immich JSON shape (matches the live probe).
         let body = serde_json::json!({
             "id": "a1",
+            "originalFileName": "IMG_0001.jpg",
             "type": "IMAGE",
             "fileCreatedAt": "2025-06-01T10:00:00.000Z",
             "updatedAt": "2025-06-01T10:05:00.000Z",
@@ -923,6 +931,7 @@ mod tests {
         let raw: RawAsset = serde_json::from_value(body).unwrap();
         let asset: ImmichAsset = raw.into();
         assert_eq!(asset.id, "a1");
+        assert_eq!(asset.filename, "IMG_0001.jpg");
         assert_eq!(asset.asset_type, ImmichAssetType::Image);
         assert!(asset.file_created_at.is_some());
         assert!(asset.exif_date_time_original.is_some());
@@ -1012,6 +1021,10 @@ mod tests {
         let raw: RawAsset = serde_json::from_value(body).unwrap();
         let asset: ImmichAsset = raw.into();
         assert_eq!(asset.asset_type, ImmichAssetType::Video);
+        assert_eq!(
+            asset.filename, "",
+            "missing originalFileName defaults to empty"
+        );
         assert!(asset.file_created_at.is_none());
         assert!(asset.exif_date_time_original.is_none());
         assert!(asset.latitude.is_none());

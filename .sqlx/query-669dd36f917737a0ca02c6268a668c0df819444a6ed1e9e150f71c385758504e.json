@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT last_updated_at FROM asset_index_state WHERE user_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "last_updated_at",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "669dd36f917737a0ca02c6268a668c0df819444a6ed1e9e150f71c385758504e"
+}

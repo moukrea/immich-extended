@@ -17,6 +17,7 @@ use server::{
     auth::oidc::OidcClient,
     config::Config,
     engine_scheduler::Scheduler,
+    indexer::Indexer,
     rules::resolver::ImmichResourceResolver,
     AppState,
 };
@@ -146,6 +147,13 @@ async fn run_serve(cfg: Config) -> Result<()> {
         cfg.data_dir.clone(),
     ));
 
+    // Background whole-library pre-processing indexer (POSTSHIP-T28). One
+    // process-wide task that keeps `asset_index` fresh for every keyed user so
+    // rule matching (T29) can scan locally. Built per-user from stored keys, so
+    // — like the scheduler — it needs only the master key, not a global Immich
+    // URL. Held here (not in AppState): no CRUD hook reaches it in this cycle.
+    let indexer = Arc::new(Indexer::new(pool.clone(), cfg.master_key.clone()));
+
     let state = AppState {
         db: pool.clone(),
         session: cfg.session.clone(),
@@ -164,6 +172,8 @@ async fn run_serve(cfg: Config) -> Result<()> {
         .await
         .context("starting per-rule scheduler")?;
 
+    indexer.clone().start().await;
+
     let app = server::router(state, cfg.web_dist_dir.clone());
 
     let listener = TcpListener::bind(cfg.http_bind)
@@ -181,6 +191,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
         .context("axum::serve terminated with an error")?;
 
     scheduler.stop().await;
+    indexer.stop().await;
     info!("immich-extended stopped");
     pool.close().await;
     Ok(())
