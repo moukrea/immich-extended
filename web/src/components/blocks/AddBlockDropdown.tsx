@@ -47,6 +47,13 @@ const AddBlockDropdown: Component<Props> = (props) => {
     props.onAddGroup(kind);
   };
 
+  // The top-level composer add passes `groupKinds={[]}` (groups emerge from
+  // "Group selected"); render the Group section only when something is offered.
+  const groupOptions = (): [AddableGroupKind, string][] =>
+    (props.groupKinds ?? (Object.keys(GROUP_LABEL) as AddableGroupKind[])).map(
+      (k) => [k, GROUP_LABEL[k]] as [AddableGroupKind, string],
+    );
+
   return (
     <div class="relative inline-block" ref={rootRef}>
       <button
@@ -82,32 +89,27 @@ const AddBlockDropdown: Component<Props> = (props) => {
               )}
             </For>
           </ul>
-          <p class="border-t border-ui-border px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ui-muted dark:text-gray-400">
-            Group
-          </p>
-          <ul class="py-1">
-            <For
-              each={
-                (props.groupKinds ??
-                  (Object.keys(GROUP_LABEL) as AddableGroupKind[])).map(
-                  (k) => [k, GROUP_LABEL[k]] as [AddableGroupKind, string],
-                )
-              }
-            >
-              {([key, label]) => (
-                <li>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => pickGroup(key)}
-                    class="block w-full px-3 py-1.5 text-left text-sm text-immich-fg dark:text-immich-dark-fg hover:bg-slate-100 dark:hover:bg-gray-700"
-                  >
-                    {label}
-                  </button>
-                </li>
-              )}
-            </For>
-          </ul>
+          <Show when={groupOptions().length > 0}>
+            <p class="border-t border-ui-border px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ui-muted dark:text-gray-400">
+              Group
+            </p>
+            <ul class="py-1">
+              <For each={groupOptions()}>
+                {([key, label]) => (
+                  <li>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => pickGroup(key)}
+                      class="block w-full px-3 py-1.5 text-left text-sm text-immich-fg dark:text-immich-dark-fg hover:bg-slate-100 dark:hover:bg-gray-700"
+                    >
+                      {label}
+                    </button>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
         </div>
       </Show>
     </div>

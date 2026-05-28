@@ -1,89 +1,209 @@
-import { Show, type Component } from "solid-js";
+// Composer root for the drag-and-drop sentence block rule builder
+// (POSTSHIP-T35, per `docs/design/dnd-block-builder.md` §3 / §5 / §8). Same
+// `{ expr, onChange }` prop contract as the old flat builder so `RuleBuilderV2`
+// is unchanged — the redesign lives entirely below this boundary.
+//
+// It owns the two ephemeral edit signals (`selection`, `dragFrom`), builds the
+// `TreeEditCtx` the recursive `NodeView` reads/writes, and performs the §3
+// top-level partition: a root AND is split into a POSITIVE expression (the main
+// composer, "Include media when …") and EXCLUDE entries (the rose "Always
+// exclude" strip). Positive edits recombine with the current excludes before
+// reaching `onChange`; the excludes never appear as inline pills.
+
+import { Show, createMemo, createSignal, type Component } from "solid-js";
 import { and, emptyMatch, type MatchExpr } from "../../lib/matchTree";
+import { pathToKey, wrapInGroup } from "../../lib/treeOps";
 import AddBlockDropdown from "./AddBlockDropdown";
-import NodeRenderer from "./GroupNode";
-import { defaultGroup, defaultLeaf } from "./defaults";
+import ExcludeStrip, { type ExcludeEntry } from "./ExcludeStrip";
+import NodeView, { type TreeEditCtx } from "./NodeView";
+import SelectionBar from "./SelectionBar";
+import { defaultLeaf, type AddableLeafKind } from "./defaults";
 
 interface Props {
   expr: MatchExpr;
   onChange: (next: MatchExpr) => void;
 }
 
-// UI-specific emptiness check: a NOT shell with an empty child is still
-// rendered (the user just added it and is about to fill it in). The
-// matchTree `isEmpty` helper conservatively treats it as empty because the
-// engine evaluates `NOT(emptyMatch)` as a no-op; in the editor we want the
-// shell visible so the user can populate it.
-function shouldShowEmptyState(expr: MatchExpr): boolean {
-  if (expr.kind === "leaf") return false;
-  if (expr.op === "not") return false;
-  return expr.children.length === 0;
+interface Partition {
+  /** The expression rendered in the main composer (NodeView at path `[]`). */
+  positive: MatchExpr;
+  /** The original exclude child nodes, in order — reused verbatim on recombine. */
+  excludeNodes: MatchExpr[];
+  /** Strip view-models; `key` is the exclude child's index in `excludeNodes`. */
+  excludes: ExcludeEntry[];
 }
 
-/**
- * Root composer for the block-based rule editor. Normalizes the root so the
- * UI always has somewhere to append (an outer AND wrapper). On the wire the
- * single-child AND is emitted as-is — the matchTree serializer matches the
- * Rust impl exactly and a single-child AND parses identically to a bare leaf.
- */
+// The two top-level "blacklist" shapes the strip owns: a flat
+// `person{must_exclude}` leaf (what `legacyMatchSpecToTree` and the deployed
+// rules emit) or `not(person{includes})` (the schema-doc design intent). Both
+// evaluate identically and both are lifted into the Always-exclude strip; only
+// the flat shape is written for a *new* exclude (§3.2 / Open Q1).
+function excludePersonId(node: MatchExpr): string | null {
+  if (node.kind === "leaf" && node.leaf === "person" && node.mode === "must_exclude") {
+    return node.person_id;
+  }
+  if (node.kind === "group" && node.op === "not") {
+    const c = node.child;
+    if (c.kind === "leaf" && c.leaf === "person" && c.mode === "includes") {
+      return c.person_id;
+    }
+  }
+  return null;
+}
+
+// §3.1 — partition the root AND into positive + exclude buckets. A non-AND root
+// (or / not / leaf) is wholly positive with no excludes.
+function partitionRoot(root: MatchExpr): Partition {
+  if (root.kind === "group" && root.op === "and") {
+    const positiveChildren: MatchExpr[] = [];
+    const excludeNodes: MatchExpr[] = [];
+    const excludes: ExcludeEntry[] = [];
+    root.children.forEach((child) => {
+      const pid = excludePersonId(child);
+      if (pid !== null) {
+        excludes.push({ key: pathToKey([excludeNodes.length]), person_id: pid });
+        excludeNodes.push(child);
+      } else {
+        positiveChildren.push(child);
+      }
+    });
+    let positive: MatchExpr;
+    if (positiveChildren.length === 0) positive = emptyMatch();
+    else if (positiveChildren.length === 1) positive = positiveChildren[0]!;
+    else positive = and(positiveChildren);
+    return { positive, excludeNodes, excludes };
+  }
+  return { positive: root, excludeNodes: [], excludes: [] };
+}
+
+// §3.2 — fold the (possibly edited) positive expression back together with the
+// excludes. A top-level positive AND is flattened so excludes stay direct
+// children of the root AND (matching the deployed shape + round-tripping bit-
+// for-bit); anything else is wrapped.
+function recombine(positive: MatchExpr, excludeNodes: MatchExpr[]): MatchExpr {
+  if (excludeNodes.length === 0) return positive;
+  if (positive.kind === "group" && positive.op === "and") {
+    return and([...positive.children, ...excludeNodes]);
+  }
+  return and([positive, ...excludeNodes]);
+}
+
+// A childless AND/OR positive is the "no conditions yet" empty state (§9.2).
+function isEmptyPositive(positive: MatchExpr): boolean {
+  return (
+    positive.kind === "group" && positive.op !== "not" && positive.children.length === 0
+  );
+}
+
 const BlockTreeEditor: Component<Props> = (props) => {
-  const onReplace = (next: MatchExpr) => props.onChange(next);
+  const [selection, setSelection] = createSignal<Set<string>>(new Set());
+  const [dragFrom, setDragFrom] = createSignal<number[] | null>(null);
 
-  const addLeafToEmpty = (kind: Parameters<typeof defaultLeaf>[0]) =>
-    props.onChange(defaultLeaf(kind));
-  const addGroupToEmpty = (kind: Parameters<typeof defaultGroup>[0]) =>
-    props.onChange(defaultGroup(kind));
+  const part = createMemo(() => partitionRoot(props.expr));
+  const positive = () => part().positive;
 
-  // When the root is a single leaf and the user clicks "+ Add condition",
-  // wrap the leaf into an AND so the next addition becomes a sibling.
-  const wrapAndAppendLeaf = (kind: Parameters<typeof defaultLeaf>[0]) => {
-    if (props.expr.kind === "leaf") {
-      props.onChange(and([props.expr, defaultLeaf(kind)]));
-      return;
-    }
-    addLeafToEmpty(kind);
+  const clearSelection = () => setSelection(new Set<string>());
+
+  // Every positive-side edit recombines with the current excludes and clears
+  // the (now possibly stale-pathed) selection — §8.
+  const applyPositive = (nextPositive: MatchExpr) => {
+    if (nextPositive === positive()) return;
+    props.onChange(recombine(nextPositive, part().excludeNodes));
+    clearSelection();
   };
-  const wrapAndAppendGroup = (kind: Parameters<typeof defaultGroup>[0]) => {
-    if (props.expr.kind === "leaf") {
-      props.onChange(and([props.expr, defaultGroup(kind)]));
-      return;
-    }
-    addGroupToEmpty(kind);
+
+  const ctx: TreeEditCtx = {
+    root: positive,
+    onChange: (next) => applyPositive(next),
+    isSelected: (k) => selection().has(k),
+    setSelected: (k, on) =>
+      setSelection((prev) => {
+        const s = new Set(prev);
+        if (on) s.add(k);
+        else s.delete(k);
+        return s;
+      }),
+    dragFrom,
+    setDragFrom: (p) => setDragFrom(() => p),
+  };
+
+  // Top-level "+ Add condition" — leaves only (groups emerge from "Group
+  // selected", per D6). Seeds the empty state, or wraps a single positive leaf
+  // into an AND so the next addition becomes a sibling.
+  const addFirstLeaf = (kind: AddableLeafKind) => applyPositive(defaultLeaf(kind));
+  const wrapAndAppendLeaf = (kind: AddableLeafKind) =>
+    applyPositive(and([positive(), defaultLeaf(kind)]));
+
+  const onGroup = (parentPath: number[], childIndices: number[], op: "and" | "or") =>
+    applyPositive(wrapInGroup(positive(), parentPath, childIndices, op));
+
+  const addExclude = (personId: string) => {
+    if (!personId) return;
+    const node: MatchExpr = {
+      kind: "leaf",
+      leaf: "person",
+      mode: "must_exclude",
+      person_id: personId,
+    };
+    props.onChange(recombine(positive(), [...part().excludeNodes, node]));
+    clearSelection();
+  };
+  const removeExclude = (key: string) => {
+    const idx = part().excludes.findIndex((e) => e.key === key);
+    if (idx < 0) return;
+    const remaining = part().excludeNodes.filter((_, i) => i !== idx);
+    props.onChange(recombine(positive(), remaining));
+    clearSelection();
   };
 
   return (
-    <div data-testid="block-tree-editor" class="space-y-3">
-      <Show
-        when={!shouldShowEmptyState(props.expr)}
-        fallback={
-          <div class="rounded-xl border-2 border-dashed border-ui-border bg-slate-50/50 dark:bg-gray-900/40 p-4 text-center">
-            <p class="text-sm text-ui-muted dark:text-gray-400 mb-3">
-              No conditions yet. The rule will match every asset.
-            </p>
-            <AddBlockDropdown
-              label="+ Add condition"
-              onAddLeaf={addLeafToEmpty}
-              onAddGroup={addGroupToEmpty}
-            />
-          </div>
-        }
-      >
-        <NodeRenderer
-          node={props.expr}
-          onChange={onReplace}
-          onRemove={() => props.onChange(emptyMatch())}
-          insideNot={false}
-        />
-        <Show when={props.expr.kind === "leaf"}>
-          <div class="text-center">
-            <AddBlockDropdown
-              label="+ Add condition"
-              onAddLeaf={wrapAndAppendLeaf}
-              onAddGroup={wrapAndAppendGroup}
-            />
-          </div>
+    <div data-testid="block-tree-editor" class="space-y-4">
+      <div class="space-y-2">
+        <p class="text-sm font-medium text-immich-fg dark:text-immich-dark-fg">
+          Include media when
+        </p>
+        <Show
+          when={!isEmptyPositive(positive())}
+          fallback={
+            <div class="rounded-2xl border-2 border-dashed border-ui-border bg-slate-50/50 p-6 text-center dark:bg-gray-900/40">
+              <p class="mb-3 text-sm text-ui-muted dark:text-gray-400">
+                No conditions yet — this rule would match every asset.
+              </p>
+              <AddBlockDropdown
+                label="+ Add condition"
+                groupKinds={[]}
+                onAddLeaf={addFirstLeaf}
+                onAddGroup={() => undefined}
+              />
+            </div>
+          }
+        >
+          <NodeView ctx={ctx} path={[]} />
+          <Show when={positive().kind === "leaf"}>
+            <div>
+              <AddBlockDropdown
+                label="+ Add condition"
+                groupKinds={[]}
+                onAddLeaf={wrapAndAppendLeaf}
+                onAddGroup={() => undefined}
+              />
+            </div>
+          </Show>
         </Show>
-      </Show>
+      </div>
+
+      <SelectionBar
+        root={positive}
+        selected={selection}
+        onGroup={onGroup}
+        onClear={clearSelection}
+      />
+
+      <ExcludeStrip
+        entries={() => part().excludes}
+        onAddPerson={addExclude}
+        onRemove={removeExclude}
+      />
     </div>
   );
 };
