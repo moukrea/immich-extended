@@ -174,3 +174,23 @@ The three open design forks are now decided; full detail in `.ralph/TASKS.md` "C
 - **No operator review gate** — worker designs AND implements straight through. The compensating control is the **mandatory UI self-assessment (D5)**: Chrome-MCP screenshot + critical comparison to the Immich style mirror / wireframe before any UI task is marked done. vitest-green is NOT enough.
 - **Drag-drop builder follows the explicit interaction model in D6** — pill-cards, bordered AND/OR/NOT group containers, "Group selected" as the primary grouping mechanism. Do not ship another flat form.
 
+
+---
+
+## OPERATOR DIRECTIVES (2026-05-28, POSTSHIP cycle 6)
+
+Operator reviewed the deployed build: the Activity view "makes no sense," and the processing model is wrong. Root cause: the background indexer (`indexer.rs`) correctly indexes the whole library and re-indexes on Immich `updatedAt` change, BUT rule matching is still rule-centric polling (`engine_scheduler.rs` per-rule timers) — the indexer never triggers matching, and activating a rule waits for the next poll tick. Full detail + design in `.ralph/TASKS.md` "POSTSHIP cycle 6" and `docs/design/event-driven-matching.md` (to be written in T38).
+
+The desired model (LOCKED, operator-confirmed):
+1. **Index every photo in the background, store its specifics, re-process on Immich-side change** — already done; keep `indexer.rs` as the heartbeat.
+2. **Matching is EVENT-DRIVEN, not poll-driven.** After each indexer sweep, the asset_ids touched that sweep are evaluated against ALL active rules (incremental). Per-rule poll timers are RETIRED.
+3. **Rule create/activate/edit triggers an IMMEDIATE full-index scan** against that rule (backfill now, not next-tick).
+4. **One slow hourly safety re-scan** of all active rules against the full index catches missed events (summary only, no per-asset spam).
+5. **Activity view = library status header + per-asset grouped live log** ("IMG_123: indexed (3 people, GPS) → matched Paloma, skipped Trip → filed to album"). Reshape consumption of the existing `activity.rs` ActivityBus; don't rebuild the bus.
+
+Cycle-6 ABSOLUTE rules:
+- Reuse the cycle-5 album-fill delta logic + `album_managed_assets` removal-respect — only the matching TRIGGER changes, not the album side.
+- The D5 UI quality gate (Chrome-MCP screenshot + critical compare before marking a UI task done) still applies to T44.
+- Don't write the project-complete sentinel until POSTSHIP-T45 verifies live.
+- Worker + supervisor now run on `claude-opus-4-8[1m]` at `--effort max` (config.env, set 2026-05-28).
+
