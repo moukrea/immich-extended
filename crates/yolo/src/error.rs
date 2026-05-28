@@ -6,8 +6,6 @@ pub enum YoloError {
     Download(#[from] reqwest::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Model SHA256 mismatch (expected {expected}, got {actual})")]
-    ShaMismatch { expected: String, actual: String },
     #[error("ONNX Runtime error: {0}")]
     Ort(#[from] ort::Error),
     #[error("Image decode error: {0}")]

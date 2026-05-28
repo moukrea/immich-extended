@@ -11,9 +11,8 @@ pub mod video;
 
 pub use error::YoloError;
 pub use model::{
-    ensure_model, ensure_model_with, expected_sha256, model_path, model_url, CONF_THRESHOLD,
-    DEFAULT_MODEL_SHA256, DEFAULT_MODEL_URL, MODEL_INPUT_SIZE, MODEL_VERSION, NMS_IOU_THRESHOLD,
-    PERSON_CLASS_ID,
+    ensure_model, ensure_model_with, model_path, model_url, CONF_THRESHOLD, DEFAULT_MODEL_URL,
+    MODEL_INPUT_SIZE, MODEL_VERSION, NMS_IOU_THRESHOLD, PERSON_CLASS_ID,
 };
 pub use postprocess::count_persons;
 pub use preprocess::{letterbox, letterbox_to_tensor, to_input_tensor, LetterboxMeta};
@@ -31,9 +30,8 @@ pub fn version() -> &'static str {
 ///
 /// The model is expected at `data_dir/models/yolo.onnx`. If absent, the function falls
 /// back to [`ensure_model`] which downloads from [`DEFAULT_MODEL_URL`] (or the
-/// `YOLO_MODEL_URL` override) and verifies the bytes against [`DEFAULT_MODEL_SHA256`]
-/// (or the `YOLO_MODEL_SHA256` override). Inference runs on a blocking thread pool
-/// because it is CPU-bound.
+/// `YOLO_MODEL_URL` override). Inference runs on a blocking thread pool because it is
+/// CPU-bound.
 pub async fn count_people_in_image(data_dir: &Path, image_path: &Path) -> Result<u32, YoloError> {
     let mp = model_path(data_dir);
     if !mp.exists() {
