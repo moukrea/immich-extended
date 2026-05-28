@@ -943,3 +943,267 @@ async fn run_one_cycle_resolves_managed_album_name_from_yaml_when_column_null() 
     .unwrap();
     assert_eq!(row.target_album_id, "legacy-album-id");
 }
+
+// --- T26 surface: managed-album backfill + record `added` only on PUT success ---
+
+#[tokio::test]
+async fn run_one_cycle_backfills_managed_album_when_first_bound() {
+    // POSTSHIP-T26 defect (ii): a managed rule whose album hadn't been minted
+    // yet may carry an advanced watermark from earlier no-op cycles (the
+    // empty-album bug). When the album is bound this cycle the watermark resets
+    // to NULL so the whole library is re-scanned and historical matches
+    // backfill into the freshly-created album.
+    let server = MockServer::start().await;
+
+    // No album by that name yet → create it.
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "backfill-album",
+            "albumName": MANAGED_NAME,
+            "ownerId": OWNER_IMMICH_UID,
+            "albumUsers": [],
+            "assetCount": 0,
+        })))
+        .mount(&server)
+        .await;
+
+    // Capture the first search body to prove the scan ran with NO updatedAfter
+    // (i.e. the watermark was reset to NULL before listing).
+    let search_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
+    let search_capture = search_body.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(move |req: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            if let Ok(mut g) = search_capture.try_lock() {
+                if g.is_none() {
+                    *g = Some(body);
+                }
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "assets": {
+                    "items": [
+                        {
+                            "id": "old-1",
+                            "type": "IMAGE",
+                            "fileCreatedAt": "2024-03-01T00:00:00Z",
+                            "updatedAt": "2024-03-02T00:00:00Z",
+                            "exifInfo": {"dateTimeOriginal": "2024-03-01T00:00:00Z"},
+                            "people": []
+                        },
+                        {
+                            "id": "old-2",
+                            "type": "IMAGE",
+                            "fileCreatedAt": "2024-04-01T00:00:00Z",
+                            "updatedAt": "2024-04-02T00:00:00Z",
+                            "exifInfo": {"dateTimeOriginal": "2024-04-01T00:00:00Z"},
+                            "people": []
+                        }
+                    ],
+                    "nextPage": null
+                }
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    // The fresh album is empty.
+    Mock::given(method("GET"))
+        .and(path("/api/albums/backfill-album"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "backfill-album",
+            "ownerId": OWNER_IMMICH_UID,
+            "albumUsers": [],
+            "assets": []
+        })))
+        .mount(&server)
+        .await;
+
+    let put_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
+    let put_capture = put_body.clone();
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/backfill-album/assets"))
+        .respond_with(move |req: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            if let Ok(mut g) = put_capture.try_lock() {
+                *g = Some(body);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    let parsed = r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#;
+    seed_managed_rule(
+        &pool,
+        &owner,
+        "backfill-r1",
+        &managed_yaml("backfill-r1"),
+        parsed,
+        Some(MANAGED_NAME),
+    )
+    .await;
+    // Simulate an advanced watermark from earlier no-op cycles (the bug state):
+    // far in the future so, without a reset, the scan would skip everything.
+    sqlx::query("UPDATE rules SET last_processed_asset_timestamp = ? WHERE id = ?")
+        .bind(5_000_000_000_i64)
+        .bind("backfill-r1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mk = deterministic_key();
+    let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "backfill-r1")
+        .await
+        .unwrap();
+    assert_eq!(outcome.added, 2, "both historical matches backfilled");
+
+    // The scan ran with NO updatedAfter → the watermark had been reset to NULL.
+    let body = search_body.lock().await.clone().expect("search fired");
+    assert!(
+        body.get("updatedAfter").is_none(),
+        "watermark should reset to NULL before the backfill scan, got {body:?}",
+    );
+
+    // Album id persisted to the rule.
+    let row = sqlx::query!(
+        "SELECT target_album_id FROM rules WHERE id = ?",
+        "backfill-r1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.target_album_id, "backfill-album");
+
+    // PUT carried both matched ids.
+    let put = put_body.lock().await.clone().expect("PUT fired");
+    let mut ids: Vec<String> = put["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["old-1".to_string(), "old-2".to_string()]);
+
+    // Both recorded as `added`...
+    let decisions = common::decisions::list_decisions_for_rule(&pool, "backfill-r1", 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(decisions.len(), 2);
+    assert!(decisions.iter().all(|d| d.decision == "added"));
+
+    // ...and a baseline row landed in album_managed_assets for T29's diff.
+    let managed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM album_managed_assets WHERE rule_id = ? AND state = 'added'",
+    )
+    .bind("backfill-r1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(managed, 2, "album_managed_assets baseline populated");
+}
+
+#[tokio::test]
+async fn run_one_cycle_records_no_phantom_added_when_put_fails() {
+    // POSTSHIP-T26 defect (i): a failed album PUT must NOT leave a phantom
+    // `added` decision. The PUT runs before any decision is recorded, so its
+    // failure aborts the cycle with nothing committed and the watermark intact.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "assets": {
+                "items": [
+                    {
+                        "id": "m1",
+                        "type": "IMAGE",
+                        "fileCreatedAt": "2025-01-01T00:00:00Z",
+                        "updatedAt": "2025-01-02T00:00:00Z",
+                        "exifInfo": {"dateTimeOriginal": "2025-01-01T00:00:00Z"},
+                        "people": []
+                    }
+                ],
+                "nextPage": null
+            }
+        })))
+        .mount(&server)
+        .await;
+    // Album is empty (diff = the one match), but the PUT 500s.
+    Mock::given(method("GET"))
+        .and(path("/api/albums/album-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "album-1",
+            "assets": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-1/assets"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+
+    let mk = deterministic_key();
+    let err = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, server::engine_cycle::CycleError::Immich(_)));
+
+    // No phantom decision rows.
+    let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
+        .await
+        .unwrap();
+    assert!(
+        decisions.is_empty(),
+        "no decision rows when the PUT failed, got {decisions:?}",
+    );
+
+    // No album_managed_assets baseline either.
+    let managed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM album_managed_assets WHERE rule_id = ?")
+            .bind("r1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(managed, 0);
+
+    // Watermark untouched so the next tick retries the same window.
+    let row = sqlx::query!(
+        "SELECT last_processed_asset_timestamp FROM rules WHERE id = ?",
+        "r1"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.last_processed_asset_timestamp.is_none());
+
+    // Run finalised with the immich_unreachable error slug.
+    let run = common::decisions::latest_run_for_rule(&pool, "r1")
+        .await
+        .unwrap()
+        .expect("a run row should exist even on error");
+    assert!(run
+        .error_message
+        .as_deref()
+        .unwrap()
+        .starts_with("immich_unreachable"));
+}

@@ -15,18 +15,22 @@
 //! cross-account test exists precisely to keep this property; never re-add a
 //! global client.
 //!
-//! ### Ordering vs. crash recovery
+//! ### Ordering vs. crash recovery (POSTSHIP-T26)
 //!
-//! Decision UPSERTs happen inside a transaction that is committed **before**
-//! the `PUT /api/albums/:id/assets` round trip. If the process crashes
-//! between the commit and the PUT, the next tick re-evaluates the same
-//! assets and the M3-T5 idempotent diff (or Immich's own no-op semantics)
-//! makes the re-PUT safe. The reverse ordering (PUT before commit) would
-//! lose "we added this" durability on crash — never flip the order.
+//! The `PUT /api/albums/:id/assets` round trip happens **before** any matched
+//! asset is recorded as `added`. A matched asset only earns an `added`
+//! decision (and an `album_managed_assets` baseline row) once the PUT that
+//! files it into the album has actually succeeded. If the PUT fails the whole
+//! cycle errors out, the watermark stays put, nothing is recorded, and the
+//! next tick retries the same window — Immich's PUT is idempotent so the
+//! re-add is safe. This kills the phantom-`added` defect where a rule whose
+//! album did not yet exist recorded hundreds of `added` rows that never landed
+//! anywhere (the empty-managed-album bug).
 //!
-//! The watermark + `last_run_at` write also lands **after** the album add so
-//! a failed PUT doesn't move the watermark forward; the next tick reattempts
-//! the same window.
+//! The watermark + `last_run_at` write lands **after** the decisions commit.
+//! It advances only when every matched asset was filed: if a rule has no album
+//! to write to but matched assets, the watermark is held back so those matches
+//! re-evaluate (and backfill) once an album exists.
 //!
 //! ### Watermark choice
 //!
@@ -134,6 +138,18 @@ struct ResolvedKey {
     immich_user_id: Option<String>,
 }
 
+/// Outcome of resolving a rule's target album for the current cycle.
+struct ResolvedAlbum {
+    /// Immich album id to write to. Empty when the rule has no album (a
+    /// malformed existing-strategy row); the cycle then records nothing and
+    /// holds its watermark.
+    album_id: String,
+    /// True when this cycle bound a previously-unset album to the rule and
+    /// reset its watermark to NULL — the caller must re-scan the whole library
+    /// this cycle to backfill historical matches (POSTSHIP-T26 defect ii).
+    watermark_was_reset: bool,
+}
+
 /// Public entry: run one poll cycle for `rule_id`. Returns the run summary
 /// on success; on failure, the `rule_runs` row is still finalised with an
 /// `error_message` slug.
@@ -202,14 +218,25 @@ async fn cycle_body(
     // Resolve target album. For Existing-strategy rules `target_album_id` is
     // already a real Immich id; for Managed-strategy rules an empty
     // `target_album_id` means the album hasn't been minted yet, so we do
-    // find-or-create now and persist the resulting id back to the row. After
-    // the first successful cycle subsequent cycles short-circuit to the
-    // already-stored id.
-    let resolved_album_id = resolve_target_album(pool, &client, &key, &rule, rule_id).await?;
+    // find-or-create now and persist the resulting id back to the row. The
+    // first time an album is bound to a rule its watermark is reset to NULL
+    // (POSTSHIP-T26 defect ii) so this cycle re-scans the whole library and
+    // backfills matches decided before the album existed.
+    let resolved = resolve_target_album(pool, &client, &key, &rule, rule_id).await?;
+    let resolved_album_id = resolved.album_id;
+    let have_album = !resolved_album_id.is_empty();
 
-    let since = rule.last_processed_asset_timestamp.map(epoch_to_utc);
+    let effective_since = if resolved.watermark_was_reset {
+        None
+    } else {
+        rule.last_processed_asset_timestamp
+    };
     let assets = client
-        .list_assets(&key.api_key, since, MAX_PAGES_PER_TICK)
+        .list_assets(
+            &key.api_key,
+            effective_since.map(epoch_to_utc),
+            MAX_PAGES_PER_TICK,
+        )
         .await
         .map_err(immich_error)?;
 
@@ -225,17 +252,55 @@ async fn cycle_body(
         decided.push((asset, outcome));
     }
 
+    let matched_ids: Vec<String> = decided
+        .iter()
+        .filter(|(_, o)| o.matched)
+        .map(|(a, _)| a.id.clone())
+        .collect();
+
+    // Defect (i): file the matches into the album BEFORE recording any `added`.
+    // A failed PUT (or a get_album failure) propagates as a cycle error here,
+    // so we never commit a phantom `added` for an asset that didn't land.
+    // `idempotent_album_add` is all-or-nothing: the whole diff succeeds or it
+    // returns Err. With no album we push nothing and record nothing below.
+    let pushed = if have_album {
+        crate::album_sync::idempotent_album_add(
+            &client,
+            &key.api_key,
+            &resolved_album_id,
+            &matched_ids,
+        )
+        .await
+        .map_err(immich_error)?
+    } else {
+        0
+    };
+    tracing::debug!(
+        rule_id,
+        candidates = matched_ids.len(),
+        pushed,
+        have_album,
+        "album sync diff applied",
+    );
+
+    // Record decisions now that the PUT has landed. A matched asset earns an
+    // `added` row (and an `album_managed_assets` baseline) ONLY when the rule
+    // had an album; without one the match is left unrecorded so a later cycle
+    // backfills it. Skipped assets are always recorded.
     let mut evaluated: i64 = 0;
     let mut added: i64 = 0;
     let mut skipped: i64 = 0;
-    let mut to_add_to_album: Vec<String> = Vec::new();
-    let mut watermark: Option<DateTime<Utc>> =
-        rule.last_processed_asset_timestamp.map(epoch_to_utc);
+    let decided_at = now_unix_seconds();
 
     let mut tx = pool.begin().await?;
-    let decided_at = now_unix_seconds();
     for (asset, outcome) in &decided {
         evaluated += 1;
+        let matched = outcome.matched;
+        if matched && !have_album {
+            // Nothing to file this into — leave it unrecorded; the watermark is
+            // held back below so it re-evaluates once an album exists.
+            continue;
+        }
         let (decision_str, reason_slug) = decision_columns(outcome);
         sqlx::query!(
             "INSERT INTO asset_decisions (rule_id, asset_id, decision, reason, run_id, decided_at) \
@@ -254,39 +319,44 @@ async fn cycle_body(
         )
         .execute(&mut *tx)
         .await?;
-        if outcome.matched {
-            to_add_to_album.push(asset.id.clone());
+        if matched {
+            // Baseline for T29's manual-removal diff: remember this rule filed
+            // this asset. Never clobber a `removed` verdict (set later by T29).
+            sqlx::query!(
+                "INSERT INTO album_managed_assets (rule_id, asset_id, state, changed_at) \
+                 VALUES (?, ?, 'added', ?) \
+                 ON CONFLICT(rule_id, asset_id) DO UPDATE SET \
+                     state = 'added', \
+                     changed_at = excluded.changed_at \
+                 WHERE album_managed_assets.state <> 'removed'",
+                rule_id,
+                asset.id,
+                decided_at,
+            )
+            .execute(&mut *tx)
+            .await?;
             added += 1;
         } else {
             skipped += 1;
         }
-        watermark = Some(match watermark {
-            Some(w) if w >= asset.updated_at => w,
-            _ => asset.updated_at,
-        });
     }
     tx.commit().await?;
 
-    // Album push happens *after* the decisions transaction has committed —
-    // see the module-level docs for why this ordering matters on crash. The
-    // managed-target find-or-create already ran above (`resolve_target_album`)
-    // so `resolved_album_id` is non-empty for every reachable code path here.
-    let pushed = crate::album_sync::idempotent_album_add(
-        &client,
-        &key.api_key,
-        &resolved_album_id,
-        &to_add_to_album,
-    )
-    .await
-    .map_err(immich_error)?;
-    tracing::debug!(
-        rule_id,
-        candidates = to_add_to_album.len(),
-        pushed,
-        "album sync diff applied",
-    );
-
-    let watermark_epoch = watermark.map(|w| w.timestamp());
+    // Watermark advances past the whole window UNLESS a match was held back for
+    // lack of an album — then keep the prior watermark so it backfills later.
+    let hold_watermark = !have_album && !matched_ids.is_empty();
+    let watermark_epoch = if hold_watermark {
+        effective_since
+    } else {
+        let mut watermark: Option<DateTime<Utc>> = effective_since.map(epoch_to_utc);
+        for (asset, _) in &decided {
+            watermark = Some(match watermark {
+                Some(w) if w >= asset.updated_at => w,
+                _ => asset.updated_at,
+            });
+        }
+        watermark.map(|w| w.timestamp())
+    };
     update_watermark_and_last_run(pool, rule_id, watermark_epoch, now_unix_seconds()).await?;
 
     Ok(RunOutcome {
@@ -354,11 +424,12 @@ fn build_client(base_url: &str) -> Result<ImmichClient, CycleError> {
 ///
 /// Three paths:
 /// * `target_album_id` is non-empty — existing rule or already-resolved
-///   managed rule. Return the id as-is.
+///   managed rule. Return the id as-is (`watermark_was_reset = false`).
 /// * `target_album_id` empty + strategy `managed` — find the operator's
 ///   first writable album matching `name`. If none exists, `POST /api/albums`
 ///   creates one. The new id is persisted back to `rules.target_album_id`
-///   so the next cycle is a fast no-op for this branch.
+///   AND the rule's watermark is reset to NULL so this cycle backfills the
+///   freshly-bound album (`watermark_was_reset = true`).
 /// * `target_album_id` empty + strategy `existing` — malformed row (the
 ///   handler refuses to write that combination). Treated as "no album to
 ///   write to": return the empty string so the album push stays a no-op.
@@ -368,12 +439,18 @@ async fn resolve_target_album(
     key: &ResolvedKey,
     rule: &LoadedRule,
     rule_id: &str,
-) -> Result<String, CycleError> {
+) -> Result<ResolvedAlbum, CycleError> {
     if !rule.target_album_id.is_empty() {
-        return Ok(rule.target_album_id.clone());
+        return Ok(ResolvedAlbum {
+            album_id: rule.target_album_id.clone(),
+            watermark_was_reset: false,
+        });
     }
     if rule.target_album_strategy != "managed" {
-        return Ok(String::new());
+        return Ok(ResolvedAlbum {
+            album_id: String::new(),
+            watermark_was_reset: false,
+        });
     }
     let name = resolve_managed_name(rule)
         .ok_or_else(|| CycleError::ManagedAlbumNameMissing(rule_id.to_string()))?;
@@ -406,8 +483,11 @@ async fn resolve_target_album(
         }
     };
 
+    // Bind the album AND reset the watermark in one write: this is the first
+    // time the rule has an album, so any matches decided earlier (while the
+    // push was a no-op) must be re-evaluated and backfilled this cycle.
     sqlx::query!(
-        "UPDATE rules SET target_album_id = ? WHERE id = ?",
+        "UPDATE rules SET target_album_id = ?, last_processed_asset_timestamp = NULL WHERE id = ?",
         resolved_id,
         rule_id,
     )
@@ -417,9 +497,12 @@ async fn resolve_target_album(
         rule_id,
         album_id = %resolved_id,
         album_name = %name,
-        "managed target album resolved",
+        "managed target album resolved; watermark reset for backfill",
     );
-    Ok(resolved_id)
+    Ok(ResolvedAlbum {
+        album_id: resolved_id,
+        watermark_was_reset: true,
+    })
 }
 
 /// Recover the managed-album name from a [`LoadedRule`]. Prefers the
