@@ -160,9 +160,6 @@ const BlockTreeEditor: Component<Props> = (props) => {
   return (
     <div data-testid="block-tree-editor" class="space-y-4">
       <div class="space-y-2">
-        <p class="text-sm font-medium text-immich-fg dark:text-immich-dark-fg">
-          Include media when
-        </p>
         <Show
           when={!isEmptyPositive(positive())}
           fallback={
