@@ -359,3 +359,64 @@ export function pasteImmichKey(
 export function deleteImmichKey(): Promise<ApiResult<void>> {
   return request<void>("/api/v1/me/immich-key", { method: "DELETE" });
 }
+
+/// One entry in the global live-activity log (T33). A discriminated union on
+/// `kind`, mirroring the server's `ActivityKind`. `seq` is a process-monotonic
+/// cursor; `at` is unix seconds.
+interface ActivityEventBase {
+  seq: number;
+  at: number;
+}
+export type ActivityEvent =
+  | (ActivityEventBase & {
+      kind: "indexed";
+      filename: string;
+      person_count: number;
+      has_gps: boolean;
+      taken_at: number | null;
+    })
+  | (ActivityEventBase & {
+      kind: "matched";
+      rule_id: string;
+      rule_name: string;
+      asset_id: string;
+      filename: string | null;
+    })
+  | (ActivityEventBase & {
+      kind: "skipped";
+      rule_id: string;
+      rule_name: string;
+      asset_id: string;
+      filename: string | null;
+      reason: string;
+    })
+  | (ActivityEventBase & {
+      kind: "album_add";
+      rule_id: string;
+      rule_name: string;
+      album_id: string;
+      added_count: number;
+    })
+  | (ActivityEventBase & {
+      kind: "sweep_done";
+      indexed: number;
+      took_ms: number;
+    });
+
+export interface ActivityStreamResponse {
+  events: ActivityEvent[];
+  /// High-water seq the client should send as the next `after`, even when some
+  /// events were evicted from the server's ring buffer between polls.
+  last_seq: number;
+}
+
+/// Poll the caller's live-activity stream for events newer than `after`
+/// (0 = the whole retained tail).
+export function fetchActivityStream(
+  after = 0,
+): Promise<ApiResult<ActivityStreamResponse>> {
+  const qs = after > 0 ? `?after=${after}` : "";
+  return request<ActivityStreamResponse>(`/api/v1/me/activity/stream${qs}`, {
+    method: "GET",
+  });
+}

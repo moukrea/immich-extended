@@ -71,6 +71,7 @@ async fn fresh_state_two_users() -> (AppState, SqlitePool, String, String) {
         oidc: Arc::new(None),
         resolver: Arc::new(resolver),
         scheduler: Arc::new(Scheduler::for_tests(pool.clone())),
+        activity: Arc::new(server::activity::ActivityBus::new()),
     };
     (state, pool, owner_a, owner_b)
 }

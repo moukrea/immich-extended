@@ -1,5 +1,6 @@
 //! HTTP server, configuration, and wiring of the engine + clients into axum routes.
 
+pub mod activity;
 pub mod admin;
 pub mod album_sync;
 pub mod auth;
@@ -14,6 +15,7 @@ pub mod setup;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use activity::ActivityBus;
 use auth::oidc::OidcClient;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -54,6 +56,11 @@ pub struct AppState {
     /// next boot. Hand-rolled `Debug` because `Scheduler` holds an opaque
     /// `RunCycleFn` closure (no `Debug` impl).
     pub scheduler: Arc<Scheduler>,
+    /// Bounded in-memory live-activity ring buffer (T33). The indexer and the
+    /// rule-cycle tick function publish into it; the `/me/activity/stream`
+    /// endpoint reads the caller's tail. `Arc` so the single buffer is shared
+    /// across all those clones.
+    pub activity: Arc<ActivityBus>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -65,6 +72,7 @@ impl std::fmt::Debug for AppState {
             .field("oidc", &self.oidc)
             .field("resolver", &"Arc<dyn RuleResourceResolver>")
             .field("scheduler", &"Arc<Scheduler>")
+            .field("activity", &self.activity)
             .finish()
     }
 }

@@ -36,10 +36,12 @@
 //! under their own `user_id`.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
 use common::crypto::MasterKey;
+
+use crate::activity::ActivityBus;
 use immich_client::{ImmichAsset, ImmichAssetType, ImmichClient, ValidationError};
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -122,6 +124,7 @@ pub struct UserSweepSummary {
 pub struct Indexer {
     pool: SqlitePool,
     master_key: MasterKey,
+    activity: Arc<ActivityBus>,
     config: IndexerConfig,
     cancel: CancellationToken,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -139,16 +142,24 @@ impl std::fmt::Debug for Indexer {
 impl Indexer {
     /// Production constructor (120 s sweep; drains the full `updatedAfter`
     /// window per user, capped at the `MAX_SEARCH_PAGES` safety ceiling).
-    pub fn new(pool: SqlitePool, master_key: MasterKey) -> Self {
-        Self::new_with(pool, master_key, IndexerConfig::default())
+    /// `activity` is the shared live-log buffer each sweep publishes
+    /// per-asset "Indexed" and per-sweep "SweepDone" events into (T33).
+    pub fn new(pool: SqlitePool, master_key: MasterKey, activity: Arc<ActivityBus>) -> Self {
+        Self::new_with(pool, master_key, activity, IndexerConfig::default())
     }
 
     /// Constructor with an explicit config. Tests use this to shorten the
     /// interval; production calls [`Self::new`].
-    pub fn new_with(pool: SqlitePool, master_key: MasterKey, config: IndexerConfig) -> Self {
+    pub fn new_with(
+        pool: SqlitePool,
+        master_key: MasterKey,
+        activity: Arc<ActivityBus>,
+        config: IndexerConfig,
+    ) -> Self {
         Self {
             pool,
             master_key,
+            activity,
             config,
             cancel: CancellationToken::new(),
             join: Mutex::new(None),
@@ -202,11 +213,12 @@ impl Indexer {
         let mut users_swept = 0usize;
         let mut total_indexed = 0usize;
         for row in rows {
-            match sweep_one_user(
+            match sweep_one_user_inner(
                 &self.pool,
                 &self.master_key,
                 &row.user_id,
                 self.config.max_pages_per_sweep,
+                Some(&self.activity),
             )
             .await
             {
@@ -246,6 +258,21 @@ pub async fn sweep_one_user(
     user_id: &str,
     max_pages: u32,
 ) -> Result<UserSweepSummary, IndexerError> {
+    sweep_one_user_inner(pool, master_key, user_id, max_pages, None).await
+}
+
+/// Implementation of [`sweep_one_user`] with an optional live-log buffer. The
+/// public wrapper passes `None` (tests don't care about the bus); the
+/// background loop passes `Some(&bus)` so each upserted asset surfaces as an
+/// "Indexed" event and the sweep closes with a "SweepDone" on `/activity`.
+async fn sweep_one_user_inner(
+    pool: &SqlitePool,
+    master_key: &MasterKey,
+    user_id: &str,
+    max_pages: u32,
+    activity: Option<&ActivityBus>,
+) -> Result<UserSweepSummary, IndexerError> {
+    let started = Instant::now();
     let key = load_key(pool, master_key, user_id).await?;
     let client = build_client(&key.base_url)?;
 
@@ -278,6 +305,20 @@ pub async fn sweep_one_user(
             if updated > max_updated {
                 max_updated = updated;
             }
+            if let Some(bus) = activity {
+                let taken_at = asset
+                    .exif_date_time_original
+                    .or(asset.file_created_at)
+                    .map(|dt| dt.timestamp());
+                let has_gps = asset.latitude.is_some() && asset.longitude.is_some();
+                bus.indexed(
+                    user_id,
+                    &asset.filename,
+                    asset.people_ids.len() as i64,
+                    has_gps,
+                    taken_at,
+                );
+            }
         }
         tx.commit().await?;
     }
@@ -285,6 +326,14 @@ pub async fn sweep_one_user(
     // Always persist state — even an empty sweep records `last_swept_at` for
     // the UI's progress indicator. The watermark only moves forward.
     persist_state(pool, user_id, max_updated, now).await?;
+
+    if let Some(bus) = activity {
+        bus.sweep_done(
+            user_id,
+            assets.len() as i64,
+            started.elapsed().as_millis() as i64,
+        );
+    }
 
     Ok(UserSweepSummary {
         indexed: assets.len(),

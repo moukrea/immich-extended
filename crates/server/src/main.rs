@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use common::db;
 use server::{
+    activity::ActivityBus,
     admin::{create_user, CreateUserError},
     auth::oidc::OidcClient,
     config::Config,
@@ -141,10 +142,18 @@ async fn run_serve(cfg: Config) -> Result<()> {
     // decrypt the stored secret. The `data_dir` plumbs through to the YOLO
     // dispatch (M5-T6) so the model file at `data_dir/models/yolo.onnx`
     // resolves at inference time.
+    // Live-activity ring buffer (POSTSHIP-T33). One process-wide buffer shared
+    // by the indexer (per-asset "Indexed" events), the rule-cycle tick fn
+    // (per-decision "Matched"/"Skipped"/"AlbumAdd"), and the
+    // `/me/activity/stream` endpoint. Constructed before the scheduler + indexer
+    // so both can publish into the same buffer the endpoint reads.
+    let activity = Arc::new(ActivityBus::new());
+
     let scheduler = Arc::new(Scheduler::new(
         pool.clone(),
         cfg.master_key.clone(),
         cfg.data_dir.clone(),
+        activity.clone(),
     ));
 
     // Background whole-library pre-processing indexer (POSTSHIP-T28). One
@@ -152,7 +161,11 @@ async fn run_serve(cfg: Config) -> Result<()> {
     // rule matching (T29) can scan locally. Built per-user from stored keys, so
     // — like the scheduler — it needs only the master key, not a global Immich
     // URL. Held here (not in AppState): no CRUD hook reaches it in this cycle.
-    let indexer = Arc::new(Indexer::new(pool.clone(), cfg.master_key.clone()));
+    let indexer = Arc::new(Indexer::new(
+        pool.clone(),
+        cfg.master_key.clone(),
+        activity.clone(),
+    ));
 
     let state = AppState {
         db: pool.clone(),
@@ -164,6 +177,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
             master_key: cfg.master_key.clone(),
         }),
         scheduler: scheduler.clone(),
+        activity: activity.clone(),
     };
 
     scheduler

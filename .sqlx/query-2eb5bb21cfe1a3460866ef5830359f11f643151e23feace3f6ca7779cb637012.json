@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT asset_id, taken_at, lat, lng, media_type, person_ids FROM asset_index WHERE user_id = ?",
+  "query": "SELECT asset_id, filename, taken_at, lat, lng, media_type, person_ids FROM asset_index WHERE user_id = ?",
   "describe": {
     "columns": [
       {
@@ -9,28 +9,33 @@
         "type_info": "Text"
       },
       {
-        "name": "taken_at",
+        "name": "filename",
         "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "taken_at",
+        "ordinal": 2,
         "type_info": "Integer"
       },
       {
         "name": "lat",
-        "ordinal": 2,
-        "type_info": "Float"
-      },
-      {
-        "name": "lng",
         "ordinal": 3,
         "type_info": "Float"
       },
       {
-        "name": "media_type",
+        "name": "lng",
         "ordinal": 4,
+        "type_info": "Float"
+      },
+      {
+        "name": "media_type",
+        "ordinal": 5,
         "type_info": "Text"
       },
       {
         "name": "person_ids",
-        "ordinal": 5,
+        "ordinal": 6,
         "type_info": "Text"
       }
     ],
@@ -39,6 +44,7 @@
     },
     "nullable": [
       false,
+      false,
       true,
       true,
       true,
@@ -46,5 +52,5 @@
       false
     ]
   },
-  "hash": "473f3c40a4741f144a048e9a5b9b89279ec4bf73f75ef4d2d97c6f6b8c61d498"
+  "hash": "2eb5bb21cfe1a3460866ef5830359f11f643151e23feace3f6ca7779cb637012"
 }

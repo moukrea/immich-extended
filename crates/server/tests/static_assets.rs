@@ -40,6 +40,7 @@ async fn test_state() -> AppState {
         oidc: std::sync::Arc::new(None),
         resolver: std::sync::Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
         scheduler: std::sync::Arc::new(Scheduler::for_tests(pool)),
+        activity: std::sync::Arc::new(server::activity::ActivityBus::new()),
     }
 }
 

@@ -1,36 +1,41 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT owner_user_id, target_album_id, target_album_strategy, managed_album_name, yaml_source, parsed_predicates FROM rules WHERE id = ?",
+  "query": "SELECT name, owner_user_id, target_album_id, target_album_strategy, managed_album_name, yaml_source, parsed_predicates FROM rules WHERE id = ?",
   "describe": {
     "columns": [
       {
-        "name": "owner_user_id",
+        "name": "name",
         "ordinal": 0,
         "type_info": "Text"
       },
       {
-        "name": "target_album_id",
+        "name": "owner_user_id",
         "ordinal": 1,
         "type_info": "Text"
       },
       {
-        "name": "target_album_strategy",
+        "name": "target_album_id",
         "ordinal": 2,
         "type_info": "Text"
       },
       {
-        "name": "managed_album_name",
+        "name": "target_album_strategy",
         "ordinal": 3,
         "type_info": "Text"
       },
       {
-        "name": "yaml_source",
+        "name": "managed_album_name",
         "ordinal": 4,
         "type_info": "Text"
       },
       {
-        "name": "parsed_predicates",
+        "name": "yaml_source",
         "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "parsed_predicates",
+        "ordinal": 6,
         "type_info": "Text"
       }
     ],
@@ -41,10 +46,11 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "9e508158d0ffb7cd3323f7cc71264358c6e1781b0cc1c15f4f545bdcfa7a907a"
+  "hash": "ab86b86f940da7debf5b6c9238b7299ddda72e55c3a304081689046f434b62f8"
 }

@@ -70,6 +70,8 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::activity::ActivityBus;
+
 #[derive(Debug, Error)]
 pub enum CycleError {
     #[error("rule {0} not found")]
@@ -126,6 +128,7 @@ pub struct RunOutcome {
 
 /// Owner-scoped data the cycle needs about the rule under evaluation.
 struct LoadedRule {
+    name: String,
     owner_user_id: String,
     target_album_id: String,
     target_album_strategy: String,
@@ -145,6 +148,7 @@ struct ResolvedKey {
 /// of an `ImmichAsset` for the matching path — no Immich round trip needed.
 struct IndexedAsset {
     asset_id: String,
+    filename: String,
     asset_type: AssetType,
     taken_at: Option<DateTime<Utc>>,
     gps: Option<(f64, f64)>,
@@ -165,11 +169,26 @@ pub async fn run_one_cycle(
     data_dir: &Path,
     rule_id: &str,
 ) -> Result<RunOutcome, CycleError> {
+    run_one_cycle_inner(pool, master_key, data_dir, rule_id, None).await
+}
+
+/// Implementation of [`run_one_cycle`] with an optional live-log buffer. The
+/// public wrapper passes `None` (most tests don't assert on the bus); the
+/// production tick fn ([`production_tick_fn`]) passes `Some(&bus)` so each
+/// verdict surfaces as a "Matched"/"Skipped" event and album fills as an
+/// "AlbumAdd" on `/activity`.
+async fn run_one_cycle_inner(
+    pool: &SqlitePool,
+    master_key: &MasterKey,
+    data_dir: &Path,
+    rule_id: &str,
+    activity: Option<&ActivityBus>,
+) -> Result<RunOutcome, CycleError> {
     let run_id = Uuid::new_v4().to_string();
     let started_at = now_unix_seconds();
     insert_run(pool, &run_id, rule_id, started_at).await?;
 
-    match cycle_body(pool, master_key, data_dir, rule_id, &run_id).await {
+    match cycle_body(pool, master_key, data_dir, rule_id, &run_id, activity).await {
         Ok(outcome) => {
             let finished_at = now_unix_seconds();
             finish_run(
@@ -209,6 +228,7 @@ async fn cycle_body(
     data_dir: &Path,
     rule_id: &str,
     run_id: &str,
+    activity: Option<&ActivityBus>,
 ) -> Result<RunOutcome, CycleError> {
     let rule = load_rule(pool, rule_id).await?;
     let key = load_key(pool, master_key, &rule.owner_user_id).await?;
@@ -270,6 +290,15 @@ async fn cycle_body(
         have_album,
         "album fill diff applied",
     );
+    if let (Some(bus), true) = (activity, filled > 0) {
+        bus.album_add(
+            &rule.owner_user_id,
+            rule_id,
+            &rule.name,
+            &album_id,
+            filled as i64,
+        );
+    }
 
     // Record the rule verdict for every evaluated asset. matched → `added`,
     // otherwise → `skipped`. `album_managed_assets` (written by fill_album) is
@@ -305,6 +334,27 @@ async fn cycle_body(
             added += 1;
         } else {
             skipped += 1;
+        }
+        if let Some(bus) = activity {
+            let filename = Some(asset.filename.as_str());
+            if outcome.matched {
+                bus.matched(
+                    &rule.owner_user_id,
+                    rule_id,
+                    &rule.name,
+                    &asset.asset_id,
+                    filename,
+                );
+            } else {
+                bus.skipped(
+                    &rule.owner_user_id,
+                    rule_id,
+                    &rule.name,
+                    &asset.asset_id,
+                    filename,
+                    reason_slug,
+                );
+            }
         }
     }
     tx.commit().await?;
@@ -418,7 +468,7 @@ async fn load_index_rows(
     owner_user_id: &str,
 ) -> Result<Vec<IndexedAsset>, CycleError> {
     let rows = sqlx::query!(
-        "SELECT asset_id, taken_at, lat, lng, media_type, person_ids \
+        "SELECT asset_id, filename, taken_at, lat, lng, media_type, person_ids \
          FROM asset_index WHERE user_id = ?",
         owner_user_id,
     )
@@ -436,6 +486,7 @@ async fn load_index_rows(
             };
             IndexedAsset {
                 asset_id: r.asset_id,
+                filename: r.filename,
                 asset_type: asset_type_from_media(&r.media_type),
                 taken_at: r.taken_at.map(epoch_to_utc),
                 gps,
@@ -447,7 +498,7 @@ async fn load_index_rows(
 
 async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, CycleError> {
     let row = sqlx::query!(
-        "SELECT owner_user_id, target_album_id, target_album_strategy, \
+        "SELECT name, owner_user_id, target_album_id, target_album_strategy, \
                 managed_album_name, yaml_source, parsed_predicates \
          FROM rules WHERE id = ?",
         rule_id,
@@ -456,6 +507,7 @@ async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, Cycle
     .await?;
     let row = row.ok_or_else(|| CycleError::RuleNotFound(rule_id.to_string()))?;
     Ok(LoadedRule {
+        name: row.name,
         owner_user_id: row.owner_user_id,
         target_album_id: row.target_album_id,
         target_album_strategy: row.target_album_strategy,
@@ -776,13 +828,17 @@ pub fn production_tick_fn(
     pool: SqlitePool,
     master_key: MasterKey,
     data_dir: PathBuf,
+    activity: Arc<ActivityBus>,
 ) -> crate::engine_scheduler::RunCycleFn {
     Arc::new(move |rule_id: String| {
         let pool = pool.clone();
         let master_key = master_key.clone();
         let data_dir = data_dir.clone();
+        let activity = activity.clone();
         Box::pin(async move {
-            match run_one_cycle(&pool, &master_key, &data_dir, &rule_id).await {
+            match run_one_cycle_inner(&pool, &master_key, &data_dir, &rule_id, Some(&activity))
+                .await
+            {
                 Ok(outcome) => {
                     tracing::info!(
                         %rule_id,
@@ -840,6 +896,7 @@ mod tests {
         let taken = Utc.with_ymd_and_hms(2025, 6, 1, 9, 0, 0).unwrap();
         let asset = IndexedAsset {
             asset_id: "a1".into(),
+            filename: "a1.jpg".into(),
             asset_type: AssetType::Video,
             taken_at: Some(taken),
             gps: Some((48.0, 2.0)),
@@ -858,6 +915,7 @@ mod tests {
     fn snapshot_from_index_without_gps_or_faces() {
         let asset = IndexedAsset {
             asset_id: "a2".into(),
+            filename: "a2.jpg".into(),
             asset_type: AssetType::Photo,
             taken_at: None,
             gps: None,

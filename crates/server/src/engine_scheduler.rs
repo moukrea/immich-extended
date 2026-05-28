@@ -43,6 +43,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::activity::ActivityBus;
 use crate::engine_cycle;
 
 #[derive(Debug, Error)]
@@ -111,10 +112,17 @@ impl Scheduler {
     /// stored credentials, so the scheduler itself never sees an Immich URL.
     ///
     /// `data_dir` is threaded through so the lazy YOLO inference path can
-    /// reach `data_dir/models/yolo.onnx`. Tests that don't exercise the real
-    /// cycle should prefer [`Self::for_tests`].
-    pub fn new(pool: SqlitePool, master_key: MasterKey, data_dir: PathBuf) -> Self {
-        let tick_fn = engine_cycle::production_tick_fn(pool.clone(), master_key, data_dir);
+    /// reach `data_dir/models/yolo.onnx`. `activity` is the shared live-log
+    /// buffer the tick fn publishes per-decision events into (T33). Tests that
+    /// don't exercise the real cycle should prefer [`Self::for_tests`].
+    pub fn new(
+        pool: SqlitePool,
+        master_key: MasterKey,
+        data_dir: PathBuf,
+        activity: Arc<ActivityBus>,
+    ) -> Self {
+        let tick_fn =
+            engine_cycle::production_tick_fn(pool.clone(), master_key, data_dir, activity);
         Self::new_with(pool, SchedulerConfig::default(), tick_fn)
     }
 

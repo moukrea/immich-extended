@@ -278,6 +278,7 @@ async fn fresh_state_with_oidc_session(
         oidc: Arc::new(Some(client)),
         resolver: Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
         scheduler: Arc::new(Scheduler::for_tests(pool.clone())),
+        activity: Arc::new(server::activity::ActivityBus::new()),
     };
     (state, pool)
 }
