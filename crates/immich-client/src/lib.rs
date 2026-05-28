@@ -314,6 +314,14 @@ struct AlbumAsset {
     id: String,
 }
 
+/// Response of `GET /api/assets/statistics`. Immich returns `images`, `videos`
+/// and `total`; only the grand `total` is needed for the index-status header's
+/// "indexed N / M" progress figure.
+#[derive(Debug, Deserialize)]
+struct AssetStatistics {
+    total: i64,
+}
+
 #[derive(Debug, Error)]
 pub enum ValidationError {
     #[error("the provided immich api key was rejected (HTTP {0})")]
@@ -681,6 +689,43 @@ impl ImmichClient {
         }
         if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND) {
             return Ok(HashSet::new());
+        }
+        Err(ValidationError::Upstream { status })
+    }
+
+    /// Total number of assets the caller owns, via `GET /api/assets/statistics`.
+    ///
+    /// Used by the index-status header (cycle-6 §8.1) as the "M" in "indexed
+    /// N / M"; the caller treats any error as `null` (best-effort), so a flaky
+    /// upstream degrades the figure rather than failing the request.
+    ///
+    /// Errors:
+    /// * 401 / 403 → [`ValidationError::Unauthorized`].
+    /// * Other 4xx / 5xx → [`ValidationError::Upstream`].
+    /// * Malformed response body → [`ValidationError::BadResponse`].
+    /// * Network failure → [`ValidationError::Transport`].
+    pub async fn get_asset_statistics(&self, api_key: &str) -> Result<i64, ValidationError> {
+        let url = self
+            .base_url
+            .join("api/assets/statistics")
+            .map_err(|e| ValidationError::InvalidBaseUrl(e.to_string()))?;
+        let resp = self
+            .http
+            .get(url)
+            .header("x-api-key", api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            let stats = resp
+                .json::<AssetStatistics>()
+                .await
+                .map_err(|e| ValidationError::BadResponse(e.to_string()))?;
+            return Ok(stats.total);
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ValidationError::Unauthorized(status));
         }
         Err(ValidationError::Upstream { status })
     }

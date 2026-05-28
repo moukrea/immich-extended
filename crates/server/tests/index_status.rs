@@ -1,10 +1,11 @@
-//! Integration tests for `GET /api/v1/me/activity/stream` (POSTSHIP-T33).
+//! Integration tests for `GET /api/v1/me/index/status` (POSTSHIP-T44 §8.1).
 //!
 //! Covers:
-//!   * Happy path — published events are returned to their owner, tagged by
-//!     `kind`, with a `last_seq` cursor.
-//!   * The `?after=<seq>` cursor only returns newer events.
-//!   * Per-account isolation — user A's events never appear for user B.
+//!   * Happy path with no Immich key — `indexed`/`last_swept_at` resolve from
+//!     the local index; `library_total` degrades to `null` (no key ⇒ no Immich
+//!     round trip) and `sweeping` is therefore false.
+//!   * Per-account isolation — user A's `indexed` count never reflects user B's
+//!     rows.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -101,117 +102,84 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// Insert a minimal `asset_index` row for `user_id`.
+async fn seed_index_row(pool: &SqlitePool, user_id: &str, asset_id: &str) {
+    sqlx::query(
+        "INSERT INTO asset_index \
+         (user_id, asset_id, filename, updated_at, media_type, indexed_at) \
+         VALUES (?, ?, ?, 0, 'IMAGE', 0)",
+    )
+    .bind(user_id)
+    .bind(asset_id)
+    .bind(format!("{asset_id}.jpg"))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
-async fn stream_returns_callers_events_with_kind_and_cursor() {
+async fn index_status_returns_counts_and_null_library_total_without_immich() {
     let (state, pool) = fresh_state().await;
     let cookie = login_fresh_user(&state, &pool, "alice@example.com", "pw").await;
     let uid = user_id_for(&pool, "alice@example.com").await;
 
-    // Publish a sweep + a couple of decisions for the caller.
-    let bus = state.activity.clone();
-    bus.indexed(&uid, "asset-1", "IMG_1.jpg", 2, true, Some(1_700_000_000));
-    bus.matched(&uid, "r1", "Family", "asset-1", Some("IMG_1.jpg"));
-    bus.skipped(
-        &uid,
-        "r1",
-        "Family",
-        "asset-2",
-        Some("IMG_2.jpg"),
-        "date_out_of_range",
-    );
+    // Two indexed assets and a completed sweep, but no Immich key on file.
+    seed_index_row(&pool, &uid, "asset-1").await;
+    seed_index_row(&pool, &uid, "asset-2").await;
+    sqlx::query(
+        "INSERT INTO asset_index_state (user_id, last_updated_at, last_swept_at) \
+         VALUES (?, 0, 1700000000)",
+    )
+    .bind(&uid)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let resp = server::router(state.clone(), None)
-        .oneshot(get_with_cookie("/api/v1/me/activity/stream", &cookie))
+        .oneshot(get_with_cookie("/api/v1/me/index/status", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
 
-    let events = body["events"].as_array().unwrap();
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0]["kind"], "indexed");
-    assert_eq!(events[0]["asset_id"], "asset-1");
-    assert_eq!(events[0]["filename"], "IMG_1.jpg");
-    assert_eq!(events[0]["person_count"], 2);
-    assert_eq!(events[0]["has_gps"], true);
-    assert_eq!(events[1]["kind"], "matched");
-    assert_eq!(events[1]["rule_name"], "Family");
-    assert_eq!(events[2]["kind"], "skipped");
-    assert_eq!(events[2]["reason"], "date_out_of_range");
-    // user_id is server-internal; it must not leak to the client.
-    assert!(events[0].get("user_id").is_none());
-
-    let last_seq = body["last_seq"].as_u64().unwrap();
-    assert_eq!(last_seq, 3);
-
-    // The cursor only returns events newer than `after`.
-    let after_two = events[1]["seq"].as_u64().unwrap();
-    let resp2 = server::router(state.clone(), None)
-        .oneshot(get_with_cookie(
-            &format!("/api/v1/me/activity/stream?after={after_two}"),
-            &cookie,
-        ))
-        .await
-        .unwrap();
-    let body2 = body_json(resp2).await;
-    let events2 = body2["events"].as_array().unwrap();
-    assert_eq!(
-        events2.len(),
-        1,
-        "only the skipped event is newer than seq 2"
-    );
-    assert_eq!(events2[0]["kind"], "skipped");
+    assert_eq!(body["indexed"], 2);
+    assert_eq!(body["last_swept_at"], 1_700_000_000_i64);
+    // No Immich key ⇒ best-effort library_total degrades to null, and the
+    // derived `sweeping` is false when the total is unknown.
+    assert!(body["library_total"].is_null());
+    assert_eq!(body["sweeping"], false);
 }
 
 #[tokio::test]
-async fn stream_is_per_account_isolated() {
+async fn index_status_is_per_account_scoped() {
     let (state, pool) = fresh_state().await;
     let cookie_a = login_fresh_user(&state, &pool, "alice@example.com", "pw").await;
     let cookie_b = login_fresh_user(&state, &pool, "bob@example.com", "pw").await;
     let uid_a = user_id_for(&pool, "alice@example.com").await;
     let uid_b = user_id_for(&pool, "bob@example.com").await;
 
-    let bus = state.activity.clone();
-    bus.matched(&uid_a, "ra", "Alice Rule", "a-1", Some("a1.jpg"));
-    bus.matched(&uid_a, "ra", "Alice Rule", "a-2", Some("a2.jpg"));
-    bus.indexed(&uid_b, "b-1", "b1.jpg", 0, false, None);
+    // Alice has three indexed assets, Bob has one.
+    seed_index_row(&pool, &uid_a, "a-1").await;
+    seed_index_row(&pool, &uid_a, "a-2").await;
+    seed_index_row(&pool, &uid_a, "a-3").await;
+    seed_index_row(&pool, &uid_b, "b-1").await;
 
-    // Bob sees only his own event…
-    let resp_b = server::router(state.clone(), None)
-        .oneshot(get_with_cookie("/api/v1/me/activity/stream", &cookie_b))
-        .await
-        .unwrap();
-    let body_b = body_json(resp_b).await;
-    let events_b = body_b["events"].as_array().unwrap();
-    assert_eq!(events_b.len(), 1);
-    assert_eq!(events_b[0]["kind"], "indexed");
-    assert_eq!(events_b[0]["filename"], "b1.jpg");
-
-    // …and Alice sees only hers, never Bob's.
     let resp_a = server::router(state.clone(), None)
-        .oneshot(get_with_cookie("/api/v1/me/activity/stream", &cookie_a))
+        .oneshot(get_with_cookie("/api/v1/me/index/status", &cookie_a))
         .await
         .unwrap();
     let body_a = body_json(resp_a).await;
-    let events_a = body_a["events"].as_array().unwrap();
-    assert_eq!(events_a.len(), 2);
-    assert!(events_a
-        .iter()
-        .all(|e| e["kind"] == "matched" && e["rule_name"] == "Alice Rule"));
-}
+    assert_eq!(body_a["indexed"], 3, "alice counts only her own rows");
 
-#[tokio::test]
-async fn stream_requires_authentication() {
-    let (state, _pool) = fresh_state().await;
-    let resp = server::router(state.clone(), None)
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/me/activity/stream")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let resp_b = server::router(state.clone(), None)
+        .oneshot(get_with_cookie("/api/v1/me/index/status", &cookie_b))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body_b = body_json(resp_b).await;
+    assert_eq!(
+        body_b["indexed"], 1,
+        "bob's count never reflects alice's rows"
+    );
+    // Bob never swept ⇒ no asset_index_state row ⇒ null timestamp.
+    assert!(body_b["last_swept_at"].is_null());
 }

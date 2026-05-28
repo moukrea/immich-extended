@@ -5,4 +5,5 @@
 pub mod activity;
 pub mod immich_key;
 pub mod immich_proxy;
+pub mod index_status;
 pub mod routes;

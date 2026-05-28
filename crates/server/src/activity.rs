@@ -45,8 +45,11 @@ const CAP: usize = 500;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActivityKind {
-    /// The indexer upserted one asset's metadata.
+    /// The indexer upserted one asset's metadata. `asset_id` lets the SPA
+    /// correlate this line with the asset's later `Matched`/`Skipped` events
+    /// when grouping the flat stream per-asset (cycle-6 §8.2).
     Indexed {
+        asset_id: String,
         filename: String,
         person_count: i64,
         has_gps: bool,
@@ -137,10 +140,11 @@ impl ActivityBus {
         });
     }
 
-    /// Indexer upserted `filename` for `user_id`.
+    /// Indexer upserted `filename` (asset `asset_id`) for `user_id`.
     pub fn indexed(
         &self,
         user_id: &str,
+        asset_id: &str,
         filename: &str,
         person_count: i64,
         has_gps: bool,
@@ -149,6 +153,7 @@ impl ActivityBus {
         self.push(
             user_id,
             ActivityKind::Indexed {
+                asset_id: asset_id.to_string(),
                 filename: filename.to_string(),
                 person_count,
                 has_gps,
@@ -257,8 +262,8 @@ mod tests {
     #[test]
     fn since_filters_by_user_and_seq() {
         let bus = ActivityBus::new();
-        bus.indexed("alice", "a.jpg", 1, true, Some(100));
-        bus.indexed("bob", "b.jpg", 0, false, None);
+        bus.indexed("alice", "asset-a", "a.jpg", 1, true, Some(100));
+        bus.indexed("bob", "asset-b", "b.jpg", 0, false, None);
         bus.matched("alice", "r1", "Rule One", "asset-1", Some("a.jpg"));
 
         let (alice, last) = bus.since("alice", 0);
@@ -289,7 +294,7 @@ mod tests {
     fn buffer_evicts_oldest_past_capacity() {
         let bus = ActivityBus::new();
         for _ in 0..(CAP + 50) {
-            bus.indexed("u", "x.jpg", 0, false, None);
+            bus.indexed("u", "asset-x", "x.jpg", 0, false, None);
         }
         let (events, last) = bus.since("u", 0);
         assert_eq!(events.len(), CAP, "retains at most CAP events");
@@ -315,6 +320,23 @@ mod tests {
         assert_eq!(json["reason"], "date_out_of_range");
         assert_eq!(json["filename"], "p.jpg");
         assert_eq!(json["rule_name"], "Rule");
+        assert!(
+            json.get("user_id").is_none(),
+            "user_id must not leak to the wire"
+        );
+    }
+
+    #[test]
+    fn indexed_event_serializes_asset_id_for_client_grouping() {
+        let bus = ActivityBus::new();
+        bus.indexed("u", "asset-7", "p.jpg", 3, true, Some(1_700_000_000));
+        let (events, _) = bus.since("u", 0);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(json["kind"], "indexed");
+        assert_eq!(json["asset_id"], "asset-7");
+        assert_eq!(json["filename"], "p.jpg");
+        assert_eq!(json["person_count"], 3);
+        assert_eq!(json["has_gps"], true);
         assert!(
             json.get("user_id").is_none(),
             "user_id must not leak to the wire"

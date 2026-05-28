@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT last_swept_at FROM asset_index_state WHERE user_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "last_swept_at",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "ce10660209c358c8450a7fc8e80171cb55b52a27ace16032018560b7630e6060"
+}

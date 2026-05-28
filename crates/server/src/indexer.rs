@@ -438,6 +438,7 @@ async fn sweep_one_user_inner(
                 let has_gps = asset.latitude.is_some() && asset.longitude.is_some();
                 bus.indexed(
                     user_id,
+                    &asset.id,
                     &asset.filename,
                     asset.people_ids.len() as i64,
                     has_gps,

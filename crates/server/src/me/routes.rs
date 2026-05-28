@@ -8,7 +8,7 @@ use axum::{
     Router,
 };
 
-use super::{activity, immich_key, immich_proxy};
+use super::{activity, immich_key, immich_proxy, index_status};
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -21,4 +21,5 @@ pub fn router() -> Router<AppState> {
         .route("/assets/:id/thumbnail", get(immich_proxy::asset_thumbnail))
         .route("/albums", get(immich_proxy::list_albums))
         .route("/activity/stream", get(activity::activity_stream))
+        .route("/index/status", get(index_status::index_status))
 }
