@@ -8,9 +8,11 @@ import {
 import { A, useNavigate } from "@solidjs/router";
 import {
   deleteRule,
+  fetchRuleMatchCount,
   fetchRuleRuns,
   listRules,
   updateRule,
+  type RuleMatchCount,
   type RuleRunItem,
   type RuleStatus,
   type RuleSummary,
@@ -23,6 +25,7 @@ const RUNS_LIMIT = 1;
 
 interface RuleSummaryWithRun extends RuleSummary {
   last_run: RuleRunItem | null;
+  match_count: RuleMatchCount | null;
 }
 
 type PendingAction =
@@ -48,13 +51,20 @@ const RulesList: Component = () => {
       setError(humanRuleError(result.error));
       return [];
     }
-    // One extra fetch per rule for its latest run. The fan-out is a handful of
-    // rules per operator, so N+1 is acceptable and keeps the list API narrow.
+    // Two extra fetches per rule — its latest run and its match count. The
+    // fan-out is a handful of rules per operator, so N+1 is acceptable and
+    // keeps the list API narrow. The two run in parallel per rule.
     return Promise.all(
       result.data.rules.map(async (rule): Promise<RuleSummaryWithRun> => {
-        const runs = await fetchRuleRuns(rule.id, { limit: RUNS_LIMIT });
-        if (!runs.ok) return { ...rule, last_run: null };
-        return { ...rule, last_run: runs.data.runs[0] ?? null };
+        const [runs, counts] = await Promise.all([
+          fetchRuleRuns(rule.id, { limit: RUNS_LIMIT }),
+          fetchRuleMatchCount(rule.id),
+        ]);
+        return {
+          ...rule,
+          last_run: runs.ok ? (runs.data.runs[0] ?? null) : null,
+          match_count: counts.ok ? counts.data : null,
+        };
       }),
     );
   });
@@ -219,7 +229,7 @@ const RuleCard: Component<RuleCardProps> = (props) => {
           <p class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-ui-muted">
             <span>{strategyLabel()}</span>
             <span aria-hidden="true">·</span>
-            <MatchCount />
+            <MatchCount count={props.rule.match_count} />
           </p>
           <LastRunSummary run={props.rule.last_run} />
         </div>
@@ -329,12 +339,55 @@ const StatusBadge: Component<{ status: RuleStatus }> = (props) => {
   );
 };
 
-// Placeholder for the per-rule match count. POSTSHIP-T36 fills in the real
-// "N matched · N in album" figures from the index + Immich album.
-const MatchCount: Component = () => (
-  <span data-testid="rule-match-count" title="Match count lands in a coming update">
-    — matched
-  </span>
+// Per-rule "N matched · M in album" figures (POSTSHIP-T36). `matched` comes
+// from the local index; `in_album` from the live Immich album (null when no
+// album is bound or Immich was unreachable). A `matched` ≠ `in_album` gap is
+// flagged amber — it means historical matches haven't all landed in the album.
+const MatchCount: Component<{ count: RuleMatchCount | null }> = (props) => (
+  <Show
+    when={props.count}
+    fallback={
+      <span data-testid="rule-match-count" class="text-ui-muted">
+        — matched
+      </span>
+    }
+  >
+    {(c) => {
+      const matched = () => c().matched;
+      const inAlbum = () => c().in_album;
+      const gap = () => inAlbum() !== null && inAlbum() !== matched();
+      return (
+        <span data-testid="rule-match-count" class="inline-flex items-center gap-1">
+          <span>
+            <span class="font-medium text-immich-fg dark:text-immich-dark-fg">
+              {matched()}
+            </span>{" "}
+            matched
+          </span>
+          <Show when={inAlbum() !== null}>
+            <span aria-hidden="true">·</span>
+            <span
+              classList={{
+                "font-medium text-amber-600 dark:text-amber-400": gap(),
+              }}
+              data-testid={gap() ? "rule-match-gap" : undefined}
+              title={
+                gap()
+                  ? `${matched()} assets match but ${inAlbum()} are in the album — a backfill gap.`
+                  : undefined
+              }
+            >
+              {inAlbum()} in album
+              <Show when={gap()}>
+                {" "}
+                <span aria-hidden="true">⚠</span>
+              </Show>
+            </span>
+          </Show>
+        </span>
+      );
+    }}
+  </Show>
 );
 
 const LastRunSummary: Component<{ run: RuleRunItem | null }> = (props) => {

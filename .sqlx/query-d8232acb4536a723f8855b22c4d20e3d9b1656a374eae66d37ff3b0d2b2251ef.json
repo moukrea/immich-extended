@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT parsed_predicates, target_album_id FROM rules WHERE id = ? AND owner_user_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "parsed_predicates",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_album_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "d8232acb4536a723f8855b22c4d20e3d9b1656a374eae66d37ff3b0d2b2251ef"
+}

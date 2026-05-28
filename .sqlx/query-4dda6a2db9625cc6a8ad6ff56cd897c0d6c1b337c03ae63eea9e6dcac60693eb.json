@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT asset_id, person_count FROM asset_yolo_cache WHERE model_version = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "asset_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "person_count",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4dda6a2db9625cc6a8ad6ff56cd897c0d6c1b337c03ae63eea9e6dcac60693eb"
+}

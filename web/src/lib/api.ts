@@ -282,6 +282,25 @@ export function fetchRuleRuns(
   return request<RuleRunsResponse>(path, { method: "GET" });
 }
 
+export interface RuleMatchCount {
+  /// Assets in the owner's index that currently satisfy the rule's predicate
+  /// tree (exact for cheap-metadata rules; a lower bound for YOLO rules).
+  matched: number;
+  /// Live asset count of the target album, or `null` when no album is bound
+  /// yet or Immich was unreachable. A `matched` ≠ `in_album` gap is a backfill
+  /// warning.
+  in_album: number | null;
+}
+
+export function fetchRuleMatchCount(
+  ruleId: string,
+): Promise<ApiResult<RuleMatchCount>> {
+  return request<RuleMatchCount>(
+    `/api/v1/rules/${encodeURIComponent(ruleId)}/match-count`,
+    { method: "GET" },
+  );
+}
+
 export interface MePerson {
   id: string;
   name: string;

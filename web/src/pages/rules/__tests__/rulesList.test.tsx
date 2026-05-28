@@ -28,6 +28,7 @@ interface TestRule {
 
 let rulesState: TestRule[];
 let lastRun: Record<string, unknown> | null;
+let matchCount: { matched: number; in_album: number | null } | null;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -65,6 +66,10 @@ function installMock() {
         jsonResponse({ runs, total: runs.length, limit: 1, offset: 0 }),
       );
     }
+    if (path.includes("/match-count")) {
+      if (matchCount === null) return Promise.resolve(jsonResponse({}, 502));
+      return Promise.resolve(jsonResponse(matchCount));
+    }
     const m = path.match(/^\/api\/v1\/rules\/([^/?]+)$/);
     if (m && method === "PATCH") {
       const body = JSON.parse(String(init?.body ?? "{}"));
@@ -99,6 +104,7 @@ beforeEach(() => {
   fetchMock.mockReset();
   rulesState = [fakeRule()];
   lastRun = null;
+  matchCount = { matched: 0, in_album: null };
   installMock();
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -145,12 +151,47 @@ describe("Rules page (consolidated home)", () => {
     expect(container.textContent).not.toContain("Signed in as");
   });
 
-  it("shows a match-count placeholder slot per rule", async () => {
+  it("shows the matched + in-album counts per rule", async () => {
+    matchCount = { matched: 5, in_album: 5 };
     const { findByText, container } = render(() => <RulesList />);
     await findByText("Vacation");
     const slot = container.querySelector("[data-testid='rule-match-count']");
     expect(slot).not.toBeNull();
-    expect(slot?.textContent).toContain("matched");
+    expect(slot?.textContent).toContain("5 matched");
+    expect(slot?.textContent).toContain("5 in album");
+    // Matched == in album → no backfill-gap flag.
+    expect(
+      container.querySelector("[data-testid='rule-match-gap']"),
+    ).toBeNull();
+  });
+
+  it("flags a backfill gap when matched != in album", async () => {
+    matchCount = { matched: 7, in_album: 3 };
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Vacation");
+    const slot = container.querySelector("[data-testid='rule-match-count']");
+    expect(slot?.textContent).toContain("7 matched");
+    expect(slot?.textContent).toContain("3 in album");
+    const gap = container.querySelector("[data-testid='rule-match-gap']");
+    expect(gap).not.toBeNull();
+    expect(gap?.className).toContain("amber");
+  });
+
+  it("shows only the matched count when no album is bound", async () => {
+    matchCount = { matched: 4, in_album: null };
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Vacation");
+    const slot = container.querySelector("[data-testid='rule-match-count']");
+    expect(slot?.textContent).toContain("4 matched");
+    expect(slot?.textContent).not.toContain("in album");
+  });
+
+  it("falls back to an em-dash when the count fetch fails", async () => {
+    matchCount = null; // mock returns 502
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Vacation");
+    const slot = container.querySelector("[data-testid='rule-match-count']");
+    expect(slot?.textContent).toContain("— matched");
   });
 
   it("renders an empty state when no rules exist", async () => {

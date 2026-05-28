@@ -13,12 +13,14 @@ import {
   createRule,
   deleteRule,
   fetchAlbums,
+  fetchRuleMatchCount,
   getRule,
   MAX_POLL_INTERVAL_SECONDS,
   MIN_POLL_INTERVAL_SECONDS,
   updateRule,
   type MeAlbum,
   type Rule,
+  type RuleMatchCount,
   type RuleStatus,
 } from "../../lib/api";
 import { emptyMatch, type MatchExpr } from "../../lib/matchTree";
@@ -133,6 +135,17 @@ const RuleBuilderV2: Component = () => {
         setLoaded(true);
       });
       return result.data;
+    },
+  );
+
+  // Per-rule match count for the edit page (POSTSHIP-T36). Edit mode only; a
+  // failed fetch leaves it null and the chip simply doesn't render.
+  const [matchCount] = createResource<RuleMatchCount | null, string | undefined>(
+    () => (mode() === "edit" ? params.id : undefined),
+    async (id) => {
+      if (!id) return null;
+      const result = await fetchRuleMatchCount(id);
+      return result.ok ? result.data : null;
     },
   );
 
@@ -410,6 +423,33 @@ const RuleBuilderV2: Component = () => {
               >
                 {meta().status}
               </span>
+            </Show>
+            <Show when={matchCount()}>
+              {(c) => {
+                const gap = () =>
+                  c().in_album !== null && c().in_album !== c().matched;
+                return (
+                  <span
+                    data-testid="builder-match-count"
+                    class="text-xs text-ui-muted dark:text-gray-400"
+                    classList={{
+                      "font-medium text-amber-600 dark:text-amber-400": gap(),
+                    }}
+                    title={
+                      gap()
+                        ? `${c().matched} assets match but ${c().in_album} are in the album — a backfill gap.`
+                        : undefined
+                    }
+                  >
+                    {c().matched} matched
+                    <Show when={c().in_album !== null}>
+                      {" · "}
+                      {c().in_album} in album
+                    </Show>
+                    <Show when={gap()}> ⚠</Show>
+                  </span>
+                );
+              }}
             </Show>
           </div>
           <div class="flex items-center gap-2">

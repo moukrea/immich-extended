@@ -35,7 +35,7 @@ use common::decisions::{
     list_runs_for_rule, DecisionsError,
 };
 use engine::rule::{
-    parse_rule, validate_rule, ParseError, RuleStatus, TargetAlbum, ValidationError,
+    parse_rule, validate_rule, MatchExpr, ParseError, RuleStatus, TargetAlbum, ValidationError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -776,6 +776,92 @@ pub(super) async fn list_rule_runs(
 fn runs_error_response(err: DecisionsError) -> ErrorResponse {
     tracing::warn!(error = %err, "runs query failed");
     internal_error()
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuleMatchCount {
+    /// Assets in the owner's `asset_index` that currently satisfy the rule's
+    /// predicate tree. Exact for cheap-metadata rules; a "matched so far" lower
+    /// bound for YOLO rules (see [`crate::engine_cycle::matched_count`] — counts
+    /// are never inferred on demand for this figure).
+    pub matched: i64,
+    /// Live asset count of the rule's target album, or `null` when the rule has
+    /// no album bound yet (managed album not minted) or Immich was unreachable.
+    /// A `matched` ≠ `in_album` gap surfaces in the UI as a backfill warning.
+    pub in_album: Option<i64>,
+}
+
+/// `GET /api/v1/rules/:id/match-count` — the per-rule "N matched · M in album"
+/// figures (POSTSHIP-T36). Owner-scoped (404 on a foreign/missing id, matching
+/// the `get_rule` convention so other users' rule existence stays hidden).
+///
+/// `matched` always resolves from the local index — no Immich round trip, so it
+/// renders even when the upstream is down. `in_album` needs a bound album AND a
+/// reachable Immich; any failure there degrades to `null` rather than failing
+/// the whole request, so the Rules list still shows its match counts.
+pub(super) async fn rule_match_count(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Path(id): Path<String>,
+) -> Result<Json<RuleMatchCount>, ErrorResponse> {
+    let row = sqlx::query!(
+        "SELECT parsed_predicates, target_album_id \
+         FROM rules WHERE id = ? AND owner_user_id = ?",
+        id,
+        uid,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::warn!(error = %err, "failed to read rule for match-count");
+        internal_error()
+    })?;
+    let row = row.ok_or_else(not_found)?;
+
+    let match_expr: MatchExpr = serde_json::from_str(&row.parsed_predicates).map_err(|err| {
+        tracing::error!(error = %err, "rule.parsed_predicates is not valid MatchExpr JSON");
+        internal_error()
+    })?;
+
+    let matched = crate::engine_cycle::matched_count(&state.db, &uid, &match_expr)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "failed to compute matched count");
+            internal_error()
+        })?;
+
+    let in_album = if row.target_album_id.is_empty() {
+        None
+    } else {
+        album_asset_count(&state, &uid, &row.target_album_id).await
+    };
+
+    Ok(Json(RuleMatchCount { matched, in_album }))
+}
+
+/// Best-effort live album size for the match-count endpoint. Decrypts the
+/// caller's Immich key and asks Immich for the album's members. Returns `None`
+/// (logged, not an error) on any missing-key / decrypt / transport failure so a
+/// flaky upstream never turns the match-count request into a 500.
+async fn album_asset_count(state: &AppState, uid: &str, album_id: &str) -> Option<i64> {
+    let row = sqlx::query!(
+        "SELECT base_url, ciphertext, nonce FROM immich_api_keys WHERE user_id = ?",
+        uid,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()??;
+    let plaintext = state.master_key.decrypt(&row.nonce, &row.ciphertext).ok()?;
+    let api_key = String::from_utf8(plaintext).ok()?;
+    let base = url::Url::parse(&row.base_url).ok()?;
+    let client = immich_client::ImmichClient::new(base);
+    match client.get_album_asset_ids(&api_key, album_id).await {
+        Ok(ids) => Some(ids.len() as i64),
+        Err(err) => {
+            tracing::warn!(error = %err, album_id, "failed to fetch album asset ids for match-count");
+            None
+        }
+    }
 }
 
 fn parse_error_response(err: ParseError) -> ErrorResponse {

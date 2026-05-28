@@ -22,4 +22,5 @@ pub fn router() -> Router<AppState> {
         .route("/:id", delete(handlers::delete_rule))
         .route("/:id/decisions", get(handlers::list_rule_decisions))
         .route("/:id/runs", get(handlers::list_rule_runs))
+        .route("/:id/match-count", get(handlers::rule_match_count))
 }

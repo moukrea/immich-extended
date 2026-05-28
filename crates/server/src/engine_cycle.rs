@@ -50,7 +50,7 @@
 //! on a miss, downloads the asset bytes and runs inference once, caching the
 //! count forever.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -494,6 +494,58 @@ async fn load_index_rows(
             }
         })
         .collect())
+}
+
+/// Count how many of the owner's indexed assets currently match `match_expr`
+/// (POSTSHIP-T36 — the per-rule "N matched" figure on the Rules + edit pages).
+///
+/// Mirrors the matching half of [`cycle_body`] — same full `asset_index` scan,
+/// same [`evaluate_expr`] — but is read-only and, crucially, NEVER triggers
+/// YOLO inference (locked decision D1: no library-wide YOLO sweep just to
+/// produce a count). For a YOLO-dependent rule it consults `asset_yolo_cache`
+/// for counts already computed by prior poll cycles (one batched query, no
+/// inference); an asset whose YOLO count isn't cached yet evaluates with
+/// `yolo_person_count = None` and so doesn't count. The figure is therefore
+/// exact for cheap-metadata rules and a "matched so far" lower bound for YOLO
+/// rules until the next cycle caches the remaining counts.
+pub async fn matched_count(
+    pool: &SqlitePool,
+    owner_user_id: &str,
+    match_expr: &MatchExpr,
+) -> Result<i64, CycleError> {
+    let assets = load_index_rows(pool, owner_user_id).await?;
+
+    // Cache-only YOLO resolution: pull every count already computed for the
+    // current model in one query (D1 — never infer here). Skipped entirely for
+    // cheap-metadata rules, which is the common case.
+    let yolo_counts: HashMap<String, u32> = if match_expr.requires_yolo() {
+        let rows = sqlx::query!(
+            "SELECT asset_id, person_count FROM asset_yolo_cache WHERE model_version = ?",
+            yolo::MODEL_VERSION,
+        )
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.asset_id,
+                    u32::try_from(r.person_count).unwrap_or(u32::MAX),
+                )
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let mut count: i64 = 0;
+    for asset in &assets {
+        let mut snapshot = snapshot_from_index(asset);
+        snapshot.yolo_person_count = yolo_counts.get(&asset.asset_id).copied();
+        if evaluate_expr(match_expr, &snapshot).matched {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, CycleError> {
