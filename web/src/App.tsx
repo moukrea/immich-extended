@@ -1,4 +1,4 @@
-import { Router, Route, useNavigate } from "@solidjs/router";
+import { Router, Route, Navigate, useNavigate } from "@solidjs/router";
 import {
   createContext,
   createSignal,
@@ -13,7 +13,7 @@ import { decideBootstrapNavigation } from "./lib/route";
 import AppShell from "./components/AppShell";
 import Login from "./pages/Login";
 import Setup from "./pages/Setup";
-import Dashboard from "./pages/Dashboard";
+import Activity from "./pages/Activity";
 import MeSettings from "./pages/MeSettings";
 import RulesList from "./pages/rules/RulesList";
 import RuleBuilderV2 from "./pages/rules/RuleBuilderV2";
@@ -85,9 +85,9 @@ const NotFound: Component = () => (
   </main>
 );
 
-const ShelledDashboard: Component = () => (
+const ShelledActivity: Component = () => (
   <AppShell>
-    <Dashboard />
+    <Activity />
   </AppShell>
 );
 const ShelledMeSettings: Component = () => (
@@ -120,9 +120,10 @@ const App: Component = () => (
   <Router root={(props) => <Bootstrap>{props.children}</Bootstrap>}>
     <Route path="/login" component={LoginRoute} />
     <Route path="/setup" component={Setup} />
-    <Route path="/" component={ShelledDashboard} />
+    <Route path="/" component={ShelledRulesList} />
+    <Route path="/activity" component={ShelledActivity} />
     <Route path="/me" component={ShelledMeSettings} />
-    <Route path="/rules" component={ShelledRulesList} />
+    <Route path="/rules" component={() => <Navigate href="/" />} />
     <Route path="/rules/new" component={ShelledRuleBuilder} />
     <Route path="/rules/:id" component={ShelledRuleBuilder} />
     <Route path="/rules/:id/decisions" component={ShelledRuleDecisions} />

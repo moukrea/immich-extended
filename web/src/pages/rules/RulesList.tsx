@@ -8,14 +8,22 @@ import {
 import { A, useNavigate } from "@solidjs/router";
 import {
   deleteRule,
+  fetchRuleRuns,
   listRules,
   updateRule,
+  type RuleRunItem,
   type RuleStatus,
   type RuleSummary,
 } from "../../lib/api";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import { Button } from "../../components/ui";
 import { humanRuleError } from "./errors";
+
+const RUNS_LIMIT = 1;
+
+interface RuleSummaryWithRun extends RuleSummary {
+  last_run: RuleRunItem | null;
+}
 
 type PendingAction =
   | { kind: "archive"; rule: RuleSummary }
@@ -27,21 +35,29 @@ const RulesList: Component = () => {
   const [busyId, setBusyId] = createSignal<string | null>(null);
   const [pending, setPending] = createSignal<PendingAction | null>(null);
 
-  const [rulesResource, { refetch }] = createResource<RuleSummary[] | null>(
-    async () => {
-      setError(null);
-      const result = await listRules();
-      if (!result.ok) {
-        if (result.status === 401) {
-          navigate("/login", { replace: true });
-          return null;
-        }
-        setError(humanRuleError(result.error));
-        return [];
+  const [rulesResource, { refetch }] = createResource<
+    RuleSummaryWithRun[] | null
+  >(async () => {
+    setError(null);
+    const result = await listRules();
+    if (!result.ok) {
+      if (result.status === 401) {
+        navigate("/login", { replace: true });
+        return null;
       }
-      return result.data.rules;
-    },
-  );
+      setError(humanRuleError(result.error));
+      return [];
+    }
+    // One extra fetch per rule for its latest run. The fan-out is a handful of
+    // rules per operator, so N+1 is acceptable and keeps the list API narrow.
+    return Promise.all(
+      result.data.rules.map(async (rule): Promise<RuleSummaryWithRun> => {
+        const runs = await fetchRuleRuns(rule.id, { limit: RUNS_LIMIT });
+        if (!runs.ok) return { ...rule, last_run: null };
+        return { ...rule, last_run: runs.data.runs[0] ?? null };
+      }),
+    );
+  });
 
   const setStatus = async (rule: RuleSummary, status: RuleStatus) => {
     setBusyId(rule.id);
@@ -130,74 +146,19 @@ const RulesList: Component = () => {
           when={(rulesResource() ?? []).length > 0}
           fallback={<EmptyState />}
         >
-          <div class="rounded-2xl border border-ui-border bg-white shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray">
-            <ul class="divide-y divide-ui-border dark:divide-gray-700">
-              <For each={rulesResource() ?? []}>
-                {(rule) => {
-                  const isBusy = () => busyId() === rule.id;
-                  const dimmed = () => rule.status === "archived";
-                  const pauseLabel = () =>
-                    rule.status === "paused" ? "Resume" : "Pause";
-                  return (
-                    <li
-                      class="flex items-center justify-between gap-4 px-5 py-4"
-                      classList={{ "opacity-60": dimmed() }}
-                    >
-                      <div class="min-w-0 flex-1">
-                        <p class="truncate text-sm font-medium text-immich-fg dark:text-immich-dark-fg">
-                          {rule.name}
-                        </p>
-                        <p class="mt-0.5 text-xs text-ui-muted">
-                          {rule.target_album_strategy === "managed"
-                            ? "Managed album"
-                            : "Existing album"}{" "}
-                          · updated {formatTimestamp(rule.updated_at)}
-                        </p>
-                      </div>
-                      <StatusBadge status={rule.status} />
-                      <div class="flex items-center gap-2">
-                        <A
-                          href={`/rules/${rule.id}`}
-                          class="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-200 px-3 py-1.5 text-xs font-medium text-immich-fg transition ease-immich duration-150 hover:bg-slate-300 dark:bg-gray-700 dark:text-immich-dark-fg dark:hover:bg-gray-600"
-                        >
-                          Edit
-                        </A>
-                        <Show when={rule.status !== "archived"}>
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy()}
-                            onClick={() => onTogglePause(rule)}
-                          >
-                            {pauseLabel()}
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            size="sm"
-                            disabled={isBusy()}
-                            onClick={() => onArchiveClick(rule)}
-                          >
-                            Archive
-                          </Button>
-                        </Show>
-                        <Button
-                          type="button"
-                          variant="destructive"
-                          size="sm"
-                          disabled={isBusy()}
-                          onClick={() => onDeleteClick(rule)}
-                        >
-                          {isBusy() ? "Working…" : "Delete"}
-                        </Button>
-                      </div>
-                    </li>
-                  );
-                }}
-              </For>
-            </ul>
-          </div>
+          <ul class="space-y-3">
+            <For each={rulesResource() ?? []}>
+              {(rule) => (
+                <RuleCard
+                  rule={rule}
+                  busy={busyId() === rule.id}
+                  onTogglePause={() => onTogglePause(rule)}
+                  onArchive={() => onArchiveClick(rule)}
+                  onDelete={() => onDeleteClick(rule)}
+                />
+              )}
+            </For>
+          </ul>
         </Show>
       </Show>
 
@@ -222,13 +183,102 @@ const RulesList: Component = () => {
   );
 };
 
+interface RuleCardProps {
+  rule: RuleSummaryWithRun;
+  busy: boolean;
+  onTogglePause: () => void;
+  onArchive: () => void;
+  onDelete: () => void;
+}
+
+const RuleCard: Component<RuleCardProps> = (props) => {
+  const dimmed = () => props.rule.status === "archived";
+  const pauseLabel = () => (props.rule.status === "paused" ? "Resume" : "Pause");
+  const strategyLabel = () =>
+    props.rule.target_album_strategy === "managed"
+      ? "Managed album"
+      : "Existing album";
+
+  return (
+    <li
+      class="rounded-2xl border border-ui-border bg-white p-5 shadow-sm transition ease-immich duration-150 hover:ring-1 hover:ring-immich-primary/30 dark:border-immich-dark-gray dark:bg-immich-dark-gray dark:hover:ring-immich-dark-primary/30"
+      classList={{ "opacity-60": dimmed() }}
+    >
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-2">
+            <StatusDot status={props.rule.status} />
+            <A
+              href={`/rules/${props.rule.id}`}
+              class="truncate text-sm font-semibold text-immich-fg hover:underline dark:text-immich-dark-fg"
+            >
+              {props.rule.name}
+            </A>
+            <StatusBadge status={props.rule.status} />
+          </div>
+          <p class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-ui-muted">
+            <span>{strategyLabel()}</span>
+            <span aria-hidden="true">·</span>
+            <MatchCount />
+          </p>
+          <LastRunSummary run={props.rule.last_run} />
+        </div>
+        <A
+          href={`/rules/${props.rule.id}/activity`}
+          class="shrink-0 text-xs font-medium text-immich-primary hover:underline dark:text-immich-dark-primary"
+        >
+          Activity →
+        </A>
+      </div>
+
+      <div class="mt-4 flex flex-wrap items-center gap-2">
+        <A
+          href={`/rules/${props.rule.id}`}
+          class="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-200 px-3 py-1.5 text-xs font-medium text-immich-fg transition ease-immich duration-150 hover:bg-slate-300 dark:bg-gray-700 dark:text-immich-dark-fg dark:hover:bg-gray-600"
+        >
+          Edit
+        </A>
+        <Show when={props.rule.status !== "archived"}>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            disabled={props.busy}
+            onClick={() => props.onTogglePause()}
+          >
+            {pauseLabel()}
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            disabled={props.busy}
+            onClick={() => props.onArchive()}
+          >
+            Archive
+          </Button>
+        </Show>
+        <Button
+          type="button"
+          variant="destructive"
+          size="sm"
+          disabled={props.busy}
+          onClick={() => props.onDelete()}
+        >
+          {props.busy ? "Working…" : "Delete"}
+        </Button>
+      </div>
+    </li>
+  );
+};
+
 const EmptyState: Component = () => (
   <div class="rounded-2xl border border-dashed border-ui-border bg-white px-6 py-12 text-center dark:border-gray-700 dark:bg-immich-dark-gray">
     <h2 class="text-base font-medium text-immich-fg dark:text-immich-dark-fg">
       No rules yet
     </h2>
     <p class="mt-1 text-sm text-ui-muted">
-      Author your first rule by pasting YAML.
+      Author your first rule to start filing assets into albums.
     </p>
     <A
       href="/rules/new"
@@ -238,6 +288,26 @@ const EmptyState: Component = () => (
     </A>
   </div>
 );
+
+const StatusDot: Component<{ status: RuleStatus }> = (props) => {
+  const color = () => {
+    switch (props.status) {
+      case "active":
+        return "bg-emerald-500";
+      case "paused":
+        return "bg-amber-500";
+      case "archived":
+      default:
+        return "bg-slate-400 dark:bg-gray-500";
+    }
+  };
+  return (
+    <span
+      class={`inline-block h-2 w-2 shrink-0 rounded-full ${color()}`}
+      aria-hidden="true"
+    />
+  );
+};
 
 const StatusBadge: Component<{ status: RuleStatus }> = (props) => {
   const styles = () => {
@@ -259,16 +329,85 @@ const StatusBadge: Component<{ status: RuleStatus }> = (props) => {
   );
 };
 
-function formatTimestamp(seconds: number): string {
+// Placeholder for the per-rule match count. POSTSHIP-T36 fills in the real
+// "N matched · N in album" figures from the index + Immich album.
+const MatchCount: Component = () => (
+  <span data-testid="rule-match-count" title="Match count lands in a coming update">
+    — matched
+  </span>
+);
+
+const LastRunSummary: Component<{ run: RuleRunItem | null }> = (props) => {
+  return (
+    <Show
+      when={props.run !== null}
+      fallback={
+        <p class="mt-1 text-xs text-ui-muted">
+          No runs yet — waiting for first cycle.
+        </p>
+      }
+    >
+      {(_) => {
+        const run = () => props.run as RuleRunItem;
+        const finished = () => run().finished_at !== null;
+        return (
+          <p class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-ui-muted">
+            <span>
+              Last run{" "}
+              <span class="text-immich-fg dark:text-immich-dark-fg">
+                {formatRelative(run().started_at)}
+              </span>
+            </span>
+            <Show
+              when={finished()}
+              fallback={
+                <span class="inline-flex items-center gap-1 text-immich-primary dark:text-immich-dark-primary">
+                  <span
+                    class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current"
+                    aria-hidden="true"
+                  />
+                  running…
+                </span>
+              }
+            >
+              <Show
+                when={run().error_message}
+                fallback={
+                  <span>
+                    <span class="text-emerald-700 dark:text-emerald-300">
+                      +{run().assets_added}
+                    </span>
+                    <span class="ml-1">added</span>
+                    <span class="ml-2">{run().assets_skipped} skipped</span>
+                  </span>
+                }
+              >
+                {(msg) => (
+                  <span
+                    class="truncate text-ui-danger"
+                    title={msg()}
+                    data-testid="rule-last-run-error"
+                  >
+                    error: {msg()}
+                  </span>
+                )}
+              </Show>
+            </Show>
+          </p>
+        );
+      }}
+    </Show>
+  );
+};
+
+function formatRelative(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return "—";
-  const date = new Date(seconds * 1000);
-  return date.toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const now = Date.now() / 1000;
+  const delta = Math.max(0, now - seconds);
+  if (delta < 60) return `${Math.round(delta)}s ago`;
+  if (delta < 3600) return `${Math.round(delta / 60)}m ago`;
+  if (delta < 86_400) return `${Math.round(delta / 3600)}h ago`;
+  return new Date(seconds * 1000).toLocaleDateString();
 }
 
 export default RulesList;

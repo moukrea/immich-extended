@@ -61,13 +61,14 @@ const ICONS: Record<string, JSX.Element> = {
 
 const DEFAULT_ITEMS: SidebarItem[] = [
   {
-    href: "/rules",
+    href: "/",
     label: "Rules",
     icon: ICONS.rules,
     matchPrefix: true,
+    matchPrefixes: ["/rules"],
   },
   {
-    href: "/",
+    href: "/activity",
     label: "Activity",
     icon: ICONS.activity,
     matchPrefix: false,

@@ -184,4 +184,30 @@ describe("SidebarNav", () => {
       getByTestId("sidebar-item-settings").getAttribute("aria-current"),
     ).toBeNull();
   });
+
+  it("keeps Rules (href '/') active on its /rules sub-pages via matchPrefixes", () => {
+    // useLocation is mocked to pathname "/rules".
+    const items = [
+      {
+        href: "/",
+        label: "Rules",
+        icon: <span>R</span>,
+        matchPrefix: true,
+        matchPrefixes: ["/rules"],
+      },
+      {
+        href: "/activity",
+        label: "Activity",
+        icon: <span>A</span>,
+        matchPrefix: false,
+      },
+    ];
+    const { getByTestId } = render(() => <SidebarNav items={items} />);
+    expect(getByTestId("sidebar-item-rules").getAttribute("aria-current")).toBe(
+      "page",
+    );
+    expect(
+      getByTestId("sidebar-item-activity").getAttribute("aria-current"),
+    ).toBeNull();
+  });
 });

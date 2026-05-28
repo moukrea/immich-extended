@@ -6,6 +6,10 @@ export interface SidebarItem {
   label: string;
   icon: JSX.Element;
   matchPrefix?: boolean;
+  // Extra path prefixes that also mark this item active. Lets "Rules" (href
+  // "/") stay highlighted on its `/rules/:id` sub-pages without matching "/"
+  // against every route.
+  matchPrefixes?: string[];
 }
 
 export interface SidebarNavProps {
@@ -33,10 +37,22 @@ const active = [
   "text-immich-primary dark:text-immich-dark-primary",
 ].join(" ");
 
-function isActive(currentPath: string, href: string, matchPrefix?: boolean) {
+function underPrefix(currentPath: string, prefix: string) {
+  return currentPath === prefix || currentPath.startsWith(prefix + "/");
+}
+
+function isActive(
+  currentPath: string,
+  href: string,
+  matchPrefix?: boolean,
+  matchPrefixes?: string[],
+) {
+  if (matchPrefixes?.some((p) => underPrefix(currentPath, p))) {
+    return true;
+  }
   if (matchPrefix) {
     if (href === "/") return currentPath === "/";
-    return currentPath === href || currentPath.startsWith(href + "/");
+    return underPrefix(currentPath, href);
   }
   return currentPath === href;
 }
@@ -48,7 +64,12 @@ const SidebarNav: Component<SidebarNavProps> = (props) => {
       <For each={props.items}>
         {(item) => {
           const itemActive = () =>
-            isActive(location.pathname, item.href, item.matchPrefix);
+            isActive(
+              location.pathname,
+              item.href,
+              item.matchPrefix,
+              item.matchPrefixes,
+            );
           return (
             <A
               href={item.href}

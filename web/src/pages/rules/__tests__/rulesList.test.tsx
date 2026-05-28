@@ -18,15 +18,16 @@ import RulesList from "../RulesList";
 
 const fetchMock = vi.fn();
 
-beforeEach(() => {
-  fetchMock.mockReset();
-  vi.stubGlobal("fetch", fetchMock);
-});
+interface TestRule {
+  id: string;
+  name: string;
+  status: "active" | "paused" | "archived";
+  target_album_strategy: "existing" | "managed";
+  updated_at: number;
+}
 
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
+let rulesState: TestRule[];
+let lastRun: Record<string, unknown> | null;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -39,161 +40,229 @@ function emptyResponse(status = 204): Response {
   return new Response(null, { status });
 }
 
-function fakeRule(overrides: Partial<{
-  id: string;
-  name: string;
-  status: "active" | "paused" | "archived";
-}> = {}) {
+function fakeRule(overrides: Partial<TestRule> = {}): TestRule {
   return {
     id: overrides.id ?? "rule-1",
     name: overrides.name ?? "Vacation",
     status: overrides.status ?? "active",
-    target_album_strategy: "managed" as const,
-    updated_at: 1747000000,
+    target_album_strategy: overrides.target_album_strategy ?? "managed",
+    updated_at: overrides.updated_at ?? 1747000000,
   };
 }
 
-describe("RulesList lifecycle controls", () => {
-  it("Pause click PATCHes the rule with status=paused and refetches", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({ rules: [fakeRule({ status: "active" })] }),
-    );
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        id: "rule-1",
-        name: "Vacation",
-        status: "paused",
-        target_album_strategy: "managed",
-        updated_at: 1747000001,
-      }),
-    );
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({ rules: [fakeRule({ status: "paused" })] }),
-    );
+// Stateful URL-routing mock: tolerant of call order/count (the page fetches a
+// per-rule run after listing) and reflects PATCH/DELETE so the UI updates.
+function installMock() {
+  fetchMock.mockImplementation((url: string | URL, init?: RequestInit) => {
+    const path = String(url);
+    const method = init?.method ?? "GET";
+    if (path === "/api/v1/rules" && method === "GET") {
+      return Promise.resolve(jsonResponse({ rules: rulesState }));
+    }
+    if (path.includes("/runs")) {
+      const runs = lastRun ? [lastRun] : [];
+      return Promise.resolve(
+        jsonResponse({ runs, total: runs.length, limit: 1, offset: 0 }),
+      );
+    }
+    const m = path.match(/^\/api\/v1\/rules\/([^/?]+)$/);
+    if (m && method === "PATCH") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      rulesState = rulesState.map((r) =>
+        r.id === m[1] ? { ...r, ...body } : r,
+      );
+      return Promise.resolve(
+        jsonResponse(rulesState.find((r) => r.id === m[1]) ?? {}),
+      );
+    }
+    if (m && method === "DELETE") {
+      rulesState = rulesState.filter((r) => r.id !== m[1]);
+      return Promise.resolve(emptyResponse(204));
+    }
+    return Promise.resolve(jsonResponse({}, 404));
+  });
+}
 
+function patchCalls() {
+  return fetchMock.mock.calls.filter(
+    (c) => (c[1] as RequestInit | undefined)?.method === "PATCH",
+  );
+}
+
+function deleteCalls() {
+  return fetchMock.mock.calls.filter(
+    (c) => (c[1] as RequestInit | undefined)?.method === "DELETE",
+  );
+}
+
+beforeEach(() => {
+  fetchMock.mockReset();
+  rulesState = [fakeRule()];
+  lastRun = null;
+  installMock();
+  vi.stubGlobal("fetch", fetchMock);
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("Rules page (consolidated home)", () => {
+  it("lists rules with their last-run summary", async () => {
+    rulesState = [fakeRule({ id: "rule-1", name: "Paloma (partage)" })];
+    lastRun = {
+      id: "run-1",
+      started_at: Math.floor(Date.now() / 1000) - 30,
+      finished_at: Math.floor(Date.now() / 1000) - 28,
+      assets_evaluated: 12,
+      assets_added: 3,
+      assets_skipped: 9,
+      error_message: null,
+    };
+
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Paloma (partage)");
+    expect(container.textContent).toContain("+3");
+    expect(container.textContent).toContain("9 skipped");
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls).toContain("/api/v1/rules");
+    expect(urls).toContain("/api/v1/rules/rule-1/runs?limit=1");
+  });
+
+  it("keeps the New rule affordance", async () => {
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Vacation");
+    const link = Array.from(container.querySelectorAll("a")).find(
+      (a) => a.getAttribute("href") === "/rules/new",
+    );
+    expect(link).toBeDefined();
+  });
+
+  it("does not render the redundant 'Signed in as' identity line", async () => {
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Vacation");
+    expect(container.textContent).not.toContain("Signed in as");
+  });
+
+  it("shows a match-count placeholder slot per rule", async () => {
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Vacation");
+    const slot = container.querySelector("[data-testid='rule-match-count']");
+    expect(slot).not.toBeNull();
+    expect(slot?.textContent).toContain("matched");
+  });
+
+  it("renders an empty state when no rules exist", async () => {
+    rulesState = [];
+    const { findByText } = render(() => <RulesList />);
+    await findByText(/No rules yet/);
+  });
+
+  it("flags rules whose last run carries an error_message", async () => {
+    rulesState = [fakeRule({ id: "rule-err", name: "Broken rule" })];
+    lastRun = {
+      id: "run-err",
+      started_at: Math.floor(Date.now() / 1000) - 60,
+      finished_at: Math.floor(Date.now() / 1000) - 58,
+      assets_evaluated: 0,
+      assets_added: 0,
+      assets_skipped: 0,
+      error_message: "managed_album_name_missing",
+    };
+    const { findByText, container } = render(() => <RulesList />);
+    await findByText("Broken rule");
+    const errSpan = container.querySelector(
+      "[data-testid='rule-last-run-error']",
+    );
+    expect(errSpan?.textContent).toContain("managed_album_name_missing");
+  });
+
+  it("shows 'No runs yet' for rules without a last run", async () => {
+    const { findByText } = render(() => <RulesList />);
+    await findByText(/No runs yet/);
+  });
+});
+
+describe("Rules page lifecycle controls", () => {
+  it("Pause PATCHes status=paused and the row flips to Resume", async () => {
     const { findByRole } = render(() => <RulesList />);
     const pauseButton = await findByRole("button", { name: "Pause" });
-
     pauseButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     await findByRole("button", { name: "Resume" });
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    const [, patchCall, refetchCall] = fetchMock.mock.calls;
-    expect(String(patchCall![0])).toBe("/api/v1/rules/rule-1");
-    const patchInit = patchCall![1] as RequestInit;
-    expect(patchInit.method).toBe("PATCH");
-    expect(JSON.parse(String(patchInit.body))).toEqual({ status: "paused" });
-    expect(String(refetchCall![0])).toBe("/api/v1/rules");
+    const patch = patchCalls();
+    expect(patch).toHaveLength(1);
+    expect(String(patch[0]![0])).toBe("/api/v1/rules/rule-1");
+    expect(JSON.parse(String((patch[0]![1] as RequestInit).body))).toEqual({
+      status: "paused",
+    });
   });
 
-  it("Archive opens a confirm dialog and only PATCHes after the user confirms", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({ rules: [fakeRule({ status: "active" })] }),
-    );
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        id: "rule-1",
-        name: "Vacation",
-        status: "archived",
-        target_album_strategy: "managed",
-        updated_at: 1747000002,
-      }),
-    );
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({ rules: [fakeRule({ status: "archived" })] }),
-    );
-
+  it("Archive only PATCHes after the confirm dialog is accepted", async () => {
     const { findByRole, queryByRole, findAllByRole } = render(() => (
       <RulesList />
     ));
     const archiveTrigger = await findByRole("button", { name: "Archive" });
-
     archiveTrigger.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     const dialog = await findByRole("dialog");
     expect(dialog.textContent).toContain("Archive");
     expect(dialog.textContent).toContain("Vacation");
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(patchCalls()).toHaveLength(0);
 
-    const dialogButtons = await findAllByRole("button");
-    const confirmInDialog = dialogButtons.find(
-      (b) =>
-        b.textContent?.trim() === "Archive" &&
-        dialog.contains(b),
+    const confirm = (await findAllByRole("button")).find(
+      (b) => b.textContent?.trim() === "Archive" && dialog.contains(b),
     );
-    expect(confirmInDialog).toBeDefined();
-    confirmInDialog!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(confirm).toBeDefined();
+    confirm!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
-    await vi.waitFor(() => {
-      expect(queryByRole("dialog")).toBeNull();
+    await vi.waitFor(() => expect(queryByRole("dialog")).toBeNull());
+    await vi.waitFor(() => expect(patchCalls()).toHaveLength(1));
+    const patch = patchCalls()[0]!;
+    expect(String(patch[0])).toBe("/api/v1/rules/rule-1");
+    expect(JSON.parse(String((patch[1] as RequestInit).body))).toEqual({
+      status: "archived",
     });
-    await vi.waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledTimes(3);
-    });
-    const [, patchCall] = fetchMock.mock.calls;
-    expect(String(patchCall![0])).toBe("/api/v1/rules/rule-1");
-    const patchInit = patchCall![1] as RequestInit;
-    expect(patchInit.method).toBe("PATCH");
-    expect(JSON.parse(String(patchInit.body))).toEqual({ status: "archived" });
   });
 
-  it("Delete confirm-then-DELETE sends a DELETE and refetches the list", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({ rules: [fakeRule({ status: "active" })] }),
-    );
-    fetchMock.mockResolvedValueOnce(emptyResponse(204));
-    fetchMock.mockResolvedValueOnce(jsonResponse({ rules: [] }));
-
+  it("Delete confirm-then-DELETE removes the rule from the list", async () => {
     const { findByRole, findByText, findAllByRole } = render(() => (
       <RulesList />
     ));
     const deleteTrigger = await findByRole("button", { name: "Delete" });
-
     deleteTrigger.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     const dialog = await findByRole("dialog");
-    const dialogButtons = await findAllByRole("button");
-    const confirmInDialog = dialogButtons.find(
-      (b) =>
-        b.textContent?.trim() === "Delete" &&
-        dialog.contains(b),
+    const confirm = (await findAllByRole("button")).find(
+      (b) => b.textContent?.trim() === "Delete" && dialog.contains(b),
     );
-    expect(confirmInDialog).toBeDefined();
-    confirmInDialog!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(confirm).toBeDefined();
+    confirm!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     await findByText(/No rules yet/);
-
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    const [, deleteCall, refetchCall] = fetchMock.mock.calls;
-    expect(String(deleteCall![0])).toBe("/api/v1/rules/rule-1");
-    expect((deleteCall![1] as RequestInit).method).toBe("DELETE");
-    expect(String(refetchCall![0])).toBe("/api/v1/rules");
+    const del = deleteCalls();
+    expect(del).toHaveLength(1);
+    expect(String(del[0]![0])).toBe("/api/v1/rules/rule-1");
   });
 
-  it("Cancel button on the confirm dialog closes without calling the API", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({ rules: [fakeRule({ status: "active" })] }),
-    );
-
+  it("Cancel closes the dialog without calling the API", async () => {
     const { findByRole, queryByRole, findAllByRole } = render(() => (
       <RulesList />
     ));
     const deleteTrigger = await findByRole("button", { name: "Delete" });
-
     deleteTrigger.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     const dialog = await findByRole("dialog");
-    const dialogButtons = await findAllByRole("button");
-    const cancelInDialog = dialogButtons.find(
+    const cancel = (await findAllByRole("button")).find(
       (b) => b.textContent?.trim() === "Cancel" && dialog.contains(b),
     );
-    expect(cancelInDialog).toBeDefined();
-    cancelInDialog!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(cancel).toBeDefined();
+    cancel!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
-    await vi.waitFor(() => {
-      expect(queryByRole("dialog")).toBeNull();
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(queryByRole("dialog")).toBeNull());
+    expect(patchCalls()).toHaveLength(0);
+    expect(deleteCalls()).toHaveLength(0);
   });
 });
