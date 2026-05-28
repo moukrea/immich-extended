@@ -8,6 +8,7 @@ pub mod config;
 pub mod engine_cycle;
 pub mod engine_scheduler;
 pub mod indexer;
+pub mod matcher;
 pub mod me;
 pub mod rules;
 pub mod setup;
@@ -23,7 +24,7 @@ use axum::{extract::State, middleware, routing::get, Json, Router};
 use common::crypto::MasterKey;
 use config::SessionConfig;
 use engine::rule::RuleResourceResolver;
-use engine_scheduler::Scheduler;
+use matcher::Matcher;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
@@ -50,12 +51,12 @@ pub struct AppState {
     /// validator. Production wires this to an Immich-backed implementation
     /// (M2-T5); tests inject `engine::rule::testing::FakeResourceResolver`.
     pub resolver: Arc<dyn RuleResourceResolver>,
-    /// Owns the per-rule poll tasks. CRUD handlers call
-    /// `scheduler.on_rule_changed(id)` after each write so create / pause /
-    /// resume / delete take effect immediately rather than waiting for the
-    /// next boot. Hand-rolled `Debug` because `Scheduler` holds an opaque
-    /// `RunCycleFn` closure (no `Debug` impl).
-    pub scheduler: Arc<Scheduler>,
+    /// Event-driven matcher (T41). CRUD handlers call
+    /// `matcher.on_rule_activated(id)` after a create/edit leaves the rule
+    /// active, spawning an immediate full-index scan so the album backfills
+    /// without waiting for a poll tick. Replaces the retired per-rule
+    /// `Scheduler` seam.
+    pub matcher: Arc<Matcher>,
     /// Bounded in-memory live-activity ring buffer (T33). The indexer and the
     /// rule-cycle tick function publish into it; the `/me/activity/stream`
     /// endpoint reads the caller's tail. `Arc` so the single buffer is shared
@@ -71,7 +72,7 @@ impl std::fmt::Debug for AppState {
             .field("master_key", &self.master_key)
             .field("oidc", &self.oidc)
             .field("resolver", &"Arc<dyn RuleResourceResolver>")
-            .field("scheduler", &"Arc<Scheduler>")
+            .field("matcher", &"Arc<Matcher>")
             .field("activity", &self.activity)
             .finish()
     }

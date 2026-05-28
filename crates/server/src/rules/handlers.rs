@@ -204,11 +204,13 @@ pub(super) async fn create_rule(
         internal_error()
     })?;
 
-    // Scheduler reconciliation runs after the DB write succeeds. Log + swallow
-    // scheduler errors so the API contract stays "the rule is created" — a
-    // hiccup on the in-process scheduler must not turn a 201 into a 500.
-    if let Err(err) = state.scheduler.on_rule_changed(&id).await {
-        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after create failed");
+    // Event-driven backfill (T41): a freshly-created ACTIVE rule gets an
+    // immediate full-index scan so its album fills without waiting for a poll
+    // tick. The scan is spawned (it can hit lazy YOLO over the whole library),
+    // so the 201 returns now and the album fills moments later. A created
+    // paused/archived rule has nothing to match yet.
+    if status_db == "active" {
+        state.matcher.on_rule_activated(&id);
     }
 
     Ok((
@@ -416,8 +418,12 @@ pub(super) async fn update_rule(
             internal_error()
         })?;
 
-        if let Err(err) = state.scheduler.on_rule_changed(&id).await {
-            tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after patch failed");
+        // Edit-while-active or a flip to active (T41): re-scan the whole index
+        // for this rule now so predicate changes / backfill take effect
+        // immediately. Spawned, same as create. An edit that lands on
+        // paused/archived has nothing to re-file.
+        if status_db == "active" {
+            state.matcher.on_rule_activated(&id);
         }
 
         return Ok(Json(RuleSummary {
@@ -472,8 +478,10 @@ pub(super) async fn update_rule(
         internal_error()
     })?;
 
-    if let Err(err) = state.scheduler.on_rule_changed(&id).await {
-        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after metadata patch failed");
+    // A status-only patch that (re)activates the rule triggers an immediate
+    // full-index scan (T41); pause/archive has nothing to re-file.
+    if row.status == "active" {
+        state.matcher.on_rule_activated(&id);
     }
 
     Ok(Json(RuleSummary {
@@ -508,10 +516,8 @@ pub(super) async fn delete_rule(
         internal_error()
     })?;
 
-    if let Err(err) = state.scheduler.on_rule_changed(&id).await {
-        tracing::error!(rule_id = %id, error = %err, "scheduler reconcile after delete failed");
-    }
-
+    // No matcher trigger on delete: there is nothing to re-file, and the row's
+    // `asset_decisions` + `album_managed_assets` cascade away via the rule FK.
     Ok(StatusCode::NO_CONTENT)
 }
 

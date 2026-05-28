@@ -17,9 +17,9 @@ use server::{
     admin::{create_user, CreateUserError},
     auth::oidc::OidcClient,
     config::Config,
-    engine_cycle::match_assets,
     engine_scheduler::Scheduler,
     indexer::{Indexer, OnSweepFn},
+    matcher::Matcher,
     rules::resolver::ImmichResourceResolver,
     AppState,
 };
@@ -150,7 +150,23 @@ async fn run_serve(cfg: Config) -> Result<()> {
     // so both can publish into the same buffer the endpoint reads.
     let activity = Arc::new(ActivityBus::new());
 
+    // Per-rule poll Scheduler is still constructed + started below for
+    // branch-safety; its per-rule timers are formally retired in T42. CRUD
+    // handlers no longer reconcile it — the rule lifecycle now drives matching
+    // through `Matcher::on_rule_activated` instead.
     let scheduler = Arc::new(Scheduler::new(
+        pool.clone(),
+        cfg.master_key.clone(),
+        cfg.data_dir.clone(),
+        activity.clone(),
+    ));
+
+    // Event-driven matcher service (POSTSHIP-T41, design §5.2). One thin
+    // wiring point — capturing pool + master_key + data_dir + activity — for the
+    // three matching triggers: the rule lifecycle (`on_rule_activated`, held in
+    // AppState), the indexer sweep hook (`match_assets`, below), and the hourly
+    // safety sweep (`safety_sweep`, wired in T42).
+    let matcher = Arc::new(Matcher::new(
         pool.clone(),
         cfg.master_key.clone(),
         cfg.data_dir.clone(),
@@ -159,34 +175,19 @@ async fn run_serve(cfg: Config) -> Result<()> {
 
     // Event-driven matching seam (POSTSHIP-T40, design §4.2). After each user
     // sweep the indexer hands that sweep's touched asset_ids to pass (b)
-    // (`engine_cycle::match_assets`): evaluate exactly those assets against all
-    // of that user's active rules and reconcile albums. Built here — capturing
-    // pool + master_key + data_dir + activity — so the indexer itself stays
-    // storage-only (no engine/YOLO/data_dir dependency). A single rule's failure
-    // is logged and skipped inside `match_assets`; the `MatchError` surfaced here
-    // is only the outer load (active-rule set / candidate rows), logged so a
-    // transient DB hiccup never aborts the sweep loop.
+    // (`Matcher::match_assets`): evaluate exactly those assets against all of
+    // that user's active rules and reconcile albums. The indexer itself stays
+    // storage-only (no engine/YOLO/data_dir dependency) — the matcher carries
+    // those. A single rule's failure is logged and skipped inside `match_assets`;
+    // the `MatchError` surfaced here is only the outer load (active-rule set /
+    // candidate rows), logged so a transient DB hiccup never aborts the sweep
+    // loop.
     let on_sweep: OnSweepFn = {
-        let pool = pool.clone();
-        let master_key = cfg.master_key.clone();
-        let data_dir = cfg.data_dir.clone();
-        let activity = activity.clone();
+        let matcher = matcher.clone();
         Arc::new(move |user_id: String, touched_ids: Vec<String>| {
-            let pool = pool.clone();
-            let master_key = master_key.clone();
-            let data_dir = data_dir.clone();
-            let activity = activity.clone();
+            let matcher = matcher.clone();
             Box::pin(async move {
-                if let Err(err) = match_assets(
-                    &pool,
-                    &master_key,
-                    &data_dir,
-                    &user_id,
-                    &touched_ids,
-                    Some(&activity),
-                )
-                .await
-                {
+                if let Err(err) = matcher.match_assets(&user_id, &touched_ids).await {
                     tracing::error!(
                         user_id = %user_id,
                         error = %err,
@@ -217,7 +218,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
             db: pool.clone(),
             master_key: cfg.master_key.clone(),
         }),
-        scheduler: scheduler.clone(),
+        matcher: matcher.clone(),
         activity: activity.clone(),
     };
 

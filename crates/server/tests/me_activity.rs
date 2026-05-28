@@ -15,7 +15,7 @@ use axum::{
 use common::crypto::MasterKey;
 use common::db;
 use http_body_util::BodyExt;
-use server::{admin::create_user, config::SessionConfig, engine_scheduler::Scheduler, AppState};
+use server::{admin::create_user, config::SessionConfig, matcher::Matcher, AppState};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -35,7 +35,7 @@ async fn fresh_state() -> (AppState, SqlitePool) {
         master_key: MasterKey::from_bytes(TEST_KEY_BYTES),
         oidc: Arc::new(None),
         resolver: Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
-        scheduler: Arc::new(Scheduler::for_tests(pool.clone())),
+        matcher: Arc::new(Matcher::for_tests(pool.clone())),
         activity: Arc::new(server::activity::ActivityBus::new()),
     };
     (state, pool)

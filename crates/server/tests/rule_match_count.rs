@@ -22,7 +22,7 @@ use common::crypto::MasterKey;
 use common::db;
 use engine::rule::testing::FakeResourceResolver;
 use http_body_util::BodyExt;
-use server::{admin::create_user, config::SessionConfig, engine_scheduler::Scheduler, AppState};
+use server::{admin::create_user, config::SessionConfig, matcher::Matcher, AppState};
 use sqlx::SqlitePool;
 use tower::ServiceExt;
 use wiremock::matchers::{header as match_header, method, path};
@@ -55,7 +55,7 @@ async fn fresh_state() -> (AppState, SqlitePool, String) {
         master_key: master_key(),
         oidc: Arc::new(None),
         resolver: Arc::new(FakeResourceResolver::empty()),
-        scheduler: Arc::new(Scheduler::for_tests(pool.clone())),
+        matcher: Arc::new(Matcher::for_tests(pool.clone())),
         activity: Arc::new(server::activity::ActivityBus::new()),
     };
     (state, pool, owner)

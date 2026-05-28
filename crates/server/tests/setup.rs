@@ -20,7 +20,7 @@ use common::auth::password::verify_password;
 use common::crypto::MasterKey;
 use common::db;
 use http_body_util::BodyExt;
-use server::{config::SessionConfig, engine_scheduler::Scheduler, AppState};
+use server::{config::SessionConfig, matcher::Matcher, AppState};
 use sqlx::SqlitePool;
 use tower::ServiceExt;
 use wiremock::matchers::{header as wm_header, method, path as wm_path};
@@ -41,7 +41,7 @@ async fn fresh_state() -> (AppState, SqlitePool) {
         master_key: MasterKey::from_bytes(TEST_KEY_BYTES),
         oidc: std::sync::Arc::new(None),
         resolver: std::sync::Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
-        scheduler: std::sync::Arc::new(Scheduler::for_tests(pool.clone())),
+        matcher: std::sync::Arc::new(Matcher::for_tests(pool.clone())),
         activity: std::sync::Arc::new(server::activity::ActivityBus::new()),
     };
     (state, pool)

@@ -18,7 +18,7 @@ use common::db;
 use common::decisions::{finish_run, insert_run};
 use engine::rule::testing::FakeResourceResolver;
 use http_body_util::BodyExt;
-use server::{admin::create_user, config::SessionConfig, engine_scheduler::Scheduler, AppState};
+use server::{admin::create_user, config::SessionConfig, matcher::Matcher, AppState};
 use sqlx::SqlitePool;
 use tower::ServiceExt;
 
@@ -28,6 +28,10 @@ const OWNER_A_PW: &str = "alice-pw";
 const OWNER_B_EMAIL: &str = "bob@example.com";
 const OWNER_B_PW: &str = "bob-pw";
 
+// Paused on purpose: these tests seed `rule_runs` rows by hand and assert the
+// read endpoint's pagination/scoping. An ACTIVE create would trigger the T41
+// lifecycle backfill scan, which writes its own `rule_runs` row and would skew
+// the counts. Status is irrelevant to the /runs endpoint, so we keep it paused.
 const YAML_RULE_A: &str = r#"
 name: "Alice's rule"
 target_album:
@@ -36,7 +40,7 @@ target_album:
 match:
   media:
     types: [photo]
-status: active
+status: paused
 "#;
 
 async fn fresh_state_two_users() -> (AppState, SqlitePool, String, String) {
@@ -62,7 +66,7 @@ async fn fresh_state_two_users() -> (AppState, SqlitePool, String, String) {
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: Arc::new(None),
         resolver: Arc::new(resolver),
-        scheduler: Arc::new(Scheduler::for_tests(pool.clone())),
+        matcher: Arc::new(Matcher::for_tests(pool.clone())),
         activity: Arc::new(server::activity::ActivityBus::new()),
     };
     (state, pool, owner_a, owner_b)
@@ -384,7 +388,7 @@ target_album:
 match:
   media:
     types: [video]
-status: active
+status: paused
 "#,
     )
     .await;

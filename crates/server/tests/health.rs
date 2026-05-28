@@ -9,7 +9,7 @@ use axum::{
 use common::crypto::MasterKey;
 use common::db;
 use http_body_util::BodyExt;
-use server::{config::SessionConfig, engine_scheduler::Scheduler, AppState};
+use server::{config::SessionConfig, matcher::Matcher, AppState};
 use tower::ServiceExt;
 
 async fn test_state() -> AppState {
@@ -24,7 +24,7 @@ async fn test_state() -> AppState {
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: std::sync::Arc::new(None),
         resolver: std::sync::Arc::new(engine::rule::testing::FakeResourceResolver::empty()),
-        scheduler: std::sync::Arc::new(Scheduler::for_tests(pool)),
+        matcher: std::sync::Arc::new(Matcher::for_tests(pool)),
         activity: std::sync::Arc::new(server::activity::ActivityBus::new()),
     }
 }

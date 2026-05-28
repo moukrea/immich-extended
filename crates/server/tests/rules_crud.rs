@@ -31,7 +31,7 @@ use common::crypto::MasterKey;
 use common::db;
 use engine::rule::testing::FakeResourceResolver;
 use http_body_util::BodyExt;
-use server::{admin::create_user, config::SessionConfig, engine_scheduler::Scheduler, AppState};
+use server::{admin::create_user, config::SessionConfig, matcher::Matcher, AppState};
 use sqlx::SqlitePool;
 use tower::ServiceExt;
 
@@ -70,7 +70,7 @@ async fn fresh_state_two_users() -> (AppState, SqlitePool, String, String) {
         master_key: MasterKey::from_bytes([0u8; 32]),
         oidc: Arc::new(None),
         resolver: Arc::new(resolver),
-        scheduler: Arc::new(Scheduler::for_tests(pool.clone())),
+        matcher: Arc::new(Matcher::for_tests(pool.clone())),
         activity: Arc::new(server::activity::ActivityBus::new()),
     };
     (state, pool, owner_a, owner_b)
