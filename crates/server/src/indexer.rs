@@ -35,8 +35,10 @@
 //! is no shared client. A user's sweep only ever writes `asset_index` rows
 //! under their own `user_id`.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -72,6 +74,14 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 /// short page regardless of this ceiling. Matches the client's own
 /// [`immich_client::MAX_SEARCH_PAGES`] safety net (50k assets).
 const DEFAULT_MAX_PAGES_PER_SWEEP: u32 = immich_client::MAX_SEARCH_PAGES;
+
+/// Run the deletion reconcile (design §7.1) every Nth sweep, NOT every sweep.
+/// `updatedAfter` sweeps never report deletions, so the only way to notice an
+/// asset deleted in Immich is a full-id membership comparison — which costs a
+/// full library listing and is heavier than a caught-up steady sweep. At the
+/// 120 s sweep cadence, 30 ≈ hourly, which matches the hourly safety re-scan
+/// cadence (L4) without adding per-sweep Immich chatter.
+const DEFAULT_RECONCILE_EVERY_N_SWEEPS: u32 = 30;
 
 /// Post-sweep matcher hook (design §4.2). After a user sweep upserts its rows,
 /// the indexer hands that sweep's touched `asset_id`s to this callback, which
@@ -109,6 +119,10 @@ pub enum IndexerError {
 pub struct IndexerConfig {
     pub sweep_interval: Duration,
     pub max_pages_per_sweep: u32,
+    /// Run the deletion reconcile (design §7.1) every Nth sweep. `0` is clamped
+    /// to `1` (reconcile every sweep) by the gate so it can never divide by
+    /// zero or silently disable pruning.
+    pub reconcile_every_n_sweeps: u32,
 }
 
 impl Default for IndexerConfig {
@@ -116,6 +130,7 @@ impl Default for IndexerConfig {
         Self {
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             max_pages_per_sweep: DEFAULT_MAX_PAGES_PER_SWEEP,
+            reconcile_every_n_sweeps: DEFAULT_RECONCILE_EVERY_N_SWEEPS,
         }
     }
 }
@@ -148,6 +163,11 @@ pub struct Indexer {
     /// Optional post-sweep matcher hook (design §4.2). `None` in tests; set by
     /// [`Self::with_on_sweep`] in production to drive event-driven matching.
     on_sweep: Option<OnSweepFn>,
+    /// Sweeps elapsed since the last deletion reconcile (design §7.1). The
+    /// single background task drives `sweep_all_users` serially, so this is only
+    /// ever touched from one thread; the atomic exists solely for `&self`
+    /// interior mutability.
+    sweeps_since_reconcile: AtomicU32,
     cancel: CancellationToken,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -184,6 +204,7 @@ impl Indexer {
             activity,
             config,
             on_sweep: None,
+            sweeps_since_reconcile: AtomicU32::new(0),
             cancel: CancellationToken::new(),
             join: Mutex::new(None),
         }
@@ -243,6 +264,12 @@ impl Indexer {
             .fetch_all(&self.pool)
             .await?;
 
+        // Deletion reconcile gate (design §7.1): only every Nth sweep also runs
+        // the full-id membership comparison that prunes assets deleted in
+        // Immich. Computed once per sweep so every user reconciles on the same
+        // (low-cadence) sweeps.
+        let do_reconcile = self.should_reconcile_this_sweep();
+
         let mut users_swept = 0usize;
         let mut total_indexed = 0usize;
         for row in rows {
@@ -277,12 +304,65 @@ impl Indexer {
                     );
                 }
             }
+
+            // Deletion reconcile (design §7.1/§7.2). A per-user failure (Immich
+            // unreachable — which returns Err, never an empty live set, so a
+            // transport blip can't wipe the index) is logged and skipped, same
+            // resilience contract as the sweep above.
+            if do_reconcile {
+                match reconcile_one_user(
+                    &self.pool,
+                    &self.master_key,
+                    &row.user_id,
+                    self.config.max_pages_per_sweep,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(pruned) => tracing::info!(
+                        user_id = %row.user_id,
+                        pruned,
+                        "indexer reconcile: pruned assets deleted in Immich",
+                    ),
+                    Err(err) => tracing::warn!(
+                        user_id = %row.user_id,
+                        error = %err,
+                        "indexer reconcile failed; will retry next cycle",
+                    ),
+                }
+            }
         }
         tracing::info!(users_swept, total_indexed, "indexer sweep complete");
         Ok(SweepSummary {
             users_swept,
             total_indexed,
         })
+    }
+
+    /// Whether this sweep should also run the deletion reconcile (design §7.1):
+    /// fires once every `reconcile_every_n_sweeps` sweeps, resetting the counter
+    /// each time it fires. `sweep_all_users` runs serially on one task, so the
+    /// non-atomic load-then-store across the relaxed atomic is race-free.
+    fn should_reconcile_this_sweep(&self) -> bool {
+        let prev = self.sweeps_since_reconcile.load(Ordering::Relaxed);
+        let (fired, next) = reconcile_gate(prev, self.config.reconcile_every_n_sweeps);
+        self.sweeps_since_reconcile.store(next, Ordering::Relaxed);
+        fired
+    }
+}
+
+/// Pure gate for [`Indexer::should_reconcile_this_sweep`]: given the sweeps
+/// elapsed since the last reconcile and the configured cadence, return
+/// `(fired, next_counter)`. Fires (and resets the counter to 0) on the `every`th
+/// sweep. `every` is clamped to at least 1 so a `0` config reconciles every
+/// sweep rather than never / dividing by zero.
+fn reconcile_gate(prev: u32, every: u32) -> (bool, u32) {
+    let every = every.max(1);
+    let n = prev.saturating_add(1);
+    if n >= every {
+        (true, 0)
+    } else {
+        (false, n)
     }
 }
 
@@ -385,6 +465,96 @@ async fn sweep_one_user_inner(
         watermark: max_updated,
         touched_ids,
     })
+}
+
+/// Prune assets deleted in Immich from one user's local index (design §7.1).
+///
+/// `updatedAfter` sweeps never report deletions, so a deleted Immich asset would
+/// linger in `asset_index` (plus its stale `asset_decisions`/`album_managed_assets`
+/// rows) forever, skewing the status header / match counts / live log. Detection
+/// is a full membership comparison: list everything Immich still holds (NO
+/// `updatedAfter`), diff against the indexed ids, and hand-cascade the stale set
+/// (§7.2). Returns the number of assets pruned.
+///
+/// A transport/auth failure surfaces as `Err` from `list_assets` (never an empty
+/// `Ok` set), so an unreachable Immich can never be mistaken for "all assets
+/// deleted" and wipe the index.
+///
+/// Public for direct integration testing (like [`sweep_one_user`]); production
+/// invokes it from [`Indexer::sweep_all_users`] every Nth sweep.
+pub async fn reconcile_one_user(
+    pool: &SqlitePool,
+    master_key: &MasterKey,
+    user_id: &str,
+    max_pages: u32,
+) -> Result<usize, IndexerError> {
+    let key = load_key(pool, master_key, user_id).await?;
+    let client = build_client(&key.base_url)?;
+
+    let live = client
+        .list_assets(&key.api_key, None, max_pages)
+        .await
+        .map_err(immich_error)?;
+    let live_ids: HashSet<String> = live.into_iter().map(|a| a.id).collect();
+
+    let indexed_ids: Vec<String> = sqlx::query_scalar!(
+        "SELECT asset_id FROM asset_index WHERE user_id = ?",
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let stale: Vec<String> = indexed_ids
+        .into_iter()
+        .filter(|id| !live_ids.contains(id))
+        .collect();
+
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    prune_stale_assets(pool, user_id, &stale).await?;
+    Ok(stale.len())
+}
+
+/// Hand-cascade the stale `asset_id`s out of the user's local state in one
+/// transaction (design §7.2). No FK path runs from `asset_index` to
+/// `asset_decisions`/`album_managed_assets` (those FK `rules(id)`, not
+/// `asset_index`), so the deletes are explicit and scoped to the user via their
+/// rules. The Immich album is deliberately NOT touched — the photo is already
+/// gone there, so a remove would be redundant and could error.
+async fn prune_stale_assets(
+    pool: &SqlitePool,
+    user_id: &str,
+    stale: &[String],
+) -> Result<(), IndexerError> {
+    let mut tx = pool.begin().await?;
+    for asset_id in stale {
+        sqlx::query!(
+            "DELETE FROM asset_index WHERE user_id = ? AND asset_id = ?",
+            user_id,
+            asset_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "DELETE FROM asset_decisions WHERE asset_id = ? \
+             AND rule_id IN (SELECT id FROM rules WHERE owner_user_id = ?)",
+            asset_id,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "DELETE FROM album_managed_assets WHERE asset_id = ? \
+             AND rule_id IN (SELECT id FROM rules WHERE owner_user_id = ?)",
+            asset_id,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Owner-scoped Immich credentials, decrypted. Mirrors the small slice of
@@ -549,11 +719,38 @@ mod tests {
         // client's safety ceiling), never truncating mid-window — see the
         // DEFAULT_MAX_PAGES_PER_SWEEP doc for why an 8-page cap stranded the tail.
         assert_eq!(c.max_pages_per_sweep, immich_client::MAX_SEARCH_PAGES);
+        // Deletion reconcile defaults to every 30th sweep ≈ hourly at 120 s.
+        assert_eq!(c.reconcile_every_n_sweeps, 30);
     }
 
     #[test]
     fn epoch_to_utc_round_trips_seconds() {
         let dt = epoch_to_utc(1_700_000_000);
         assert_eq!(dt.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn reconcile_gate_fires_every_nth_sweep_and_resets() {
+        let mut counter = 0u32;
+        let mut fired_on = Vec::new();
+        for sweep in 1..=90 {
+            let (fired, next) = reconcile_gate(counter, 30);
+            counter = next;
+            if fired {
+                fired_on.push(sweep);
+            }
+        }
+        // Fires on the 30th, 60th, 90th sweep; the counter resets to 0 each
+        // time so the cadence stays exactly every 30.
+        assert_eq!(fired_on, vec![30, 60, 90]);
+    }
+
+    #[test]
+    fn reconcile_gate_clamps_zero_cadence_to_every_sweep() {
+        // A 0 cadence is nonsensical; clamp to 1 so it reconciles every sweep
+        // rather than never firing or dividing by zero.
+        let (fired, next) = reconcile_gate(0, 0);
+        assert!(fired);
+        assert_eq!(next, 0);
     }
 }

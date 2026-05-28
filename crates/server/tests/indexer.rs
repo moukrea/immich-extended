@@ -19,7 +19,7 @@ use chrono::DateTime;
 use common::crypto::MasterKey;
 use common::db;
 use server::admin::create_user;
-use server::indexer::{sweep_one_user, IndexerConfig};
+use server::indexer::{reconcile_one_user, sweep_one_user, IndexerConfig};
 use sqlx::SqlitePool;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -427,4 +427,173 @@ async fn sweep_is_per_account_isolated() {
         0,
         "A's sweep must never write B's rows"
     );
+}
+
+/// Insert an active managed-strategy rule owned by `owner`.
+async fn seed_rule(pool: &SqlitePool, owner: &str, id: &str) {
+    sqlx::query(
+        "INSERT INTO rules \
+            (id, owner_user_id, name, yaml_source, parsed_predicates, \
+             target_album_id, target_album_strategy, status, \
+             poll_interval_seconds, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, '', 'managed', 'active', 300, 0, 0)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(id)
+    .bind("name: stub")
+    .bind(r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_decision(pool: &SqlitePool, rule_id: &str, asset_id: &str) {
+    sqlx::query(
+        "INSERT INTO asset_decisions (rule_id, asset_id, decision, reason, run_id, decided_at) \
+         VALUES (?, ?, 'added', 'matched', NULL, 0)",
+    )
+    .bind(rule_id)
+    .bind(asset_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_managed(pool: &SqlitePool, rule_id: &str, asset_id: &str) {
+    sqlx::query(
+        "INSERT INTO album_managed_assets (rule_id, asset_id, state, changed_at) \
+         VALUES (?, ?, 'added', 0)",
+    )
+    .bind(rule_id)
+    .bind(asset_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn row_exists(pool: &SqlitePool, table: &str, asset_id: &str) -> bool {
+    // `table` is a test-controlled literal, never user input.
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE asset_id = ?");
+    let count: i64 = sqlx::query_scalar(&sql)
+        .bind(asset_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    count > 0
+}
+
+#[tokio::test]
+async fn reconcile_prunes_assets_deleted_in_immich() {
+    // Design §7.3: a,b,c are indexed; Immich later returns only {a,c} (b was
+    // deleted). The reconcile must prune b from asset_index AND hand-cascade its
+    // asset_decisions + album_managed_assets, leave a/c untouched, and issue NO
+    // album-remove call (the photo is already gone in Immich).
+    let server = MockServer::start().await;
+    let pool = fresh_pool().await;
+    let user = seed_user(&pool, "owner@example.com").await;
+    seed_key(&pool, &user, &server.uri(), OWNER_KEY).await;
+
+    // Index all three via a normal sweep.
+    let three = |ids: &[&str]| {
+        search_page(
+            ids.iter()
+                .map(|id| {
+                    asset_json(
+                        id,
+                        &format!("{id}.jpg"),
+                        "IMAGE",
+                        "2024-01-01T00:00:00.000Z",
+                        "2026-01-10T00:00:00.000Z",
+                        None,
+                        &[],
+                    )
+                })
+                .collect(),
+        )
+    };
+    mount_search(&server, three(&["a", "b", "c"])).await;
+    sweep_one_user(&pool, &deterministic_key(), &user, 8)
+        .await
+        .unwrap();
+    assert_eq!(index_count(&pool, &user).await, 3);
+
+    // b matched a rule and was filed before it was deleted; a too (proves a's
+    // rows survive). c was only indexed, never matched.
+    seed_rule(&pool, &user, "r1").await;
+    for asset in ["a", "b"] {
+        seed_decision(&pool, "r1", asset).await;
+        seed_managed(&pool, "r1", asset).await;
+    }
+
+    // Immich now reports only {a,c}; b is gone. Trap ANY album-remove (DELETE):
+    // the reconcile must never issue one.
+    server.reset().await;
+    mount_search(&server, three(&["a", "c"])).await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let pruned = reconcile_one_user(&pool, &deterministic_key(), &user, 8)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 1, "only b is stale");
+
+    // b is gone from all three tables; a and c survive.
+    assert_eq!(index_count(&pool, &user).await, 2, "a and c remain indexed");
+    assert!(row_exists(&pool, "asset_index", "a").await);
+    assert!(row_exists(&pool, "asset_index", "c").await);
+    assert!(!row_exists(&pool, "asset_index", "b").await);
+
+    assert!(
+        row_exists(&pool, "asset_decisions", "a").await,
+        "a's decision survives",
+    );
+    assert!(
+        !row_exists(&pool, "asset_decisions", "b").await,
+        "b's decision is cascaded away",
+    );
+    assert!(
+        row_exists(&pool, "album_managed_assets", "a").await,
+        "a's managed-album row survives",
+    );
+    assert!(
+        !row_exists(&pool, "album_managed_assets", "b").await,
+        "b's managed-album row is cascaded away",
+    );
+    // The DELETE trap (expect 0) is asserted when `server` drops at scope end.
+}
+
+#[tokio::test]
+async fn reconcile_is_a_noop_when_nothing_is_stale() {
+    // Immich still holds everything indexed → no prune, no error.
+    let server = MockServer::start().await;
+    let pool = fresh_pool().await;
+    let user = seed_user(&pool, "owner@example.com").await;
+    seed_key(&pool, &user, &server.uri(), OWNER_KEY).await;
+
+    mount_search(
+        &server,
+        search_page(vec![asset_json(
+            "a1",
+            "a1.jpg",
+            "IMAGE",
+            "2024-01-01T00:00:00.000Z",
+            "2026-01-10T00:00:00.000Z",
+            None,
+            &[],
+        )]),
+    )
+    .await;
+    sweep_one_user(&pool, &deterministic_key(), &user, 8)
+        .await
+        .unwrap();
+
+    let pruned = reconcile_one_user(&pool, &deterministic_key(), &user, 8)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 0);
+    assert_eq!(index_count(&pool, &user).await, 1);
 }

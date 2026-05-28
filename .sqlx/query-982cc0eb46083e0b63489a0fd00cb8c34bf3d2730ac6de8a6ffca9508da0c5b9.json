@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT asset_id FROM asset_index WHERE user_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "asset_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "982cc0eb46083e0b63489a0fd00cb8c34bf3d2730ac6de8a6ffca9508da0c5b9"
+}

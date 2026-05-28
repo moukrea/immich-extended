@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM asset_decisions WHERE asset_id = ? AND rule_id IN (SELECT id FROM rules WHERE owner_user_id = ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "ee5f5b4dfed545aab644c7b98968762db5cda6eb059d75bce013a6073293a3ec"
+}
