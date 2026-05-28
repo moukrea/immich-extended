@@ -50,8 +50,6 @@ type ErrorResponse = (StatusCode, Json<serde_json::Value>);
 #[derive(Debug, Deserialize)]
 pub struct CreateRuleRequest {
     pub yaml_source: String,
-    #[serde(default)]
-    pub poll_interval_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,38 +58,15 @@ pub struct UpdateRuleRequest {
     pub yaml_source: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
-    pub poll_interval_seconds: Option<i64>,
 }
 
-/// Default cadence for newly created rules that don't supply a value.
-/// Matches the SQL column default seeded by `migrations/0004_rules.sql`.
-pub const DEFAULT_POLL_INTERVAL_SECONDS: i64 = 300;
-
-/// Minimum operator-settable poll cadence (1 minute). Below this we'd hammer
-/// the upstream Immich for diminishing returns.
-pub const MIN_POLL_INTERVAL_SECONDS: i64 = 60;
-
-/// Maximum operator-settable poll cadence (24 hours). Beyond this the UX of
-/// "did the rule even run?" gets miserable.
-pub const MAX_POLL_INTERVAL_SECONDS: i64 = 86_400;
-
-fn validate_poll_interval(value: i64) -> Result<(), ErrorResponse> {
-    if !(MIN_POLL_INTERVAL_SECONDS..=MAX_POLL_INTERVAL_SECONDS).contains(&value) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "invalid_poll_interval",
-                "detail": format!(
-                    "poll_interval_seconds must be between {MIN_POLL_INTERVAL_SECONDS} and {MAX_POLL_INTERVAL_SECONDS}, got {value}",
-                ),
-                "min": MIN_POLL_INTERVAL_SECONDS,
-                "max": MAX_POLL_INTERVAL_SECONDS,
-            })),
-        ));
-    }
-    Ok(())
-}
+/// Fixed value written into the retained-but-unread `rules.poll_interval_seconds`
+/// column on insert. The per-rule poll timers were retired (cycle-6 L1: matching
+/// is event-driven off the indexer sweep), so this is no longer operator-settable;
+/// the column stays only to keep the NOT NULL schema and the GET response shape
+/// unchanged. Nothing reads the value. Matches the SQL default seeded by
+/// `migrations/0004_rules.sql`.
+const RETAINED_POLL_INTERVAL_SECONDS: i64 = 300;
 
 #[derive(Debug, Serialize)]
 pub struct RuleSummary {
@@ -131,10 +106,8 @@ pub(super) async fn create_rule(
     AuthenticatedUser(UserId(uid)): AuthenticatedUser,
     Json(req): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<RuleSummary>), ErrorResponse> {
-    let poll_interval = req
-        .poll_interval_seconds
-        .unwrap_or(DEFAULT_POLL_INTERVAL_SECONDS);
-    validate_poll_interval(poll_interval)?;
+    // Retained-but-unread column (cycle-6 L1): written once on insert, never read.
+    let poll_interval = RETAINED_POLL_INTERVAL_SECONDS;
 
     let mut rule = parse_rule(&req.yaml_source).map_err(parse_error_response)?;
 
@@ -307,18 +280,14 @@ pub(super) async fn update_rule(
     Path(id): Path<String>,
     Json(req): Json<UpdateRuleRequest>,
 ) -> Result<Json<RuleSummary>, ErrorResponse> {
-    if req.yaml_source.is_none() && req.status.is_none() && req.poll_interval_seconds.is_none() {
+    if req.yaml_source.is_none() && req.status.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "empty_patch",
-                "detail": "request must include yaml_source, status, or poll_interval_seconds",
+                "detail": "request must include yaml_source or status",
             })),
         ));
-    }
-
-    if let Some(interval) = req.poll_interval_seconds {
-        validate_poll_interval(interval)?;
     }
 
     // Establish that the row exists and belongs to the caller. The actual
@@ -388,9 +357,11 @@ pub(super) async fn update_rule(
         };
         let status_db = rule.status.as_str();
 
-        // `poll_interval_seconds` is optional on PATCH; COALESCE keeps the
-        // existing value when the body omits the field.
-        let interval_arg = req.poll_interval_seconds;
+        // `poll_interval_seconds` is a retired-but-unread column (cycle-6 L1):
+        // bind NULL so COALESCE leaves the stored value untouched. The SQL is
+        // unchanged from when the field was operator-settable, so the cached
+        // `.sqlx` query stays valid.
+        let interval_arg: Option<i64> = None;
         sqlx::query!(
             "UPDATE rules SET \
                 name = ?, yaml_source = ?, parsed_predicates = ?, \
@@ -435,16 +406,17 @@ pub(super) async fn update_rule(
         }));
     }
 
-    // No yaml_source — at least one of `status` / `poll_interval_seconds` is
-    // present (empty-patch is rejected above). Both are COALESCE'd so omitting
-    // one keeps the existing column.
+    // No yaml_source — `status` is present (empty-patch is rejected above, and
+    // poll_interval is no longer a request field). `poll_interval_seconds` is
+    // bound NULL so COALESCE keeps the stored value (retired column, cycle-6 L1);
+    // the SQL is unchanged so the cached `.sqlx` query stays valid.
     let new_status_db: Option<&str> = if let Some(status_str) = req.status.as_deref() {
         let parsed = parse_status_str(status_str).ok_or_else(|| invalid_status(status_str))?;
         Some(parsed.as_str())
     } else {
         None
     };
-    let interval_arg = req.poll_interval_seconds;
+    let interval_arg: Option<i64> = None;
 
     sqlx::query!(
         "UPDATE rules SET \

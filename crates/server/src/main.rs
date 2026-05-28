@@ -17,13 +17,13 @@ use server::{
     admin::{create_user, CreateUserError},
     auth::oidc::OidcClient,
     config::Config,
-    engine_scheduler::Scheduler,
     indexer::{Indexer, OnSweepFn},
-    matcher::Matcher,
+    matcher::{safety_sweep_interval, Matcher},
     rules::resolver::ImmichResourceResolver,
     AppState,
 };
 use tokio::{net::TcpListener, signal};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -137,29 +137,17 @@ async fn run_serve(cfg: Config) -> Result<()> {
         }
     };
 
-    // Per-rule Immich clients are built inside the poll cycle from each
-    // rule owner's stored `immich_api_keys.base_url`, so the scheduler
-    // doesn't need a global Immich URL — it just needs the master key to
-    // decrypt the stored secret. The `data_dir` plumbs through to the YOLO
-    // dispatch (M5-T6) so the model file at `data_dir/models/yolo.onnx`
-    // resolves at inference time.
+    // Per-rule Immich clients are built inside each match pass from the rule
+    // owner's stored `immich_api_keys.base_url`, so the matcher doesn't need a
+    // global Immich URL — it just needs the master key to decrypt the stored
+    // secret. The `data_dir` plumbs through to the YOLO dispatch (M5-T6) so the
+    // model file at `data_dir/models/yolo.onnx` resolves at inference time.
     // Live-activity ring buffer (POSTSHIP-T33). One process-wide buffer shared
-    // by the indexer (per-asset "Indexed" events), the rule-cycle tick fn
+    // by the indexer (per-asset "Indexed" events), the match passes
     // (per-decision "Matched"/"Skipped"/"AlbumAdd"), and the
-    // `/me/activity/stream` endpoint. Constructed before the scheduler + indexer
+    // `/me/activity/stream` endpoint. Constructed before the matcher + indexer
     // so both can publish into the same buffer the endpoint reads.
     let activity = Arc::new(ActivityBus::new());
-
-    // Per-rule poll Scheduler is still constructed + started below for
-    // branch-safety; its per-rule timers are formally retired in T42. CRUD
-    // handlers no longer reconcile it — the rule lifecycle now drives matching
-    // through `Matcher::on_rule_activated` instead.
-    let scheduler = Arc::new(Scheduler::new(
-        pool.clone(),
-        cfg.master_key.clone(),
-        cfg.data_dir.clone(),
-        activity.clone(),
-    ));
 
     // Event-driven matcher service (POSTSHIP-T41, design §5.2). One thin
     // wiring point — capturing pool + master_key + data_dir + activity — for the
@@ -201,7 +189,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
     // Background whole-library pre-processing indexer (POSTSHIP-T28). One
     // process-wide task that keeps `asset_index` fresh for every keyed user so
     // rule matching can scan locally. Built per-user from stored keys, so — like
-    // the scheduler — it needs only the master key, not a global Immich URL.
+    // the matcher — it needs only the master key, not a global Immich URL.
     // `with_on_sweep` attaches the event-driven matcher hook (T40). Held here
     // (not in AppState): no CRUD hook reaches it in this cycle.
     let indexer = Arc::new(
@@ -222,13 +210,38 @@ async fn run_serve(cfg: Config) -> Result<()> {
         activity: activity.clone(),
     };
 
-    scheduler
-        .clone()
-        .start()
-        .await
-        .context("starting per-rule scheduler")?;
-
     indexer.clone().start().await;
+
+    // Process-wide hourly safety sweep (POSTSHIP-T42, L4). The single backstop
+    // for anything the incremental indexer→matcher path (pass b) missed — a
+    // failed album PUT, or a sweep the process slept through: every active rule
+    // across all users is re-reconciled through pass (a) with `SummaryOnly`
+    // verbosity, so it never spams the live log. Canonical
+    // `select! { cancelled, sleep }` loop (mirroring the indexer) — NOT
+    // `tokio::time::interval`, whose phase ignores cancellation between ticks, so
+    // a shutting-down process never sweeps once more. Default 3600 s, overridable
+    // via `SAFETY_SWEEP_INTERVAL_SECONDS`. This is the only timer left after the
+    // per-rule poll timers retired (cycle-4 directive #6's operator-settable
+    // interval is superseded by cycle-6 L1).
+    let safety_cancel = CancellationToken::new();
+    let safety_join = {
+        let matcher = matcher.clone();
+        let token = safety_cancel.clone();
+        let interval = safety_sweep_interval();
+        info!(interval_secs = interval.as_secs(), "safety sweep started");
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => {
+                        if let Err(err) = matcher.safety_sweep().await {
+                            tracing::error!(error = %err, "hourly safety sweep failed");
+                        }
+                    }
+                }
+            }
+        })
+    };
 
     let app = server::router(state, cfg.web_dist_dir.clone());
 
@@ -246,7 +259,8 @@ async fn run_serve(cfg: Config) -> Result<()> {
         .await
         .context("axum::serve terminated with an error")?;
 
-    scheduler.stop().await;
+    safety_cancel.cancel();
+    let _ = safety_join.await;
     indexer.stop().await;
     info!("immich-extended stopped");
     pool.close().await;

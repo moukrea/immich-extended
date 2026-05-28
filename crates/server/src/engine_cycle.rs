@@ -62,8 +62,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -1134,52 +1133,6 @@ fn now_unix_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// Build the scheduler's production tick function. The closure captures the
-/// pool + master key + data_dir and delegates each tick to [`match_rule_full`]
-/// (pass a, `Verbose`). Lives here (next to the match passes) so a future
-/// refactor can swap implementations in one place without touching the
-/// scheduler module. Retired alongside the per-rule timers in T42.
-pub fn production_tick_fn(
-    pool: SqlitePool,
-    master_key: MasterKey,
-    data_dir: PathBuf,
-    activity: Arc<ActivityBus>,
-) -> crate::engine_scheduler::RunCycleFn {
-    Arc::new(move |rule_id: String| {
-        let pool = pool.clone();
-        let master_key = master_key.clone();
-        let data_dir = data_dir.clone();
-        let activity = activity.clone();
-        Box::pin(async move {
-            match match_rule_full(
-                &pool,
-                &master_key,
-                &data_dir,
-                &rule_id,
-                Some(&activity),
-                EventVerbosity::Verbose,
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    tracing::info!(
-                        %rule_id,
-                        evaluated = outcome.evaluated,
-                        added = outcome.added,
-                        skipped = outcome.skipped,
-                        "rule cycle ok",
-                    );
-                    Ok(())
-                }
-                Err(err) => {
-                    let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
-                    Err(boxed)
-                }
-            }
-        })
-    })
 }
 
 #[cfg(test)]

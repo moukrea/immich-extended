@@ -15,8 +15,6 @@ import {
   fetchAlbums,
   fetchRuleMatchCount,
   getRule,
-  MAX_POLL_INTERVAL_SECONDS,
-  MIN_POLL_INTERVAL_SECONDS,
   updateRule,
   type MeAlbum,
   type Rule,
@@ -25,7 +23,6 @@ import {
 } from "../../lib/api";
 import { emptyMatch, type MatchExpr } from "../../lib/matchTree";
 import {
-  BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
   defaultRuleMeta,
   formStateToYamlV2,
   yamlToFormStateV2,
@@ -59,14 +56,12 @@ function deriveStateFromRule(rule: Rule): {
   expr: MatchExpr;
 } {
   const parsed = yamlToFormStateV2(rule.yaml_source);
-  // Server payload is authoritative for status + poll_interval_seconds (the
-  // latter is row-level, never round-tripped through YAML).
+  // Server payload is authoritative for status (row-level, not in YAML).
   return {
     meta: {
       ...parsed.meta,
       id: rule.id,
       status: rule.status,
-      poll_interval_seconds: rule.poll_interval_seconds,
     },
     expr: parsed.expr,
   };
@@ -224,20 +219,6 @@ const RuleBuilderV2: Component = () => {
       return { ...m, target: { ...m.target, name } };
     });
 
-  const onPollIntervalInput = (raw: string) => {
-    const trimmed = raw.trim();
-    if (trimmed === "") {
-      mutateMeta((m) => ({
-        ...m,
-        poll_interval_seconds: BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
-      }));
-      return;
-    }
-    const parsed = Number(trimmed);
-    if (!Number.isFinite(parsed)) return;
-    mutateMeta((m) => ({ ...m, poll_interval_seconds: Math.round(parsed) }));
-  };
-
   const exportSlug = createMemo(() => {
     const trimmed = meta().name.trim().toLowerCase();
     const slug = trimmed.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -363,12 +344,10 @@ const RuleBuilderV2: Component = () => {
     }
     setSaving(true);
     setError(null);
-    const pollInterval = meta().poll_interval_seconds;
 
     if (mode() === "new") {
       const result = await createRule({
         yaml_source: yaml,
-        poll_interval_seconds: pollInterval,
       });
       setSaving(false);
       if (!result.ok) {
@@ -390,7 +369,6 @@ const RuleBuilderV2: Component = () => {
     }
     const result = await updateRule(id, {
       yaml_source: yaml,
-      poll_interval_seconds: pollInterval,
     });
     setSaving(false);
     if (!result.ok) {
@@ -539,26 +517,6 @@ const RuleBuilderV2: Component = () => {
               <PeopleProvider>
                 <BlockTreeEditor expr={expr()} onChange={mutateExpr} />
               </PeopleProvider>
-            </Card>
-
-            <Card>
-              <Field
-                label="Poll interval (seconds)"
-                for_="rule-poll-interval"
-                help={`Minimum ${MIN_POLL_INTERVAL_SECONDS}s, maximum ${MAX_POLL_INTERVAL_SECONDS}s (1 day). 300s (5 min) suits most rules.`}
-              >
-                <Input
-                  id="rule-poll-interval"
-                  type="number"
-                  min={MIN_POLL_INTERVAL_SECONDS}
-                  max={MAX_POLL_INTERVAL_SECONDS}
-                  step="1"
-                  value={meta().poll_interval_seconds}
-                  onInput={(e) => onPollIntervalInput(e.currentTarget.value)}
-                  aria-label="Poll interval seconds"
-                  class="w-40"
-                />
-              </Field>
             </Card>
 
             <Card padding="none">

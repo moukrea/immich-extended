@@ -6,7 +6,6 @@ pub mod album_sync;
 pub mod auth;
 pub mod config;
 pub mod engine_cycle;
-pub mod engine_scheduler;
 pub mod indexer;
 pub mod matcher;
 pub mod me;

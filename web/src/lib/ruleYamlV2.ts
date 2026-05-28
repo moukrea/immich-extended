@@ -1,7 +1,7 @@
 // YAML ↔ state for the block-tree rule builder (POSTSHIP-T20).
 //
-// The non-match rule-level fields (id / name / status / target_album /
-// poll_interval_seconds) carry the same shape used by the deployed API.
+// The non-match rule-level fields (id / name / status / target_album) carry
+// the same shape used by the deployed API.
 // `match` round-trips through `serializeMatchExpr` / `parseMatchExpr`, which
 // accept both the new tree shape and the legacy flat shape on load.
 //
@@ -29,14 +29,12 @@ export type TargetAlbumState =
 
 export const DEFAULT_LOCATION_CENTER: [number, number] = [48.8566, 2.3522];
 export const DEFAULT_LOCATION_RADIUS_KM = 60;
-export const BUILDER_DEFAULT_POLL_INTERVAL_SECONDS = 300;
 
 export interface RuleMetaState {
   id: string | null;
   name: string;
   status: RuleStatusValue;
   target: TargetAlbumState;
-  poll_interval_seconds: number;
   untouched_top_level: Record<string, unknown>;
 }
 
@@ -46,7 +44,6 @@ export function defaultRuleMeta(): RuleMetaState {
     name: "",
     status: "active",
     target: { kind: "managed", name: "", shared_with: [] },
-    poll_interval_seconds: BUILDER_DEFAULT_POLL_INTERVAL_SECONDS,
     untouched_top_level: {},
   };
 }

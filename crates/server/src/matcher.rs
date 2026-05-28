@@ -16,12 +16,14 @@
 //!   active rule across all users with `SummaryOnly` verbosity, catching any event
 //!   the incremental path missed without spamming the live log.
 //!
-//! Held in [`crate::AppState`] as `Arc<Matcher>`, replacing the retired per-rule
-//! [`crate::engine_scheduler::Scheduler`] seam (the scheduler is still constructed
-//! in `main.rs` until its timers are formally retired in T42).
+//! Held in [`crate::AppState`] as `Arc<Matcher>`, having replaced the retired
+//! per-rule scheduler seam: per-rule poll timers were deleted in T42, so matching
+//! is now driven purely by the indexer sweep hook, the rule-lifecycle trigger, and
+//! the hourly safety task — never a per-rule timer.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::crypto::MasterKey;
 use sqlx::SqlitePool;
@@ -30,9 +32,40 @@ use tokio::task::JoinHandle;
 use crate::activity::ActivityBus;
 use crate::engine_cycle::{self, EventVerbosity, MatchError};
 
+/// Default cadence for the process-wide safety sweep (L4): one full reconcile of
+/// every active rule per hour. The incremental indexer→matcher path (pass b)
+/// handles the steady state; this slow backstop catches anything an event missed
+/// (a failed album PUT, a sweep the process slept through). Overridable via the
+/// `SAFETY_SWEEP_INTERVAL_SECONDS` env var.
+pub const DEFAULT_SAFETY_SWEEP_INTERVAL_SECONDS: u64 = 3600;
+
+/// Parse a raw `SAFETY_SWEEP_INTERVAL_SECONDS` value into a sweep [`Duration`].
+/// A missing, unparseable, or non-positive value falls back to
+/// [`DEFAULT_SAFETY_SWEEP_INTERVAL_SECONDS`] (a zero interval would busy-spin the
+/// safety task). Pure (env read lives in [`safety_sweep_interval`]) so it can be
+/// unit-tested without mutating process-global env.
+fn parse_safety_sweep_interval(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_SAFETY_SWEEP_INTERVAL_SECONDS);
+    Duration::from_secs(secs)
+}
+
+/// Resolve the safety-sweep cadence from the `SAFETY_SWEEP_INTERVAL_SECONDS`
+/// env override, defaulting to [`DEFAULT_SAFETY_SWEEP_INTERVAL_SECONDS`]. Called
+/// once at startup in `main.rs` to size the hourly safety task's sleep.
+pub fn safety_sweep_interval() -> Duration {
+    parse_safety_sweep_interval(
+        std::env::var("SAFETY_SWEEP_INTERVAL_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Drives the matching passes from rule-lifecycle, indexer-sweep, and
 /// hourly-safety triggers. Cheap to clone-by-`Arc`; carries no per-rule task
-/// state (unlike the retired [`Scheduler`](crate::engine_scheduler::Scheduler)).
+/// state (unlike the retired per-rule scheduler it replaced).
 #[derive(Debug)]
 pub struct Matcher {
     pool: SqlitePool,
@@ -61,9 +94,8 @@ impl Matcher {
 
     /// Convenience for tests that build [`AppState`](crate::AppState) but never
     /// exercise matching (the rule-lifecycle handlers only *trigger* a spawned
-    /// pass; CRUD-shape tests assert the request, not the async fill). Mirrors
-    /// [`Scheduler::for_tests`](crate::engine_scheduler::Scheduler::for_tests):
-    /// a deterministic zero key, the system temp dir, and a fresh activity bus.
+    /// pass; CRUD-shape tests assert the request, not the async fill). Uses a
+    /// deterministic zero key, the system temp dir, and a fresh activity bus.
     pub fn for_tests(pool: SqlitePool) -> Self {
         Self {
             pool,
@@ -76,7 +108,7 @@ impl Matcher {
     /// Rule create / activate / edit trigger (L3). Spawns the full-index scan of
     /// `rule_id` (pass a, `Verbose`) and returns immediately so the calling POST
     /// handler keeps its fire-and-forget ergonomics — the 201 returns now, the
-    /// album fills moments later. Errors are logged inside the task (a scheduler
+    /// album fills moments later. Errors are logged inside the task (a backfill
     /// hiccup must never turn a 201 into a 500).
     ///
     /// Returns the [`JoinHandle`] purely so tests can await the spawned scan
@@ -164,5 +196,43 @@ impl Matcher {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safety_sweep_interval_defaults_when_absent() {
+        assert_eq!(
+            parse_safety_sweep_interval(None),
+            Duration::from_secs(DEFAULT_SAFETY_SWEEP_INTERVAL_SECONDS),
+        );
+    }
+
+    #[test]
+    fn safety_sweep_interval_honors_positive_override() {
+        assert_eq!(
+            parse_safety_sweep_interval(Some("900")),
+            Duration::from_secs(900),
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            parse_safety_sweep_interval(Some("  120 ")),
+            Duration::from_secs(120),
+        );
+    }
+
+    #[test]
+    fn safety_sweep_interval_rejects_zero_and_garbage() {
+        // A zero interval would busy-spin the safety task; fall back to default.
+        for raw in ["0", "-5", "abc", ""] {
+            assert_eq!(
+                parse_safety_sweep_interval(Some(raw)),
+                Duration::from_secs(DEFAULT_SAFETY_SWEEP_INTERVAL_SECONDS),
+                "raw {raw:?} should fall back to the default",
+            );
+        }
     }
 }
