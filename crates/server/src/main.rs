@@ -17,8 +17,9 @@ use server::{
     admin::{create_user, CreateUserError},
     auth::oidc::OidcClient,
     config::Config,
+    engine_cycle::match_assets,
     engine_scheduler::Scheduler,
-    indexer::Indexer,
+    indexer::{Indexer, OnSweepFn},
     rules::resolver::ImmichResourceResolver,
     AppState,
 };
@@ -156,16 +157,56 @@ async fn run_serve(cfg: Config) -> Result<()> {
         activity.clone(),
     ));
 
+    // Event-driven matching seam (POSTSHIP-T40, design §4.2). After each user
+    // sweep the indexer hands that sweep's touched asset_ids to pass (b)
+    // (`engine_cycle::match_assets`): evaluate exactly those assets against all
+    // of that user's active rules and reconcile albums. Built here — capturing
+    // pool + master_key + data_dir + activity — so the indexer itself stays
+    // storage-only (no engine/YOLO/data_dir dependency). A single rule's failure
+    // is logged and skipped inside `match_assets`; the `MatchError` surfaced here
+    // is only the outer load (active-rule set / candidate rows), logged so a
+    // transient DB hiccup never aborts the sweep loop.
+    let on_sweep: OnSweepFn = {
+        let pool = pool.clone();
+        let master_key = cfg.master_key.clone();
+        let data_dir = cfg.data_dir.clone();
+        let activity = activity.clone();
+        Arc::new(move |user_id: String, touched_ids: Vec<String>| {
+            let pool = pool.clone();
+            let master_key = master_key.clone();
+            let data_dir = data_dir.clone();
+            let activity = activity.clone();
+            Box::pin(async move {
+                if let Err(err) = match_assets(
+                    &pool,
+                    &master_key,
+                    &data_dir,
+                    &user_id,
+                    &touched_ids,
+                    Some(&activity),
+                )
+                .await
+                {
+                    tracing::error!(
+                        user_id = %user_id,
+                        error = %err,
+                        "event-driven match after sweep failed",
+                    );
+                }
+            })
+        })
+    };
+
     // Background whole-library pre-processing indexer (POSTSHIP-T28). One
     // process-wide task that keeps `asset_index` fresh for every keyed user so
-    // rule matching (T29) can scan locally. Built per-user from stored keys, so
-    // — like the scheduler — it needs only the master key, not a global Immich
-    // URL. Held here (not in AppState): no CRUD hook reaches it in this cycle.
-    let indexer = Arc::new(Indexer::new(
-        pool.clone(),
-        cfg.master_key.clone(),
-        activity.clone(),
-    ));
+    // rule matching can scan locally. Built per-user from stored keys, so — like
+    // the scheduler — it needs only the master key, not a global Immich URL.
+    // `with_on_sweep` attaches the event-driven matcher hook (T40). Held here
+    // (not in AppState): no CRUD hook reaches it in this cycle.
+    let indexer = Arc::new(
+        Indexer::new(pool.clone(), cfg.master_key.clone(), activity.clone())
+            .with_on_sweep(on_sweep),
+    );
 
     let state = AppState {
         db: pool.clone(),

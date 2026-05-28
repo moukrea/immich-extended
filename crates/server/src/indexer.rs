@@ -35,6 +35,8 @@
 //! is no shared client. A user's sweep only ever writes `asset_index` rows
 //! under their own `user_id`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -70,6 +72,19 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 /// short page regardless of this ceiling. Matches the client's own
 /// [`immich_client::MAX_SEARCH_PAGES`] safety net (50k assets).
 const DEFAULT_MAX_PAGES_PER_SWEEP: u32 = immich_client::MAX_SEARCH_PAGES;
+
+/// Post-sweep matcher hook (design §4.2). After a user sweep upserts its rows,
+/// the indexer hands that sweep's touched `asset_id`s to this callback, which
+/// production wires to `engine_cycle::match_assets` — the event-driven pass (b)
+/// that evaluates exactly those assets against all of the user's active rules.
+///
+/// Kept as an opaque injected seam (mirroring the scheduler's `RunCycleFn`) so
+/// the indexer stays storage-only: it never grows a dependency on the engine /
+/// YOLO surface or `data_dir`, which the matcher needs but the sweep does not.
+/// Tests construct the indexer without a hook (`None`); production attaches one
+/// via [`Indexer::with_on_sweep`].
+pub type OnSweepFn =
+    Arc<dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum IndexerError {
@@ -112,12 +127,16 @@ pub struct SweepSummary {
     pub total_indexed: usize,
 }
 
-/// Summary of one user's sweep: how many assets were upserted and the
-/// resulting ingest watermark.
+/// Summary of one user's sweep: how many assets were upserted, the resulting
+/// ingest watermark, and the `asset_id`s touched (upserted) this sweep. The
+/// touched set is what [`Indexer::sweep_all_users`] hands to the post-sweep
+/// matcher hook (design §4.1); an empty sweep yields an empty vec and no match
+/// work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserSweepSummary {
     pub indexed: usize,
     pub watermark: i64,
+    pub touched_ids: Vec<String>,
 }
 
 /// Owns the process-wide background sweep task.
@@ -126,6 +145,9 @@ pub struct Indexer {
     master_key: MasterKey,
     activity: Arc<ActivityBus>,
     config: IndexerConfig,
+    /// Optional post-sweep matcher hook (design §4.2). `None` in tests; set by
+    /// [`Self::with_on_sweep`] in production to drive event-driven matching.
+    on_sweep: Option<OnSweepFn>,
     cancel: CancellationToken,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -161,9 +183,20 @@ impl Indexer {
             master_key,
             activity,
             config,
+            on_sweep: None,
             cancel: CancellationToken::new(),
             join: Mutex::new(None),
         }
+    }
+
+    /// Attach the post-sweep matcher hook (design §4.2). Called once at startup
+    /// in `main.rs` with a closure capturing `pool + master_key + data_dir +
+    /// activity` that invokes `engine_cycle::match_assets`. Builder-style so the
+    /// indexer can be `Arc`-wrapped immediately after: `Arc::new(Indexer::new(..)
+    /// .with_on_sweep(hook))`.
+    pub fn with_on_sweep(mut self, hook: OnSweepFn) -> Self {
+        self.on_sweep = Some(hook);
+        self
     }
 
     /// Spawn the sweep loop. Sleeps one interval before the first sweep (same
@@ -225,6 +258,16 @@ impl Indexer {
                 Ok(summary) => {
                     users_swept += 1;
                     total_indexed += summary.indexed;
+                    // Event-driven matching (design §4.2): hand the assets this
+                    // sweep touched to the matcher hook. Coalesced — one pass (b)
+                    // per user per sweep over the whole touched set, not per
+                    // asset. A caught-up sweep touches nothing, so the hook (and
+                    // its rule fan-out) is skipped entirely.
+                    if let Some(hook) = &self.on_sweep {
+                        if !summary.touched_ids.is_empty() {
+                            hook(row.user_id.clone(), summary.touched_ids).await;
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -293,6 +336,7 @@ async fn sweep_one_user_inner(
 
     let now = now_unix_seconds();
     let mut max_updated = watermark;
+    let mut touched_ids: Vec<String> = Vec::with_capacity(assets.len());
 
     if !assets.is_empty() {
         // One transaction per sweep: bounded to max_pages × 250 rows, so the
@@ -301,6 +345,7 @@ async fn sweep_one_user_inner(
         let mut tx = pool.begin().await?;
         for asset in &assets {
             upsert_asset(&mut tx, user_id, asset, now).await?;
+            touched_ids.push(asset.id.clone());
             let updated = asset.updated_at.timestamp();
             if updated > max_updated {
                 max_updated = updated;
@@ -338,6 +383,7 @@ async fn sweep_one_user_inner(
     Ok(UserSweepSummary {
         indexed: assets.len(),
         watermark: max_updated,
+        touched_ids,
     })
 }
 
