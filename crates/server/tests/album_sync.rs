@@ -1,25 +1,23 @@
-//! Integration test for `album_sync::idempotent_album_add` (M3-T5).
+//! Integration tests for the album-fill diff (M3-T5 → POSTSHIP-T29).
 //!
-//! Drives `engine_cycle::run_one_cycle` twice against a stateful wiremock and
-//! asserts that:
+//! Drives `engine_cycle::run_one_cycle` against a stateful wiremock and asserts
+//! the reconciliation contract over the pre-processed `asset_index`:
 //!
 //! 1. The first cycle PUTs the matched ids into the (empty) album.
-//! 2. A second cycle that re-evaluates the same assets — but now the album
-//!    reports those ids as already present and the search returns one new
-//!    matching asset — PUTs ONLY the newly matched id, not the previously
-//!    added ones.
-//! 3. A cycle whose matched set is fully a subset of the album's current state
-//!    issues NO PUT at all (the diff resolves to empty).
+//! 2. A second cycle whose matches are already album members issues NO PUT.
+//! 3. A newly-indexed match is the only id PUT on the next cycle.
+//! 4. **D3**: an asset the rule filed that the operator later removed from the
+//!    album is recorded `removed` and NEVER re-added, even though it still
+//!    matches.
 //!
-//! The mock uses an `Arc<Mutex<...>>` "state" closure to flip the GET album
-//! response and the search response between the two cycles. The PUT mock
-//! records every body it receives so the test can assert exactly what went
-//! over the wire each round.
+//! The album GET mock reads an `Arc<Mutex<Vec<String>>>` "state" so the test can
+//! flip the album's membership between cycles. The PUT mock records every body.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use common::crypto::MasterKey;
 use common::db;
 use server::admin::create_user;
@@ -101,119 +99,111 @@ async fn seed_rule(
     .unwrap();
 }
 
-/// Match-spec that picks up every asset whose `taken_at >= 2024-01-01`.
+/// Seed one matching `asset_index` row (photo, taken in 2024, no faces).
+async fn seed_index_match(pool: &SqlitePool, owner: &str, asset_id: &str) {
+    let taken = DateTime::parse_from_rfc3339("2024-06-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc)
+        .timestamp();
+    sqlx::query(
+        "INSERT INTO asset_index \
+            (user_id, asset_id, filename, updated_at, taken_at, lat, lng, \
+             media_type, person_ids, face_count, indexed_at) \
+         VALUES (?, ?, ?, 0, ?, NULL, NULL, 'photo', '[]', 0, 0)",
+    )
+    .bind(owner)
+    .bind(asset_id)
+    .bind(format!("{asset_id}.jpg"))
+    .bind(taken)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 fn date_from_2024_match() -> &'static str {
     r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#
 }
 
-/// Build a single search response item.
-fn asset_item(id: &str, updated_at: &str, taken_at: &str) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "type": "IMAGE",
-        "fileCreatedAt": taken_at,
-        "updatedAt": updated_at,
-        "exifInfo": {"dateTimeOriginal": taken_at},
-        "people": [],
-    })
-}
-
-#[tokio::test]
-async fn second_cycle_with_same_assets_does_not_re_put() {
-    // Cycle 1 sees {a1, a2}; both match; album starts empty → PUT(a1, a2).
-    // Cycle 2 re-evaluates {a1, a2} (watermark advance is sidestepped by
-    // resetting it after the first run so the search returns the same set);
-    // album now reports {a1, a2} as members → diff is empty → no PUT.
-    let server = MockServer::start().await;
-
-    // Album GET state: empty on call #1, {a1, a2} on call #2+.
-    let album_state: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
-    let album_state_for_mock = album_state.clone();
+/// Mount a GET album mock backed by `state` and a PUT recorder. Returns the PUT
+/// bodies handle.
+async fn mount_album(
+    server: &MockServer,
+    album: &str,
+    state: Arc<Mutex<Vec<String>>>,
+) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    let get_path = format!("/api/albums/{album}");
+    let put_path = format!("/api/albums/{album}/assets");
+    let album_owned = album.to_string();
+    let state_for_mock = state.clone();
     Mock::given(method("GET"))
-        .and(path("/api/albums/album-1"))
+        .and(path(get_path))
         .and(header("x-api-key", OWNER_KEY))
         .respond_with(move |_: &Request| {
-            let state = album_state_for_mock.clone();
-            let ids = state.try_lock().map(|g| g.clone()).unwrap_or_default();
+            let ids = state_for_mock
+                .try_lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
             let assets: Vec<serde_json::Value> = ids
                 .into_iter()
                 .map(|id| serde_json::json!({"id": id}))
                 .collect();
             ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "album-1", "assets": assets}))
+                .set_body_json(serde_json::json!({"id": album_owned, "assets": assets}))
         })
-        .mount(&server)
+        .mount(server)
         .await;
 
-    // Search always returns the same two assets.
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [
-                    asset_item("a1", "2026-01-15T10:00:00Z", "2024-06-01T10:00:00Z"),
-                    asset_item("a2", "2026-02-15T11:00:00Z", "2026-02-10T12:00:00Z"),
-                ],
-                "nextPage": null
-            }
-        })))
-        .mount(&server)
-        .await;
-
-    // PUT mock records every body it receives.
     let put_bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let put_bodies_capture = put_bodies.clone();
+    let put_capture = put_bodies.clone();
     Mock::given(method("PUT"))
-        .and(path("/api/albums/album-1/assets"))
+        .and(path(put_path))
         .and(header("x-api-key", OWNER_KEY))
         .respond_with(move |req: &Request| {
             let body: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            if let Ok(mut g) = put_bodies_capture.try_lock() {
+            if let Ok(mut g) = put_capture.try_lock() {
                 g.push(body);
             }
             ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
         })
-        .mount(&server)
+        .mount(server)
         .await;
+    put_bodies
+}
+
+#[tokio::test]
+async fn second_cycle_with_same_assets_does_not_re_put() {
+    // Cycle 1 sees {a1, a2}; album empty → PUT(a1, a2). Cycle 2 re-scans the
+    // same index; the album now reports {a1, a2} → diff empty → no PUT.
+    let server = MockServer::start().await;
+    let album_state: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let put_bodies = mount_album(&server, "album-1", album_state.clone()).await;
 
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+    seed_index_match(&pool, &owner, "a1").await;
+    seed_index_match(&pool, &owner, "a2").await;
 
     let mk = deterministic_key();
 
-    // Cycle 1: empty album → PUT fires with a1, a2.
     let out1 = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
         .await
         .unwrap();
     assert_eq!(out1.added, 2, "first cycle should add both assets");
 
-    // Reset the watermark so cycle 2 re-evaluates the same assets, and flip
-    // the album state to include them.
-    sqlx::query!(
-        "UPDATE rules SET last_processed_asset_timestamp = NULL WHERE id = ?",
-        "r1"
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    // The album now contains what we filed.
     {
         let mut g = album_state.lock().await;
-        g.push("a1");
-        g.push("a2");
+        g.push("a1".to_string());
+        g.push("a2".to_string());
     }
 
-    // Cycle 2: album already has {a1, a2} → diff empty → no PUT.
     let out2 = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
         .await
         .unwrap();
-    assert_eq!(
-        out2.evaluated, 2,
-        "second cycle should still evaluate both assets",
-    );
+    assert_eq!(out2.evaluated, 2, "second cycle re-evaluates both assets");
     assert_eq!(
         out2.added, 2,
         "decision counter is matched-vs-skipped, not what was pushed",
@@ -226,95 +216,30 @@ async fn second_cycle_with_same_assets_does_not_re_put() {
         "PUT should have fired exactly once across two cycles, got {:?}",
         *bodies,
     );
-    let first_ids: Vec<String> = bodies[0]["ids"]
+    let mut ids: Vec<String> = bodies[0]["ids"]
         .as_array()
         .unwrap()
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    let mut sorted = first_ids.clone();
-    sorted.sort();
-    assert_eq!(sorted, vec!["a1".to_string(), "a2".to_string()]);
+    ids.sort();
+    assert_eq!(ids, vec!["a1".to_string(), "a2".to_string()]);
 }
 
 #[tokio::test]
 async fn second_cycle_pushes_only_newly_matched_id() {
-    // Cycle 1 sees {a1, a2}; album empty → PUT(a1, a2).
-    // Cycle 2 sees {a1, a2, a3}; album now has {a1, a2} → PUT only [a3].
+    // Cycle 1 sees {a1, a2}; album empty → PUT(a1, a2). Then a3 is indexed and
+    // the album reports {a1, a2}; cycle 2 PUTs only [a3].
     let server = MockServer::start().await;
-
-    let album_state: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
-    let album_state_for_mock = album_state.clone();
-    Mock::given(method("GET"))
-        .and(path("/api/albums/album-1"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(move |_: &Request| {
-            let state = album_state_for_mock.clone();
-            let ids = state.try_lock().map(|g| g.clone()).unwrap_or_default();
-            let assets: Vec<serde_json::Value> = ids
-                .into_iter()
-                .map(|id| serde_json::json!({"id": id}))
-                .collect();
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "album-1", "assets": assets}))
-        })
-        .mount(&server)
-        .await;
-
-    // Search response is stateful: cycle 1 returns {a1, a2}; cycle 2 returns
-    // {a1, a2, a3}.
-    let search_call_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let search_call_count_for_mock = search_call_count.clone();
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(move |_: &Request| {
-            let counter = search_call_count_for_mock.clone();
-            let n = if let Ok(mut g) = counter.try_lock() {
-                *g += 1;
-                *g
-            } else {
-                0
-            };
-            let items = if n <= 1 {
-                vec![
-                    asset_item("a1", "2026-01-15T10:00:00Z", "2024-06-01T10:00:00Z"),
-                    asset_item("a2", "2026-02-15T11:00:00Z", "2026-02-10T12:00:00Z"),
-                ]
-            } else {
-                vec![
-                    asset_item("a1", "2026-01-15T10:00:00Z", "2024-06-01T10:00:00Z"),
-                    asset_item("a2", "2026-02-15T11:00:00Z", "2026-02-10T12:00:00Z"),
-                    asset_item("a3", "2026-03-20T08:00:00Z", "2026-03-10T07:00:00Z"),
-                ]
-            };
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "assets": {"items": items, "nextPage": null}
-            }))
-        })
-        .mount(&server)
-        .await;
-
-    let put_bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let put_bodies_capture = put_bodies.clone();
-    Mock::given(method("PUT"))
-        .and(path("/api/albums/album-1/assets"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(move |req: &Request| {
-            let body: serde_json::Value =
-                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            if let Ok(mut g) = put_bodies_capture.try_lock() {
-                g.push(body);
-            }
-            ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
-        })
-        .mount(&server)
-        .await;
+    let album_state: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let put_bodies = mount_album(&server, "album-1", album_state.clone()).await;
 
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+    seed_index_match(&pool, &owner, "a1").await;
+    seed_index_match(&pool, &owner, "a2").await;
 
     let mk = deterministic_key();
 
@@ -323,19 +248,13 @@ async fn second_cycle_pushes_only_newly_matched_id() {
         .unwrap();
     assert_eq!(out1.added, 2);
 
-    // Reset watermark + populate album for cycle 2.
-    sqlx::query!(
-        "UPDATE rules SET last_processed_asset_timestamp = NULL WHERE id = ?",
-        "r1"
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    // Album now has {a1, a2}; a new asset gets indexed.
     {
         let mut g = album_state.lock().await;
-        g.push("a1");
-        g.push("a2");
+        g.push("a1".to_string());
+        g.push("a2".to_string());
     }
+    seed_index_match(&pool, &owner, "a3").await;
 
     let out2 = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
         .await
@@ -367,18 +286,84 @@ async fn second_cycle_pushes_only_newly_matched_id() {
 }
 
 #[tokio::test]
-async fn managed_target_without_name_errors_with_dedicated_slug() {
-    // T13: a managed-strategy rule whose name we cannot recover (no
-    // `managed_album_name` column AND `yaml_source` doesn't parse back to a
-    // managed target) fails the cycle with `managed_album_name_missing`.
-    // This is the unreachable-by-handler state; we surface a typed error
-    // instead of silently no-oping (the pre-T13 behavior) because the rule
-    // is genuinely broken — silently dropping its decisions would hide the
-    // problem from the operator.
+async fn operator_removed_asset_is_never_re_added() {
+    // D3: a1 + a2 filed in cycle 1. The operator pulls a1 out of the album.
+    // Cycle 2 detects the removal (records `removed`) and does NOT re-add a1,
+    // even though a1 still matches. Cycle 3 is idempotent — still no re-add.
     let server = MockServer::start().await;
+    let album_state: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let put_bodies = mount_album(&server, "album-1", album_state.clone()).await;
 
-    // No HTTP call should hit Immich — the cycle short-circuits before
-    // listing assets or albums.
+    let pool = fresh_pool().await;
+    let owner = seed_user(&pool, "alice@example.test", "Alice").await;
+    seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
+    seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+    seed_index_match(&pool, &owner, "a1").await;
+    seed_index_match(&pool, &owner, "a2").await;
+
+    let mk = deterministic_key();
+
+    // Cycle 1: empty album → PUT(a1, a2); both recorded `added`.
+    run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
+    {
+        let mut g = album_state.lock().await;
+        g.push("a1".to_string());
+        g.push("a2".to_string());
+    }
+
+    // Operator removes a1 from the album.
+    {
+        let mut g = album_state.lock().await;
+        g.retain(|id| id != "a1");
+    }
+
+    // Cycle 2: a1 detected as operator-removed → recorded `removed`, no PUT.
+    run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
+
+    let state_a1: Option<String> =
+        sqlx::query_scalar("SELECT state FROM album_managed_assets WHERE rule_id=? AND asset_id=?")
+            .bind("r1")
+            .bind("a1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state_a1.as_deref(),
+        Some("removed"),
+        "a1 must be marked removed"
+    );
+    let state_a2: Option<String> =
+        sqlx::query_scalar("SELECT state FROM album_managed_assets WHERE rule_id=? AND asset_id=?")
+            .bind("r1")
+            .bind("a2")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state_a2.as_deref(), Some("added"), "a2 stays managed");
+
+    // Cycle 3: idempotent — a1 stays removed, still no re-add.
+    run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
+        .await
+        .unwrap();
+
+    let bodies = put_bodies.lock().await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "only cycle 1 should PUT; a1 must never be re-added, got {:?}",
+        *bodies,
+    );
+}
+
+#[tokio::test]
+async fn managed_target_without_name_errors_with_dedicated_slug() {
+    // T13: a managed-strategy rule whose name we cannot recover fails the cycle
+    // with `managed_album_name_missing` before any Immich call.
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
@@ -398,9 +383,9 @@ async fn managed_target_without_name_errors_with_dedicated_slug() {
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
-    // `seed_rule` plants `yaml_source = "name: stub"` which doesn't parse
-    // back to a managed TargetAlbum — combined with the empty column, the
-    // engine cannot recover a name.
+    // `seed_rule` plants `yaml_source = "name: stub"` which doesn't parse back
+    // to a managed TargetAlbum — combined with the empty column, the engine
+    // cannot recover a name.
     seed_rule(&pool, &owner, "r1", "", date_from_2024_match()).await;
 
     let mk = deterministic_key();
@@ -413,17 +398,15 @@ async fn managed_target_without_name_errors_with_dedicated_slug() {
         "error should mention managed-target, got: {err_text}",
     );
 
-    // The errored rule_run row carries the dedicated slug.
     let run = common::decisions::latest_run_for_rule(&pool, "r1")
         .await
         .unwrap()
         .expect("a run row should exist");
     assert_eq!(
         run.error_message.as_deref(),
-        Some("managed_album_name_missing"),
+        Some("managed_album_name_missing")
     );
 
-    // No decisions were recorded — the cycle never reached the asset loop.
     let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
         .await
         .unwrap();

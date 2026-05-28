@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT asset_id FROM album_managed_assets WHERE rule_id = ? AND state = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "asset_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ecebb703d91b764ced8f09684339adf58ec3d09c3a0c77fa22ce8b0beccf208f"
+}

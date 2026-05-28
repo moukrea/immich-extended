@@ -1,29 +1,25 @@
-//! Integration test for `engine_cycle::run_one_cycle` (M3-T4).
+//! Integration test for `engine_cycle::run_one_cycle` (M3-T4 → POSTSHIP-T29).
 //!
-//! Drives the full poll cycle end-to-end against a wiremock-backed Immich:
-//! seed a user + encrypted API key + Active rule, mock `/api/search/metadata`
-//! to return three assets (two matching the rule, one not), then call
-//! `run_one_cycle` directly (the scheduler is exercised separately in
-//! `tests/scheduler.rs`). Assertions cover:
+//! Since T29 the cycle matches against the local `asset_index` (populated by
+//! the background indexer) rather than fetching a fresh `/api/search/metadata`
+//! page each tick. These tests therefore seed `asset_index` rows directly and
+//! assert:
 //!
-//! * the three decision rows landed with the right `decision`/`reason`,
-//! * the rule_runs row was finalised with `evaluated=3 added=2 skipped=1`,
-//! * the rule's watermark advanced to the max of the three `updatedAt`s,
-//! * `PUT /api/albums/:id/assets` was called exactly once with the two
-//!   matched ids,
-//! * the second cycle on the same data does NOT re-add to the album
-//!   (decision UPSERT, watermark already advanced ⇒ list_assets returns
-//!   empty).
+//! * the decision rows land with the right `decision`/`reason`,
+//! * the `rule_runs` row is finalised with the right counters,
+//! * `PUT /api/albums/:id/assets` files exactly the matched, not-yet-present
+//!   ids,
+//! * a managed album is found-or-created and backfilled from the whole index,
+//! * a failed PUT records no phantom `added`.
 //!
-//! Per-account isolation is asserted indirectly: the wiremock matcher checks
-//! the request's `x-api-key` header equals the key we encrypted into the
-//! row. The dedicated cross-account isolation test lives in M3-T6.
+//! Per-account isolation has a dedicated test in `cross_account_isolation.rs`;
+//! here the wiremock matchers still pin `x-api-key` to the owner's key.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use common::crypto::MasterKey;
 use common::db;
 use engine::rule::{LocationPredicate, MatchSpec};
@@ -71,9 +67,9 @@ async fn seed_key(pool: &SqlitePool, owner: &str, base_url: &str, plaintext: &st
     .unwrap();
 }
 
-/// Insert a rule with the given match-spec JSON and target_album_id. The
-/// `last_processed_asset_timestamp` starts NULL so the first cycle pulls
-/// everything Immich returns.
+/// Insert a rule with the given match-spec JSON and target_album_id. An empty
+/// `target_album_id` makes it managed-strategy (the engine find-or-creates the
+/// album); a non-empty one makes it existing-strategy.
 async fn seed_rule(
     pool: &SqlitePool,
     owner: &str,
@@ -108,52 +104,51 @@ async fn seed_rule(
     .unwrap();
 }
 
-/// Build the three-asset Immich search response we use in most tests.
-/// `a1` is a 2024 photo (matches), `a2` is a 2026 photo (matches),
-/// `a3` is a 2022 photo (out of range). All carry distinct `updatedAt`s.
-fn three_asset_search_response() -> serde_json::Value {
-    serde_json::json!({
-        "assets": {
-            "total": 3,
-            "count": 3,
-            "items": [
-                {
-                    "id": "a1",
-                    "type": "IMAGE",
-                    "fileCreatedAt": "2024-06-01T10:00:00.000Z",
-                    "updatedAt": "2026-01-15T10:00:00.000Z",
-                    "exifInfo": {
-                        "dateTimeOriginal": "2024-06-01T10:00:00.000Z"
-                    },
-                    "people": []
-                },
-                {
-                    "id": "a2",
-                    "type": "IMAGE",
-                    "fileCreatedAt": "2026-02-10T12:00:00.000Z",
-                    "updatedAt": "2026-02-15T11:00:00.000Z",
-                    "exifInfo": {
-                        "dateTimeOriginal": "2026-02-10T12:00:00.000Z"
-                    },
-                    "people": []
-                },
-                {
-                    "id": "a3",
-                    "type": "IMAGE",
-                    "fileCreatedAt": "2022-03-01T09:00:00.000Z",
-                    "updatedAt": "2026-01-10T09:00:00.000Z",
-                    "exifInfo": {
-                        "dateTimeOriginal": "2022-03-01T09:00:00.000Z"
-                    },
-                    "people": []
-                }
-            ],
-            "nextPage": null
-        }
-    })
+/// Seed one `asset_index` row for `owner`. `taken_at` is an RFC3339 string (or
+/// `None`); `people` are Immich person ids (faces) on the asset. The matching
+/// scan reads exactly these rows — no Immich `/search/metadata` call is made.
+#[allow(clippy::too_many_arguments)]
+async fn seed_index(
+    pool: &SqlitePool,
+    owner: &str,
+    asset_id: &str,
+    media_type: &str,
+    taken_at: Option<&str>,
+    lat: Option<f64>,
+    lng: Option<f64>,
+    people: &[&str],
+) {
+    let taken = taken_at.map(|s| {
+        DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&Utc)
+            .timestamp()
+    });
+    let person_ids = serde_json::to_string(people).unwrap();
+    let face_count = people.len() as i64;
+    sqlx::query(
+        "INSERT INTO asset_index \
+            (user_id, asset_id, filename, updated_at, taken_at, lat, lng, \
+             media_type, person_ids, face_count, indexed_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(owner)
+    .bind(asset_id)
+    .bind(format!("{asset_id}.jpg"))
+    .bind(0i64)
+    .bind(taken)
+    .bind(lat)
+    .bind(lng)
+    .bind(media_type)
+    .bind(person_ids)
+    .bind(face_count)
+    .bind(0i64)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
-/// MatchSpec JSON for "date.from = 2024-01-01" (matches a1 + a2, skips a3).
+/// MatchSpec JSON for "date.from = 2024-01-01".
 fn date_from_2024_match() -> &'static str {
     r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#
 }
@@ -162,16 +157,9 @@ fn date_from_2024_match() -> &'static str {
 async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
     let server = MockServer::start().await;
 
-    // Search endpoint returns three assets — owner_key header is required.
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(three_asset_search_response()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // Capture the PUT body so we can assert the exact ids sent.
+    // Capture the PUT body so we can assert the exact ids sent. There is no
+    // GET /api/albums/album-1 mock: an unmatched GET 404s, which the client
+    // reads as "empty album", so the diff adds both matched ids.
     let put_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
     let put_body_capture = put_body.clone();
     Mock::given(method("PUT"))
@@ -180,10 +168,7 @@ async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
         .respond_with(move |req: &Request| {
             let body: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            let pb = put_body_capture.clone();
-            // Synchronous capture into the Mutex (try_lock is fine — there's
-            // only one writer per test).
-            if let Ok(mut g) = pb.try_lock() {
+            if let Ok(mut g) = put_body_capture.try_lock() {
                 *g = Some(body);
             }
             ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
@@ -197,6 +182,41 @@ async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
 
+    // a1 (2024) + a2 (2026) match; a3 (2022) is out of range.
+    seed_index(
+        &pool,
+        &owner,
+        "a1",
+        "photo",
+        Some("2024-06-01T10:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "a2",
+        "photo",
+        Some("2026-02-10T12:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "a3",
+        "photo",
+        Some("2022-03-01T09:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
+
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
         .await
@@ -206,7 +226,6 @@ async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
     assert_eq!(outcome.added, 2, "a1 + a2 match the 2024+ date predicate");
     assert_eq!(outcome.skipped, 1, "a3 is out of range");
 
-    // Three decision rows with the right decision + reason.
     let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
         .await
         .unwrap();
@@ -222,7 +241,6 @@ async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
         ("skipped".to_string(), "date_out_of_range".to_string()),
     );
 
-    // rule_runs row finalised with the right counters and no error.
     let run = common::decisions::latest_run_for_rule(&pool, "r1")
         .await
         .unwrap()
@@ -233,87 +251,50 @@ async fn run_one_cycle_records_decisions_and_pushes_matched_to_album() {
     assert!(run.finished_at.is_some(), "run should be finalised");
     assert!(run.error_message.is_none(), "no error expected");
 
-    // Watermark advanced to the max updatedAt of the batch (a2 = 2026-02-15T11:00:00Z).
-    let row = sqlx::query!(
-        "SELECT last_processed_asset_timestamp, last_run_at FROM rules WHERE id = ?",
-        "r1"
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let expected = Utc
-        .with_ymd_and_hms(2026, 2, 15, 11, 0, 0)
-        .unwrap()
-        .timestamp();
-    assert_eq!(row.last_processed_asset_timestamp, Some(expected));
+    // last_run_at stamped; the matching path no longer touches the watermark.
+    let row = sqlx::query!("SELECT last_run_at FROM rules WHERE id = ?", "r1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(row.last_run_at.is_some());
 
-    // PUT body contained the two matched ids (order not asserted).
     let body = put_body
         .lock()
         .await
         .clone()
         .expect("PUT was supposed to fire once");
-    let ids: Vec<String> = body["ids"]
+    let mut ids: Vec<String> = body["ids"]
         .as_array()
         .unwrap()
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    let mut sorted = ids.clone();
-    sorted.sort();
-    assert_eq!(sorted, vec!["a1".to_string(), "a2".to_string()]);
+    ids.sort();
+    assert_eq!(ids, vec!["a1".to_string(), "a2".to_string()]);
+
+    // The two matched ids are recorded as the managed-membership baseline.
+    let baseline: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM album_managed_assets WHERE rule_id = ? AND state = 'added'",
+    )
+    .bind("r1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(baseline, 2);
 }
 
 #[tokio::test]
 async fn run_one_cycle_decision_reasons_track_predicates() {
-    // Build three assets that each fail a different predicate to confirm
-    // that the reason column is correctly attributed.
+    // Three assets each failing a different predicate confirms the reason
+    // column is correctly attributed.
     //
-    //   a1 — VIDEO   (fails media: photo-only)
-    //   a2 — PHOTO 2020 (fails date: from=2024)
+    //   a1 — VIDEO       (fails media: photo-only)
+    //   a2 — PHOTO 2020  (fails date: from=2024)
     //   a3 — PHOTO 2025 with foreign person id (fails people.must_exclude)
     //
-    // The rule's match spec ANDs media=photo, date>=2024, people.must_exclude=banned.
+    // The rule ANDs media=photo, date>=2024, people.must_exclude=banned.
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [
-                    {
-                        "id": "a1",
-                        "type": "VIDEO",
-                        "updatedAt": "2026-01-01T10:00:00Z",
-                        "people": []
-                    },
-                    {
-                        "id": "a2",
-                        "type": "IMAGE",
-                        "fileCreatedAt": "2020-06-01T10:00:00Z",
-                        "updatedAt": "2026-01-01T11:00:00Z",
-                        "exifInfo": {
-                            "dateTimeOriginal": "2020-06-01T10:00:00Z"
-                        },
-                        "people": []
-                    },
-                    {
-                        "id": "a3",
-                        "type": "IMAGE",
-                        "fileCreatedAt": "2025-06-01T10:00:00Z",
-                        "updatedAt": "2026-01-01T12:00:00Z",
-                        "exifInfo": {
-                            "dateTimeOriginal": "2025-06-01T10:00:00Z"
-                        },
-                        "people": [{"id": "banned"}]
-                    }
-                ],
-                "nextPage": null
-            }
-        })))
-        .mount(&server)
-        .await;
-    // No PUT expected — every asset is skipped.
+    // No PUT expected — every asset is skipped, so the album fill short-circuits.
     Mock::given(method("PUT"))
         .and(path("/api/albums/album-1/assets"))
         .respond_with(ResponseTemplate::new(500))
@@ -324,13 +305,46 @@ async fn run_one_cycle_decision_reasons_track_predicates() {
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
-    // Combined predicate: media=photo AND date>=2024 AND must_exclude=banned.
     let parsed = r#"{
         "media": {"types": ["photo"]},
         "date": {"from": "2024-01-01T00:00:00+00:00"},
         "people": {"must_exclude": ["banned"]}
     }"#;
     seed_rule(&pool, &owner, "r1", "album-1", parsed).await;
+
+    seed_index(
+        &pool,
+        &owner,
+        "a1",
+        "video",
+        Some("2026-01-01T10:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "a2",
+        "photo",
+        Some("2020-06-01T10:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "a3",
+        "photo",
+        Some("2025-06-01T10:00:00Z"),
+        None,
+        None,
+        &["banned"],
+    )
+    .await;
 
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
@@ -361,27 +375,30 @@ async fn run_one_cycle_decision_reasons_track_predicates() {
 
 #[tokio::test]
 async fn run_one_cycle_uses_owner_api_key_not_any_other() {
-    // Plant two encrypted keys: owner has OWNER_KEY, stranger has a
-    // different one. The rule belongs to owner. Every request to Immich
-    // must carry OWNER_KEY; if anything calls Immich with the stranger
-    // key, the matcher misses and the test fails because mocks are
-    // configured with `expect(1)` on OWNER_KEY only.
+    // The cycle must only ever talk to Immich with the rule owner's key. A
+    // matched asset triggers a GET + PUT on album-1; both are pinned to
+    // OWNER_KEY. Trap mocks on a stranger key are `.expect(0)` so any key bleed
+    // fails the test on MockServer drop.
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
+    Mock::given(method("GET"))
+        .and(path("/api/albums/album-1"))
         .and(header("x-api-key", OWNER_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {"items": [], "nextPage": null}
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"id": "album-1", "assets": []})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-1/assets"))
+        .and(header("x-api-key", OWNER_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
         .expect(1)
         .mount(&server)
         .await;
-    // A second matcher that *would* match if the wrong key leaked through.
-    // We assert `expect(0)` so the test fails noisily on key bleed.
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", "stranger-key"))
-        .respond_with(ResponseTemplate::new(200))
+    // Trap: anything carrying a foreign key must never fire.
+    Mock::given(header("x-api-key", "stranger-key"))
+        .respond_with(ResponseTemplate::new(500))
         .expect(0)
         .mount(&server)
         .await;
@@ -389,15 +406,25 @@ async fn run_one_cycle_uses_owner_api_key_not_any_other() {
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
-    // Don't seed the stranger as an immich_api_keys row — owner-scoped
-    // load_key must only consult the rule owner's row.
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+    seed_index(
+        &pool,
+        &owner,
+        "a1",
+        "photo",
+        Some("2026-01-01T10:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
 
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
         .await
         .unwrap();
-    assert_eq!(outcome.evaluated, 0);
+    assert_eq!(outcome.evaluated, 1);
+    assert_eq!(outcome.added, 1);
 }
 
 #[tokio::test]
@@ -421,10 +448,12 @@ async fn run_one_cycle_no_api_key_records_error_run() {
 }
 
 #[tokio::test]
-async fn run_one_cycle_immich_5xx_records_error_run_and_keeps_watermark() {
+async fn run_one_cycle_album_5xx_records_error_run() {
+    // A matched asset forces the album-fill diff to GET the album; a 5xx there
+    // aborts the cycle with the immich_unreachable slug and nothing recorded.
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
+    Mock::given(method("GET"))
+        .and(path("/api/albums/album-1"))
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
@@ -433,6 +462,17 @@ async fn run_one_cycle_immich_5xx_records_error_run_and_keeps_watermark() {
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+    seed_index(
+        &pool,
+        &owner,
+        "a1",
+        "photo",
+        Some("2026-01-01T10:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
 
     let mk = deterministic_key();
     let err = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
@@ -443,7 +483,6 @@ async fn run_one_cycle_immich_5xx_records_error_run_and_keeps_watermark() {
         .await
         .unwrap()
         .expect("a run row should exist even on error");
-    assert!(run.error_message.is_some());
     assert!(
         run.error_message
             .as_deref()
@@ -452,95 +491,18 @@ async fn run_one_cycle_immich_5xx_records_error_run_and_keeps_watermark() {
         "expected immich_unreachable slug, got {:?}",
         run.error_message,
     );
-    // Watermark must not have advanced on failure.
-    let row = sqlx::query!(
-        "SELECT last_processed_asset_timestamp FROM rules WHERE id = ?",
-        "r1"
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(row.last_processed_asset_timestamp.is_none());
 }
 
 #[tokio::test]
 async fn run_one_cycle_location_filter_matches_in_radius_and_skips_others() {
-    // M4-T2: end-to-end location predicate.
-    //
-    // Rule filter: Paris centroid (48.8566, 2.3522), 50 km radius. Four
-    // search-result assets exercise each location outcome:
+    // M4-T2: end-to-end location predicate against indexed rows.
     //
     //   asset-paris-1: at Paris    → in-radius  → added/matched
     //   asset-lyon:    ~391 km off → out of band → skipped/location_out_of_range
-    //   asset-no-gps:  no GPS exif → no GPS     → skipped/location_missing_gps
+    //   asset-no-gps:  no GPS      → skipped/location_missing_gps
     //   asset-paris-2: ~70 m off   → in-radius  → added/matched
-    //
-    // Assertions: 4 decision rows with the right (decision, reason) pair;
-    // rule_runs finalised with evaluated=4 added=2 skipped=2 and no error;
-    // PUT fires exactly once with the two matched ids (order-insensitive).
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [
-                    {
-                        "id": "asset-paris-1",
-                        "type": "IMAGE",
-                        "fileCreatedAt": "2026-01-01T10:00:00Z",
-                        "updatedAt": "2026-02-01T10:00:00Z",
-                        "exifInfo": {
-                            "dateTimeOriginal": "2026-01-01T10:00:00Z",
-                            "latitude": 48.8566,
-                            "longitude": 2.3522
-                        },
-                        "people": []
-                    },
-                    {
-                        "id": "asset-lyon",
-                        "type": "IMAGE",
-                        "fileCreatedAt": "2026-01-02T10:00:00Z",
-                        "updatedAt": "2026-02-02T10:00:00Z",
-                        "exifInfo": {
-                            "dateTimeOriginal": "2026-01-02T10:00:00Z",
-                            "latitude": 45.7640,
-                            "longitude": 4.8357
-                        },
-                        "people": []
-                    },
-                    {
-                        "id": "asset-no-gps",
-                        "type": "IMAGE",
-                        "fileCreatedAt": "2026-01-03T10:00:00Z",
-                        "updatedAt": "2026-02-03T10:00:00Z",
-                        "exifInfo": {
-                            "dateTimeOriginal": "2026-01-03T10:00:00Z"
-                        },
-                        "people": []
-                    },
-                    {
-                        "id": "asset-paris-2",
-                        "type": "IMAGE",
-                        "fileCreatedAt": "2026-01-04T10:00:00Z",
-                        "updatedAt": "2026-02-04T10:00:00Z",
-                        "exifInfo": {
-                            "dateTimeOriginal": "2026-01-04T10:00:00Z",
-                            "latitude": 48.8570,
-                            "longitude": 2.3530
-                        },
-                        "people": []
-                    }
-                ],
-                "nextPage": null
-            }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // Empty existing album — diff produces both matched ids.
     Mock::given(method("GET"))
         .and(path("/api/albums/album-loc"))
         .and(header("x-api-key", OWNER_KEY))
@@ -582,6 +544,51 @@ async fn run_one_cycle_location_filter_matches_in_radius_and_skips_others() {
     .unwrap();
     seed_rule(&pool, &owner, "r1", "album-loc", &predicates).await;
 
+    seed_index(
+        &pool,
+        &owner,
+        "asset-paris-1",
+        "photo",
+        Some("2026-01-01T10:00:00Z"),
+        Some(48.8566),
+        Some(2.3522),
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "asset-lyon",
+        "photo",
+        Some("2026-01-02T10:00:00Z"),
+        Some(45.7640),
+        Some(4.8357),
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "asset-no-gps",
+        "photo",
+        Some("2026-01-03T10:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "asset-paris-2",
+        "photo",
+        Some("2026-01-04T10:00:00Z"),
+        Some(48.8570),
+        Some(2.3530),
+        &[],
+    )
+    .await;
+
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
         .await
@@ -616,40 +623,29 @@ async fn run_one_cycle_location_filter_matches_in_radius_and_skips_others() {
         ("skipped".to_string(), "location_missing_gps".to_string()),
     );
 
-    let run = common::decisions::latest_run_for_rule(&pool, "r1")
-        .await
-        .unwrap()
-        .expect("a run row should exist");
-    assert_eq!(run.assets_evaluated, 4);
-    assert_eq!(run.assets_added, 2);
-    assert_eq!(run.assets_skipped, 2);
-    assert!(run.finished_at.is_some(), "run should be finalised");
-    assert!(run.error_message.is_none(), "no error expected");
-
     let body = put_body
         .lock()
         .await
         .clone()
         .expect("PUT was supposed to fire once");
-    let ids: Vec<String> = body["ids"]
+    let mut ids: Vec<String> = body["ids"]
         .as_array()
         .unwrap()
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    let mut sorted = ids.clone();
-    sorted.sort();
+    ids.sort();
     assert_eq!(
-        sorted,
+        ids,
         vec!["asset-paris-1".to_string(), "asset-paris-2".to_string()],
     );
 }
 
 // --- T13 surface: managed albums find-or-create ---
 
-/// Seed a managed-target rule. `name_in_column` mimics the post-T13 happy
-/// path (handler persists the name to the new column); pass `None` to
-/// emulate a pre-T13 row (engine falls back to parsing `yaml_source`).
+/// Seed a managed-target rule. `name_in_column` mimics the post-T13 happy path
+/// (handler persists the name to the new column); pass `None` to emulate a
+/// pre-T13 row (engine falls back to parsing `yaml_source`).
 async fn seed_managed_rule(
     pool: &SqlitePool,
     owner: &str,
@@ -707,8 +703,7 @@ async fn run_one_cycle_creates_managed_album_when_none_exists() {
         .respond_with(move |req: &Request| {
             let body: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            let cb = create_capture.clone();
-            if let Ok(mut g) = cb.try_lock() {
+            if let Ok(mut g) = create_capture.try_lock() {
                 *g = Some(body);
             }
             ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -723,21 +718,14 @@ async fn run_one_cycle_creates_managed_album_when_none_exists() {
         .mount(&server)
         .await;
 
-    // /api/search/metadata — one matching asset.
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
+    // GET the new album's asset ids (fill_album) → empty.
+    Mock::given(method("GET"))
+        .and(path("/api/albums/new-album-id"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [{
-                    "id": "asset-1",
-                    "type": "IMAGE",
-                    "fileCreatedAt": "2025-01-01T00:00:00Z",
-                    "updatedAt": "2025-01-01T00:00:00Z",
-                    "exifInfo": {"dateTimeOriginal": "2025-01-01T00:00:00Z"},
-                    "people": []
-                }],
-                "nextPage": null
-            }
+            "id": "new-album-id",
+            "ownerId": OWNER_IMMICH_UID,
+            "albumUsers": [],
+            "assets": []
         })))
         .mount(&server)
         .await;
@@ -750,25 +738,12 @@ async fn run_one_cycle_creates_managed_album_when_none_exists() {
         .respond_with(move |req: &Request| {
             let body: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            let pb = put_capture.clone();
-            if let Ok(mut g) = pb.try_lock() {
+            if let Ok(mut g) = put_capture.try_lock() {
                 *g = Some(body);
             }
             ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
         })
         .expect(1)
-        .mount(&server)
-        .await;
-
-    // GET the new album's asset ids (album_sync.get_album_asset_ids).
-    Mock::given(method("GET"))
-        .and(path("/api/albums/new-album-id"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "new-album-id",
-            "ownerId": OWNER_IMMICH_UID,
-            "albumUsers": [],
-            "assets": []
-        })))
         .mount(&server)
         .await;
 
@@ -785,6 +760,17 @@ async fn run_one_cycle_creates_managed_album_when_none_exists() {
         Some(MANAGED_NAME),
     )
     .await;
+    seed_index(
+        &pool,
+        &owner,
+        "asset-1",
+        "photo",
+        Some("2025-01-01T00:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
 
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "managed-r1")
@@ -794,7 +780,6 @@ async fn run_one_cycle_creates_managed_album_when_none_exists() {
     assert_eq!(outcome.evaluated, 1);
     assert_eq!(outcome.added, 1);
 
-    // Create body carried the expected name.
     let body = create_body
         .lock()
         .await
@@ -802,17 +787,15 @@ async fn run_one_cycle_creates_managed_album_when_none_exists() {
         .expect("POST /api/albums was supposed to fire");
     assert_eq!(body["albumName"], serde_json::json!(MANAGED_NAME));
 
-    // The rule row was patched with the new album id.
     let row = sqlx::query!(
         "SELECT target_album_id FROM rules WHERE id = ?",
-        "managed-r1",
+        "managed-r1"
     )
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(row.target_album_id, "new-album-id");
 
-    // PUT to the new album fired with the matched asset id.
     let put_body = put_body
         .lock()
         .await
@@ -849,14 +832,6 @@ async fn run_one_cycle_reuses_existing_managed_album_when_name_matches() {
         .mount(&server)
         .await;
 
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {"items": [], "nextPage": null}
-        })))
-        .mount(&server)
-        .await;
-
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
@@ -876,10 +851,9 @@ async fn run_one_cycle_reuses_existing_managed_album_when_name_matches() {
         .await
         .unwrap();
 
-    // Existing album id was persisted to the rule.
     let row = sqlx::query!(
         "SELECT target_album_id FROM rules WHERE id = ?",
-        "managed-r2",
+        "managed-r2"
     )
     .fetch_one(&pool)
     .await
@@ -890,8 +864,7 @@ async fn run_one_cycle_reuses_existing_managed_album_when_name_matches() {
 #[tokio::test]
 async fn run_one_cycle_resolves_managed_album_name_from_yaml_when_column_null() {
     // Back-compat for rows written before migration 0007: the
-    // `managed_album_name` column is NULL but the YAML source carries the
-    // name. The engine should parse it back.
+    // `managed_album_name` column is NULL but the YAML source carries the name.
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/albums"))
@@ -906,19 +879,11 @@ async fn run_one_cycle_resolves_managed_album_name_from_yaml_when_column_null() 
         )
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {"items": [], "nextPage": null}
-        })))
-        .mount(&server)
-        .await;
 
     let pool = fresh_pool().await;
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
     let parsed = r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#;
-    // managed_album_name = NULL — engine should fall back to yaml_source.
     seed_managed_rule(
         &pool,
         &owner,
@@ -936,7 +901,7 @@ async fn run_one_cycle_resolves_managed_album_name_from_yaml_when_column_null() 
 
     let row = sqlx::query!(
         "SELECT target_album_id FROM rules WHERE id = ?",
-        "legacy-r3",
+        "legacy-r3"
     )
     .fetch_one(&pool)
     .await
@@ -944,18 +909,15 @@ async fn run_one_cycle_resolves_managed_album_name_from_yaml_when_column_null() 
     assert_eq!(row.target_album_id, "legacy-album-id");
 }
 
-// --- T26 surface: managed-album backfill + record `added` only on PUT success ---
+// --- T29 surface: managed-album backfill from the full index + no phantom add ---
 
 #[tokio::test]
-async fn run_one_cycle_backfills_managed_album_when_first_bound() {
-    // POSTSHIP-T26 defect (ii): a managed rule whose album hadn't been minted
-    // yet may carry an advanced watermark from earlier no-op cycles (the
-    // empty-album bug). When the album is bound this cycle the watermark resets
-    // to NULL so the whole library is re-scanned and historical matches
-    // backfill into the freshly-created album.
+async fn run_one_cycle_managed_album_fills_full_indexed_library() {
+    // POSTSHIP-T29: matching scans the whole index, so a freshly-created managed
+    // album backfills ALL historical matches on its first pass — no watermark
+    // reset needed (the empty-managed-album bug is structurally gone).
     let server = MockServer::start().await;
 
-    // No album by that name yet → create it.
     Mock::given(method("GET"))
         .and(path("/api/albums"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
@@ -972,49 +934,6 @@ async fn run_one_cycle_backfills_managed_album_when_first_bound() {
         })))
         .mount(&server)
         .await;
-
-    // Capture the first search body to prove the scan ran with NO updatedAfter
-    // (i.e. the watermark was reset to NULL before listing).
-    let search_body = Arc::new(tokio::sync::Mutex::new(Option::<serde_json::Value>::None));
-    let search_capture = search_body.clone();
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .respond_with(move |req: &Request| {
-            let body: serde_json::Value =
-                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            if let Ok(mut g) = search_capture.try_lock() {
-                if g.is_none() {
-                    *g = Some(body);
-                }
-            }
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "assets": {
-                    "items": [
-                        {
-                            "id": "old-1",
-                            "type": "IMAGE",
-                            "fileCreatedAt": "2024-03-01T00:00:00Z",
-                            "updatedAt": "2024-03-02T00:00:00Z",
-                            "exifInfo": {"dateTimeOriginal": "2024-03-01T00:00:00Z"},
-                            "people": []
-                        },
-                        {
-                            "id": "old-2",
-                            "type": "IMAGE",
-                            "fileCreatedAt": "2024-04-01T00:00:00Z",
-                            "updatedAt": "2024-04-02T00:00:00Z",
-                            "exifInfo": {"dateTimeOriginal": "2024-04-01T00:00:00Z"},
-                            "people": []
-                        }
-                    ],
-                    "nextPage": null
-                }
-            }))
-        })
-        .mount(&server)
-        .await;
-
-    // The fresh album is empty.
     Mock::given(method("GET"))
         .and(path("/api/albums/backfill-album"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1055,14 +974,29 @@ async fn run_one_cycle_backfills_managed_album_when_first_bound() {
         Some(MANAGED_NAME),
     )
     .await;
-    // Simulate an advanced watermark from earlier no-op cycles (the bug state):
-    // far in the future so, without a reset, the scan would skip everything.
-    sqlx::query("UPDATE rules SET last_processed_asset_timestamp = ? WHERE id = ?")
-        .bind(5_000_000_000_i64)
-        .bind("backfill-r1")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Two historical matches already indexed.
+    seed_index(
+        &pool,
+        &owner,
+        "old-1",
+        "photo",
+        Some("2024-03-01T00:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
+    seed_index(
+        &pool,
+        &owner,
+        "old-2",
+        "photo",
+        Some("2024-04-01T00:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
 
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "backfill-r1")
@@ -1070,24 +1004,15 @@ async fn run_one_cycle_backfills_managed_album_when_first_bound() {
         .unwrap();
     assert_eq!(outcome.added, 2, "both historical matches backfilled");
 
-    // The scan ran with NO updatedAfter → the watermark had been reset to NULL.
-    let body = search_body.lock().await.clone().expect("search fired");
-    assert!(
-        body.get("updatedAfter").is_none(),
-        "watermark should reset to NULL before the backfill scan, got {body:?}",
-    );
-
-    // Album id persisted to the rule.
     let row = sqlx::query!(
         "SELECT target_album_id FROM rules WHERE id = ?",
-        "backfill-r1",
+        "backfill-r1"
     )
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(row.target_album_id, "backfill-album");
 
-    // PUT carried both matched ids.
     let put = put_body.lock().await.clone().expect("PUT fired");
     let mut ids: Vec<String> = put["ids"]
         .as_array()
@@ -1098,14 +1023,12 @@ async fn run_one_cycle_backfills_managed_album_when_first_bound() {
     ids.sort();
     assert_eq!(ids, vec!["old-1".to_string(), "old-2".to_string()]);
 
-    // Both recorded as `added`...
     let decisions = common::decisions::list_decisions_for_rule(&pool, "backfill-r1", 100, 0)
         .await
         .unwrap();
     assert_eq!(decisions.len(), 2);
     assert!(decisions.iter().all(|d| d.decision == "added"));
 
-    // ...and a baseline row landed in album_managed_assets for T29's diff.
     let managed: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM album_managed_assets WHERE rule_id = ? AND state = 'added'",
     )
@@ -1118,30 +1041,10 @@ async fn run_one_cycle_backfills_managed_album_when_first_bound() {
 
 #[tokio::test]
 async fn run_one_cycle_records_no_phantom_added_when_put_fails() {
-    // POSTSHIP-T26 defect (i): a failed album PUT must NOT leave a phantom
-    // `added` decision. The PUT runs before any decision is recorded, so its
-    // failure aborts the cycle with nothing committed and the watermark intact.
+    // POSTSHIP-T26 invariant (carried into T29): a failed album PUT must NOT
+    // leave a phantom `added` decision. The PUT runs before any decision is
+    // recorded, so its failure aborts the cycle with nothing committed.
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [
-                    {
-                        "id": "m1",
-                        "type": "IMAGE",
-                        "fileCreatedAt": "2025-01-01T00:00:00Z",
-                        "updatedAt": "2025-01-02T00:00:00Z",
-                        "exifInfo": {"dateTimeOriginal": "2025-01-01T00:00:00Z"},
-                        "people": []
-                    }
-                ],
-                "nextPage": null
-            }
-        })))
-        .mount(&server)
-        .await;
-    // Album is empty (diff = the one match), but the PUT 500s.
     Mock::given(method("GET"))
         .and(path("/api/albums/album-1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1161,6 +1064,17 @@ async fn run_one_cycle_records_no_phantom_added_when_put_fails() {
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
     seed_rule(&pool, &owner, "r1", "album-1", date_from_2024_match()).await;
+    seed_index(
+        &pool,
+        &owner,
+        "m1",
+        "photo",
+        Some("2025-01-01T00:00:00Z"),
+        None,
+        None,
+        &[],
+    )
+    .await;
 
     let mk = deterministic_key();
     let err = run_one_cycle(&pool, &mk, &std::env::temp_dir(), "r1")
@@ -1168,7 +1082,6 @@ async fn run_one_cycle_records_no_phantom_added_when_put_fails() {
         .unwrap_err();
     assert!(matches!(err, server::engine_cycle::CycleError::Immich(_)));
 
-    // No phantom decision rows.
     let decisions = common::decisions::list_decisions_for_rule(&pool, "r1", 100, 0)
         .await
         .unwrap();
@@ -1177,7 +1090,6 @@ async fn run_one_cycle_records_no_phantom_added_when_put_fails() {
         "no decision rows when the PUT failed, got {decisions:?}",
     );
 
-    // No album_managed_assets baseline either.
     let managed: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM album_managed_assets WHERE rule_id = ?")
             .bind("r1")
@@ -1186,17 +1098,6 @@ async fn run_one_cycle_records_no_phantom_added_when_put_fails() {
             .unwrap();
     assert_eq!(managed, 0);
 
-    // Watermark untouched so the next tick retries the same window.
-    let row = sqlx::query!(
-        "SELECT last_processed_asset_timestamp FROM rules WHERE id = ?",
-        "r1"
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(row.last_processed_asset_timestamp.is_none());
-
-    // Run finalised with the immich_unreachable error slug.
     let run = common::decisions::latest_run_for_rule(&pool, "r1")
         .await
         .unwrap()

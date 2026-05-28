@@ -1,43 +1,56 @@
-//! Per-rule poll cycle body (M3-T4).
+//! Per-rule poll cycle body (M3-T4 → POSTSHIP-T29).
 //!
-//! `run_one_cycle(pool, master_key, rule_id)` is the unit of work the scheduler
-//! invokes for every tick of every Active rule. The function is purposefully
-//! self-contained: it manages its own `rule_runs` row, decrypts the owner's
-//! Immich API key, builds a per-rule [`ImmichClient`] against the owner's
-//! stored `base_url`, lists newly-updated assets, evaluates each against the
-//! rule's predicate set, persists every verdict to `asset_decisions`, and
-//! finally pushes the matched ids into the configured target album.
+//! `run_one_cycle(pool, master_key, data_dir, rule_id)` is the unit of work the
+//! scheduler invokes for every tick of every Active rule. Since T29 it matches
+//! against the **local pre-processed index** (`asset_index`, populated by the
+//! background indexer — see [`crate::indexer`]) rather than fetching a
+//! fresh page of assets from Immich each tick. One cycle:
+//!
+//! 1. loads the rule + decrypts the owner's Immich key,
+//! 2. resolves (find-or-creates) the rule's target album,
+//! 3. scans the owner's **entire** `asset_index` and evaluates each row against
+//!    the rule's predicate tree (lazy YOLO on demand, §"YOLO"),
+//! 4. reconciles the match set against the live album ([`fill_album`]),
+//! 5. records every verdict to `asset_decisions`.
+//!
+//! ### Why a full-library scan (no per-rule watermark)
+//!
+//! The old model fetched `updatedAt > last_processed_asset_timestamp` and
+//! advanced that watermark after each tick. That made backfill fragile: when a
+//! managed album was minted late, or an old photo got a face tagged after the
+//! watermark passed it, the match was never re-filed (the empty-managed-album
+//! bug). Matching against the index every cycle removes the watermark from the
+//! matching path entirely, so a match can never be stranded behind it. The
+//! `rules.last_processed_asset_timestamp` column stays in the schema but the
+//! matching path no longer reads or writes it; the only remaining watermark is
+//! the indexer's per-user ingest watermark (`asset_index_state`).
 //!
 //! ### Per-account isolation
 //!
 //! The Immich client is constructed *inside* this function from the rule
-//! owner's stored key — there is no shared client. The required M3-T6
-//! cross-account test exists precisely to keep this property; never re-add a
-//! global client.
+//! owner's stored key — there is no shared client. The index scan filters
+//! `WHERE user_id = <rule owner>`, so a rule only ever sees its owner's assets.
+//! The required cross-account test keeps both properties.
 //!
-//! ### Ordering vs. crash recovery (POSTSHIP-T26)
+//! ### Album fill + manual removals (D3) / record-after-PUT (T26)
 //!
-//! The `PUT /api/albums/:id/assets` round trip happens **before** any matched
-//! asset is recorded as `added`. A matched asset only earns an `added`
-//! decision (and an `album_managed_assets` baseline row) once the PUT that
-//! files it into the album has actually succeeded. If the PUT fails the whole
-//! cycle errors out, the watermark stays put, nothing is recorded, and the
-//! next tick retries the same window — Immich's PUT is idempotent so the
-//! re-add is safe. This kills the phantom-`added` defect where a rule whose
-//! album did not yet exist recorded hundreds of `added` rows that never landed
-//! anywhere (the empty-managed-album bug).
+//! [`fill_album`] computes `to_add = matched − in_album − removed` via
+//! [`crate::album_sync::compute_album_plan`], PUTs the new ids, and only then
+//! records them `added` in `album_managed_assets`. An asset the rule filed that
+//! the operator later pulled out of the album is detected (`added` in our table
+//! but gone from the live album), recorded `removed`, and never re-added. The
+//! PUT runs **before** the decisions commit, so a failed PUT aborts the cycle
+//! with nothing recorded (no phantom `added`).
 //!
-//! The watermark + `last_run_at` write lands **after** the decisions commit.
-//! It advances only when every matched asset was filed: if a rule has no album
-//! to write to but matched assets, the watermark is held back so those matches
-//! re-evaluate (and backfill) once an album exists.
+//! ### YOLO
 //!
-//! ### Watermark choice
-//!
-//! Immich's `updatedAt` is the anchor (not `dateTimeOriginal`), because face
-//! data and EXIF can be re-derived after upload — bumping `updatedAt` is the
-//! signal that the asset is worth re-evaluating.
+//! Stays lazy + cached (locked decision D1). The index holds no YOLO data; when
+//! a rule's tree needs `yolo_person_count` for an asset that passed every
+//! cheaper predicate, [`resolve_yolo_count`] consults `asset_yolo_cache` and,
+//! on a miss, downloads the asset bytes and runs inference once, caching the
+//! count forever.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,17 +64,11 @@ use engine::predicate::{
     evaluate_expr, AssetSnapshot, AssetType, DecisionReason, PredicateOutcome,
 };
 use engine::rule::{parse_rule, MatchExpr, TargetAlbum};
-use immich_client::{ImmichAsset, ImmichAssetType, ImmichClient, ValidationError};
+use immich_client::{ImmichClient, ValidationError};
 use sqlx::SqlitePool;
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
-
-/// Per-tick bound: at most this many search pages (× 250 assets/page) are
-/// consumed before the cycle stops and lets the next tick continue. Keeps a
-/// backfill of a multi-tens-of-thousands-asset library from pinning one tick
-/// open. PRD §7: "bounded work per tick".
-const MAX_PAGES_PER_TICK: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum CycleError {
@@ -91,7 +98,7 @@ pub enum CycleError {
 
 impl CycleError {
     /// Slug stored in `rule_runs.error_message`. Stable contract for tests
-    /// and the future decisions UI.
+    /// and the decisions UI.
     fn slug(&self) -> String {
         match self {
             CycleError::RuleNotFound(_) => "rule_not_found".into(),
@@ -115,9 +122,6 @@ pub struct RunOutcome {
     pub evaluated: i64,
     pub added: i64,
     pub skipped: i64,
-    /// New `last_processed_asset_timestamp` value after the tick. Unix-seconds.
-    /// `None` when no assets were processed (don't move the watermark).
-    pub watermark: Option<i64>,
 }
 
 /// Owner-scoped data the cycle needs about the rule under evaluation.
@@ -128,7 +132,6 @@ struct LoadedRule {
     managed_album_name: Option<String>,
     yaml_source: String,
     parsed_predicates: String,
-    last_processed_asset_timestamp: Option<i64>,
 }
 
 /// Owner-scoped Immich credentials, decrypted.
@@ -138,16 +141,14 @@ struct ResolvedKey {
     immich_user_id: Option<String>,
 }
 
-/// Outcome of resolving a rule's target album for the current cycle.
-struct ResolvedAlbum {
-    /// Immich album id to write to. Empty when the rule has no album (a
-    /// malformed existing-strategy row); the cycle then records nothing and
-    /// holds its watermark.
-    album_id: String,
-    /// True when this cycle bound a previously-unset album to the rule and
-    /// reset its watermark to NULL — the caller must re-scan the whole library
-    /// this cycle to backfill historical matches (POSTSHIP-T26 defect ii).
-    watermark_was_reset: bool,
+/// One `asset_index` row, mapped into the engine's terms. The local equivalent
+/// of an `ImmichAsset` for the matching path — no Immich round trip needed.
+struct IndexedAsset {
+    asset_id: String,
+    asset_type: AssetType,
+    taken_at: Option<DateTime<Utc>>,
+    gps: Option<(f64, f64)>,
+    person_ids: Vec<String>,
 }
 
 /// Public entry: run one poll cycle for `rule_id`. Returns the run summary
@@ -215,39 +216,26 @@ async fn cycle_body(
     let match_expr: MatchExpr = serde_json::from_str(&rule.parsed_predicates)
         .map_err(|e| CycleError::BadParsedPredicates(e.to_string()))?;
 
-    // Resolve target album. For Existing-strategy rules `target_album_id` is
-    // already a real Immich id; for Managed-strategy rules an empty
+    // Resolve the target album. For Existing-strategy rules `target_album_id`
+    // is already a real Immich id; for Managed-strategy rules an empty
     // `target_album_id` means the album hasn't been minted yet, so we do
-    // find-or-create now and persist the resulting id back to the row. The
-    // first time an album is bound to a rule its watermark is reset to NULL
-    // (POSTSHIP-T26 defect ii) so this cycle re-scans the whole library and
-    // backfills matches decided before the album existed.
-    let resolved = resolve_target_album(pool, &client, &key, &rule, rule_id).await?;
-    let resolved_album_id = resolved.album_id;
-    let have_album = !resolved_album_id.is_empty();
+    // find-or-create now and persist the resulting id back to the row.
+    let album_id = resolve_target_album(pool, &client, &key, &rule, rule_id).await?;
+    let have_album = !album_id.is_empty();
 
-    let effective_since = if resolved.watermark_was_reset {
-        None
-    } else {
-        rule.last_processed_asset_timestamp
-    };
-    let assets = client
-        .list_assets(
-            &key.api_key,
-            effective_since.map(epoch_to_utc),
-            MAX_PAGES_PER_TICK,
-        )
-        .await
-        .map_err(immich_error)?;
+    // Full-library scan from the local index (T29). Every cycle evaluates the
+    // rule owner's entire indexed library — no per-rule watermark — which makes
+    // the managed-album backfill bug structurally impossible.
+    let assets = load_index_rows(pool, &rule.owner_user_id).await?;
 
-    // Pre-pass: evaluate every asset, dispatching to YOLO when (and only when)
-    // a `no_unidentified_humans` rule has all other predicates passing.
-    // Building the full `(asset, outcome)` set BEFORE the transaction lets the
-    // YOLO downloads + tempfile writes happen outside any held DB locks.
-    let mut decided: Vec<(&ImmichAsset, PredicateOutcome)> = Vec::with_capacity(assets.len());
-    for asset in &assets {
+    // Pre-pass: evaluate every indexed asset, dispatching to YOLO when (and
+    // only when) a `no_unidentified_humans` rule has all other predicates
+    // passing. Building the full `(asset, outcome)` set BEFORE the transaction
+    // lets the YOLO downloads + tempfile writes happen outside any held locks.
+    let mut decided: Vec<(IndexedAsset, PredicateOutcome)> = Vec::with_capacity(assets.len());
+    for asset in assets {
         let outcome =
-            decide_with_optional_yolo(pool, &client, &key.api_key, data_dir, &match_expr, asset)
+            decide_with_optional_yolo(pool, &client, &key.api_key, data_dir, &match_expr, &asset)
                 .await?;
         decided.push((asset, outcome));
     }
@@ -255,38 +243,38 @@ async fn cycle_body(
     let matched_ids: Vec<String> = decided
         .iter()
         .filter(|(_, o)| o.matched)
-        .map(|(a, _)| a.id.clone())
+        .map(|(a, _)| a.asset_id.clone())
         .collect();
 
-    // Defect (i): file the matches into the album BEFORE recording any `added`.
-    // A failed PUT (or a get_album failure) propagates as a cycle error here,
-    // so we never commit a phantom `added` for an asset that didn't land.
-    // `idempotent_album_add` is all-or-nothing: the whole diff succeeds or it
-    // returns Err. With no album we push nothing and record nothing below.
-    let pushed = if have_album {
-        crate::album_sync::idempotent_album_add(
+    // Album-fill diff (D3): respect manual removals, record `added` only after
+    // a successful PUT (T26 invariant). Runs BEFORE the decisions commit so a
+    // failed PUT aborts the cycle with nothing recorded.
+    let (filled, removed) = if have_album {
+        fill_album(
+            pool,
             &client,
             &key.api_key,
-            &resolved_album_id,
+            rule_id,
+            &album_id,
             &matched_ids,
         )
-        .await
-        .map_err(immich_error)?
+        .await?
     } else {
-        0
+        (0, 0)
     };
     tracing::debug!(
         rule_id,
-        candidates = matched_ids.len(),
-        pushed,
+        matched = matched_ids.len(),
+        filled,
+        removed,
         have_album,
-        "album sync diff applied",
+        "album fill diff applied",
     );
 
-    // Record decisions now that the PUT has landed. A matched asset earns an
-    // `added` row (and an `album_managed_assets` baseline) ONLY when the rule
-    // had an album; without one the match is left unrecorded so a later cycle
-    // backfills it. Skipped assets are always recorded.
+    // Record the rule verdict for every evaluated asset. matched → `added`,
+    // otherwise → `skipped`. `album_managed_assets` (written by fill_album) is
+    // the source of truth for actual album membership; `asset_decisions` is the
+    // rule's verdict for the decisions/activity UI (T32/T36).
     let mut evaluated: i64 = 0;
     let mut added: i64 = 0;
     let mut skipped: i64 = 0;
@@ -295,12 +283,6 @@ async fn cycle_body(
     let mut tx = pool.begin().await?;
     for (asset, outcome) in &decided {
         evaluated += 1;
-        let matched = outcome.matched;
-        if matched && !have_album {
-            // Nothing to file this into — leave it unrecorded; the watermark is
-            // held back below so it re-evaluates once an album exists.
-            continue;
-        }
         let (decision_str, reason_slug) = decision_columns(outcome);
         sqlx::query!(
             "INSERT INTO asset_decisions (rule_id, asset_id, decision, reason, run_id, decided_at) \
@@ -311,7 +293,7 @@ async fn cycle_body(
                  run_id = excluded.run_id, \
                  decided_at = excluded.decided_at",
             rule_id,
-            asset.id,
+            asset.asset_id,
             decision_str,
             reason_slug,
             run_id,
@@ -319,22 +301,7 @@ async fn cycle_body(
         )
         .execute(&mut *tx)
         .await?;
-        if matched {
-            // Baseline for T29's manual-removal diff: remember this rule filed
-            // this asset. Never clobber a `removed` verdict (set later by T29).
-            sqlx::query!(
-                "INSERT INTO album_managed_assets (rule_id, asset_id, state, changed_at) \
-                 VALUES (?, ?, 'added', ?) \
-                 ON CONFLICT(rule_id, asset_id) DO UPDATE SET \
-                     state = 'added', \
-                     changed_at = excluded.changed_at \
-                 WHERE album_managed_assets.state <> 'removed'",
-                rule_id,
-                asset.id,
-                decided_at,
-            )
-            .execute(&mut *tx)
-            .await?;
+        if outcome.matched {
             added += 1;
         } else {
             skipped += 1;
@@ -342,37 +309,146 @@ async fn cycle_body(
     }
     tx.commit().await?;
 
-    // Watermark advances past the whole window UNLESS a match was held back for
-    // lack of an album — then keep the prior watermark so it backfills later.
-    let hold_watermark = !have_album && !matched_ids.is_empty();
-    let watermark_epoch = if hold_watermark {
-        effective_since
-    } else {
-        let mut watermark: Option<DateTime<Utc>> = effective_since.map(epoch_to_utc);
-        for (asset, _) in &decided {
-            watermark = Some(match watermark {
-                Some(w) if w >= asset.updated_at => w,
-                _ => asset.updated_at,
-            });
-        }
-        watermark.map(|w| w.timestamp())
-    };
-    update_watermark_and_last_run(pool, rule_id, watermark_epoch, now_unix_seconds()).await?;
+    update_last_run(pool, rule_id, now_unix_seconds()).await?;
 
     Ok(RunOutcome {
         run_id: run_id.to_string(),
         evaluated,
         added,
         skipped,
-        watermark: watermark_epoch,
     })
+}
+
+/// Reconcile the rule's match set against its live album (POSTSHIP-T29, D3).
+///
+/// Returns `(filled, removed)` — how many ids were PUT and how many operator
+/// removals were detected. Short-circuits with no Immich call when the rule
+/// matched nothing AND has never filed anything (nothing to add, nothing that
+/// could have been removed).
+///
+/// Records `added` rows only after the PUT succeeds (the T26 invariant): the
+/// `add_assets_to_album` PUT is awaited before the `album_managed_assets`
+/// transaction, so a failed PUT propagates as a cycle error with no membership
+/// rows written.
+async fn fill_album(
+    pool: &SqlitePool,
+    client: &ImmichClient,
+    api_key: &str,
+    rule_id: &str,
+    album_id: &str,
+    matched_ids: &[String],
+) -> Result<(usize, usize), CycleError> {
+    let prior_added = load_managed_assets(pool, rule_id, "added").await?;
+    let removed_set = load_managed_assets(pool, rule_id, "removed").await?;
+
+    if matched_ids.is_empty() && prior_added.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let in_album = client
+        .get_album_asset_ids(api_key, album_id)
+        .await
+        .map_err(immich_error)?;
+    let plan =
+        crate::album_sync::compute_album_plan(matched_ids, &in_album, &prior_added, &removed_set);
+
+    if !plan.to_add.is_empty() {
+        client
+            .add_assets_to_album(api_key, album_id, &plan.to_add)
+            .await
+            .map_err(immich_error)?;
+    }
+
+    // Persist membership only after the PUT landed.
+    let changed_at = now_unix_seconds();
+    let mut tx = pool.begin().await?;
+    for id in &plan.newly_removed {
+        sqlx::query!(
+            "INSERT INTO album_managed_assets (rule_id, asset_id, state, changed_at) \
+             VALUES (?, ?, 'removed', ?) \
+             ON CONFLICT(rule_id, asset_id) DO UPDATE SET \
+                 state = 'removed', \
+                 changed_at = excluded.changed_at",
+            rule_id,
+            id,
+            changed_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    for id in &plan.added_baseline {
+        // DO NOTHING never clobbers a `removed` verdict and never churns an
+        // existing `added` row's changed_at.
+        sqlx::query!(
+            "INSERT INTO album_managed_assets (rule_id, asset_id, state, changed_at) \
+             VALUES (?, ?, 'added', ?) \
+             ON CONFLICT(rule_id, asset_id) DO NOTHING",
+            rule_id,
+            id,
+            changed_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok((plan.to_add.len(), plan.newly_removed.len()))
+}
+
+async fn load_managed_assets(
+    pool: &SqlitePool,
+    rule_id: &str,
+    state: &str,
+) -> Result<HashSet<String>, CycleError> {
+    let rows = sqlx::query!(
+        "SELECT asset_id FROM album_managed_assets WHERE rule_id = ? AND state = ?",
+        rule_id,
+        state,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.asset_id).collect())
+}
+
+/// Load the rule owner's entire indexed library. The matching scan reads every
+/// row (no watermark window); per-account isolation holds because the filter is
+/// `WHERE user_id = <owner>`.
+async fn load_index_rows(
+    pool: &SqlitePool,
+    owner_user_id: &str,
+) -> Result<Vec<IndexedAsset>, CycleError> {
+    let rows = sqlx::query!(
+        "SELECT asset_id, taken_at, lat, lng, media_type, person_ids \
+         FROM asset_index WHERE user_id = ?",
+        owner_user_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            // person_ids is JSON written by the indexer; a corrupt value
+            // degrades to "no faces" rather than failing the whole cycle.
+            let person_ids: Vec<String> = serde_json::from_str(&r.person_ids).unwrap_or_default();
+            let gps = match (r.lat, r.lng) {
+                (Some(lat), Some(lng)) => Some((lat, lng)),
+                _ => None,
+            };
+            IndexedAsset {
+                asset_id: r.asset_id,
+                asset_type: asset_type_from_media(&r.media_type),
+                taken_at: r.taken_at.map(epoch_to_utc),
+                gps,
+                person_ids,
+            }
+        })
+        .collect())
 }
 
 async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, CycleError> {
     let row = sqlx::query!(
         "SELECT owner_user_id, target_album_id, target_album_strategy, \
-                managed_album_name, yaml_source, parsed_predicates, \
-                last_processed_asset_timestamp \
+                managed_album_name, yaml_source, parsed_predicates \
          FROM rules WHERE id = ?",
         rule_id,
     )
@@ -386,7 +462,6 @@ async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, Cycle
         managed_album_name: row.managed_album_name,
         yaml_source: row.yaml_source,
         parsed_predicates: row.parsed_predicates,
-        last_processed_asset_timestamp: row.last_processed_asset_timestamp,
     })
 }
 
@@ -420,47 +495,41 @@ fn build_client(base_url: &str) -> Result<ImmichClient, CycleError> {
 }
 
 /// Resolve the rule's Immich target album, creating it on first cycle when the
-/// rule is managed-target and no album has been minted yet.
+/// rule is managed-target and no album has been minted yet. Returns the album
+/// id, or an empty string when the rule has no album to write to (a malformed
+/// existing-strategy row).
 ///
 /// Three paths:
-/// * `target_album_id` is non-empty — existing rule or already-resolved
-///   managed rule. Return the id as-is (`watermark_was_reset = false`).
-/// * `target_album_id` empty + strategy `managed` — find the operator's
-///   first writable album matching `name`. If none exists, `POST /api/albums`
-///   creates one. The new id is persisted back to `rules.target_album_id`
-///   AND the rule's watermark is reset to NULL so this cycle backfills the
-///   freshly-bound album (`watermark_was_reset = true`).
-/// * `target_album_id` empty + strategy `existing` — malformed row (the
-///   handler refuses to write that combination). Treated as "no album to
-///   write to": return the empty string so the album push stays a no-op.
+/// * `target_album_id` non-empty — existing rule or already-resolved managed
+///   rule. Return the id as-is.
+/// * `target_album_id` empty + strategy `managed` — find the operator's first
+///   writable album matching `name`; if none exists, `POST /api/albums` creates
+///   one. The resulting id is persisted back to `rules.target_album_id`. No
+///   watermark reset is needed (T29): the next scan is the whole library
+///   anyway, so a freshly-bound album backfills on the very first pass.
+/// * `target_album_id` empty + strategy `existing` — malformed row. Return the
+///   empty string so the album fill stays a no-op.
 async fn resolve_target_album(
     pool: &SqlitePool,
     client: &ImmichClient,
     key: &ResolvedKey,
     rule: &LoadedRule,
     rule_id: &str,
-) -> Result<ResolvedAlbum, CycleError> {
+) -> Result<String, CycleError> {
     if !rule.target_album_id.is_empty() {
-        return Ok(ResolvedAlbum {
-            album_id: rule.target_album_id.clone(),
-            watermark_was_reset: false,
-        });
+        return Ok(rule.target_album_id.clone());
     }
     if rule.target_album_strategy != "managed" {
-        return Ok(ResolvedAlbum {
-            album_id: String::new(),
-            watermark_was_reset: false,
-        });
+        return Ok(String::new());
     }
     let name = resolve_managed_name(rule)
         .ok_or_else(|| CycleError::ManagedAlbumNameMissing(rule_id.to_string()))?;
 
-    // Caller's Immich user id is needed by `list_albums` to derive
-    // writability. If it's missing (key not validated yet) we still go
-    // through `list_albums` with an empty string — owner_id won't match, no
-    // album will be flagged writable, and we'll fall through to create.
-    // After create, the new album is owned by the caller so subsequent
-    // cycles can find it even without `immich_user_id` populated.
+    // Caller's Immich user id is needed by `list_albums` to derive writability.
+    // If it's missing (key not validated yet) we still go through `list_albums`
+    // with an empty string — owner_id won't match, no album will be flagged
+    // writable, and we'll fall through to create. After create, the new album
+    // is owned by the caller so subsequent cycles find it.
     let caller_id = key.immich_user_id.as_deref().unwrap_or("");
     let albums = client
         .list_albums(&key.api_key, caller_id)
@@ -483,11 +552,8 @@ async fn resolve_target_album(
         }
     };
 
-    // Bind the album AND reset the watermark in one write: this is the first
-    // time the rule has an album, so any matches decided earlier (while the
-    // push was a no-op) must be re-evaluated and backfilled this cycle.
     sqlx::query!(
-        "UPDATE rules SET target_album_id = ?, last_processed_asset_timestamp = NULL WHERE id = ?",
+        "UPDATE rules SET target_album_id = ? WHERE id = ?",
         resolved_id,
         rule_id,
     )
@@ -497,12 +563,9 @@ async fn resolve_target_album(
         rule_id,
         album_id = %resolved_id,
         album_name = %name,
-        "managed target album resolved; watermark reset for backfill",
+        "managed target album resolved",
     );
-    Ok(ResolvedAlbum {
-        album_id: resolved_id,
-        watermark_was_reset: true,
-    })
+    Ok(resolved_id)
 }
 
 /// Recover the managed-album name from a [`LoadedRule`]. Prefers the
@@ -522,52 +585,38 @@ fn resolve_managed_name(rule: &LoadedRule) -> Option<String> {
     }
 }
 
-async fn update_watermark_and_last_run(
+async fn update_last_run(
     pool: &SqlitePool,
     rule_id: &str,
-    watermark: Option<i64>,
     last_run_at: i64,
 ) -> Result<(), CycleError> {
-    if let Some(wm) = watermark {
-        sqlx::query!(
-            "UPDATE rules SET last_processed_asset_timestamp = ?, last_run_at = ? WHERE id = ?",
-            wm,
-            last_run_at,
-            rule_id,
-        )
-        .execute(pool)
-        .await?;
-    } else {
-        sqlx::query!(
-            "UPDATE rules SET last_run_at = ? WHERE id = ?",
-            last_run_at,
-            rule_id,
-        )
-        .execute(pool)
-        .await?;
-    }
+    sqlx::query!(
+        "UPDATE rules SET last_run_at = ? WHERE id = ?",
+        last_run_at,
+        rule_id,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Evaluate a single asset against `match_expr`, lazily falling back to YOLO
-/// inference when (and only when) the cheaper predicates passed and the rule
-/// has a YOLO-dependent leaf left to decide.
+/// Evaluate a single indexed asset against `match_expr`, lazily falling back to
+/// YOLO inference when (and only when) the cheaper predicates passed and the
+/// rule has a YOLO-dependent leaf left to decide.
 ///
-/// Returns the final outcome — the caller persists it as-is. Implements the
-/// pay-zero rule for non-YOLO rules: if the tree doesn't require YOLO, this
-/// function performs a single [`evaluate_expr`] call and returns. The two-pass
-/// path runs only when the first evaluation returns
-/// [`DecisionReason::YoloUnimplemented`], meaning the tree walker exhausted
-/// every cheap branch without deciding and a YOLO sibling is still pending.
+/// Implements the pay-zero rule for non-YOLO rules: if the tree doesn't require
+/// YOLO, this performs a single [`evaluate_expr`] call and returns. The
+/// two-pass path runs only when the first evaluation returns
+/// [`DecisionReason::YoloUnimplemented`].
 async fn decide_with_optional_yolo(
     pool: &SqlitePool,
     client: &ImmichClient,
     api_key: &str,
     data_dir: &Path,
     match_expr: &MatchExpr,
-    asset: &ImmichAsset,
+    asset: &IndexedAsset,
 ) -> Result<PredicateOutcome, CycleError> {
-    let snapshot = snapshot_from_immich(asset);
+    let snapshot = snapshot_from_index(asset);
     let outcome = evaluate_expr(match_expr, &snapshot);
     if !match_expr.requires_yolo() {
         return Ok(outcome);
@@ -575,7 +624,15 @@ async fn decide_with_optional_yolo(
     if outcome.reason != DecisionReason::YoloUnimplemented {
         return Ok(outcome);
     }
-    let yolo_count = resolve_yolo_count(pool, client, api_key, data_dir, asset).await?;
+    let yolo_count = resolve_yolo_count(
+        pool,
+        client,
+        api_key,
+        data_dir,
+        &asset.asset_id,
+        asset.asset_type,
+    )
+    .await?;
     let mut snapshot = snapshot;
     snapshot.yolo_person_count = Some(yolo_count);
     Ok(evaluate_expr(match_expr, &snapshot))
@@ -590,16 +647,16 @@ async fn resolve_yolo_count(
     client: &ImmichClient,
     api_key: &str,
     data_dir: &Path,
-    asset: &ImmichAsset,
+    asset_id: &str,
+    asset_type: AssetType,
 ) -> Result<u32, CycleError> {
-    if let Some(cached) = yolo_cache::get_count(pool, &asset.id, yolo::MODEL_VERSION).await? {
+    if let Some(cached) = yolo_cache::get_count(pool, asset_id, yolo::MODEL_VERSION).await? {
         return Ok(cached);
     }
-    let asset_type = map_asset_type(asset.asset_type);
-    let count = run_yolo_for_asset(client, api_key, data_dir, &asset.id, asset_type).await?;
+    let count = run_yolo_for_asset(client, api_key, data_dir, asset_id, asset_type).await?;
     yolo_cache::upsert_count(
         pool,
-        &asset.id,
+        asset_id,
         count,
         yolo::MODEL_VERSION,
         now_unix_seconds(),
@@ -656,42 +713,27 @@ fn write_tempfile(bytes: &[u8], suffix: &str) -> Result<tempfile::NamedTempFile,
     Ok(tmp)
 }
 
-fn map_asset_type(t: ImmichAssetType) -> AssetType {
-    match t {
-        ImmichAssetType::Image => AssetType::Photo,
-        ImmichAssetType::Video => AssetType::Video,
-        // Unknown Immich types are treated as Photo for YOLO dispatch.
-        // The predicate stack already mapped them the same way; the
-        // thumbnail endpoint is safer than `original` for "we don't know
-        // what this is".
-        ImmichAssetType::Other => AssetType::Photo,
+/// Map the `asset_index.media_type` text domain (`photo` | `video` | `other`)
+/// back onto the engine's [`AssetType`]. `other` maps to `Photo`, matching the
+/// old `snapshot_from_immich` behavior so an unknown Immich kind is handled the
+/// conservative way (the thumbnail endpoint is safer than `original`).
+fn asset_type_from_media(media_type: &str) -> AssetType {
+    match media_type {
+        "video" => AssetType::Video,
+        _ => AssetType::Photo,
     }
 }
 
-/// Pure mapper from Immich's asset shape to the engine's snapshot. Lives here
-/// (server crate) rather than in `engine` so the `engine` crate stays free of
-/// any `immich-client` dependency — the engine deals in `AssetSnapshot`,
-/// nothing else.
-fn snapshot_from_immich(asset: &ImmichAsset) -> AssetSnapshot {
-    let asset_type = match asset.asset_type {
-        ImmichAssetType::Image => AssetType::Photo,
-        ImmichAssetType::Video => AssetType::Video,
-        // Unknown Immich types are treated as Photo for predicate dispatch.
-        // `media` predicates that filter on a specific type will skip them
-        // with `MediaTypeMismatch`, which is the conservative outcome.
-        ImmichAssetType::Other => AssetType::Photo,
-    };
-    let taken_at = asset.exif_date_time_original.or(asset.file_created_at);
-    let gps = match (asset.latitude, asset.longitude) {
-        (Some(lat), Some(lon)) => Some((lat, lon)),
-        _ => None,
-    };
+/// Pure mapper from an `asset_index` row to the engine's snapshot. Lives here
+/// (server crate) so the `engine` crate stays free of any storage concerns —
+/// the engine deals in `AssetSnapshot`, nothing else.
+fn snapshot_from_index(asset: &IndexedAsset) -> AssetSnapshot {
     AssetSnapshot {
-        id: asset.id.clone(),
-        asset_type,
-        taken_at,
-        gps,
-        face_person_ids: asset.people_ids.clone(),
+        id: asset.asset_id.clone(),
+        asset_type: asset.asset_type,
+        taken_at: asset.taken_at,
+        gps: asset.gps,
+        face_person_ids: asset.person_ids.clone(),
         yolo_person_count: None,
     }
 }
@@ -710,7 +752,7 @@ fn immich_error(err: ValidationError) -> CycleError {
 
 fn epoch_to_utc(epoch: i64) -> DateTime<Utc> {
     // Clamp negative or pre-epoch values to the epoch itself; Immich timestamps
-    // are post-2010 and the DB column is always populated by us, so this
+    // are post-2010 and the index column is always populated by us, so this
     // fallback is purely defensive.
     Utc.timestamp_opt(epoch, 0).single().unwrap_or_else(|| {
         Utc.timestamp_opt(0, 0)
@@ -784,67 +826,47 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_from_immich_maps_fields() {
+    fn asset_type_from_media_maps_domain() {
+        assert_eq!(asset_type_from_media("photo"), AssetType::Photo);
+        assert_eq!(asset_type_from_media("video"), AssetType::Video);
+        // Unknown / "other" is treated as a photo (conservative dispatch).
+        assert_eq!(asset_type_from_media("other"), AssetType::Photo);
+        assert_eq!(asset_type_from_media("whatever"), AssetType::Photo);
+    }
+
+    #[test]
+    fn snapshot_from_index_maps_fields() {
         use chrono::TimeZone;
-        let updated = Utc.with_ymd_and_hms(2025, 6, 1, 10, 0, 0).unwrap();
-        let exif = Utc.with_ymd_and_hms(2025, 6, 1, 9, 0, 0).unwrap();
-        let asset = ImmichAsset {
-            id: "a1".into(),
-            filename: "IMG_0001.jpg".into(),
-            asset_type: ImmichAssetType::Video,
-            file_created_at: None,
-            exif_date_time_original: Some(exif),
-            latitude: Some(48.0),
-            longitude: Some(2.0),
-            people_ids: vec!["p1".into()],
-            updated_at: updated,
+        let taken = Utc.with_ymd_and_hms(2025, 6, 1, 9, 0, 0).unwrap();
+        let asset = IndexedAsset {
+            asset_id: "a1".into(),
+            asset_type: AssetType::Video,
+            taken_at: Some(taken),
+            gps: Some((48.0, 2.0)),
+            person_ids: vec!["p1".into()],
         };
-        let snap = snapshot_from_immich(&asset);
+        let snap = snapshot_from_index(&asset);
         assert_eq!(snap.id, "a1");
         assert_eq!(snap.asset_type, AssetType::Video);
-        assert_eq!(snap.taken_at, Some(exif));
+        assert_eq!(snap.taken_at, Some(taken));
         assert_eq!(snap.gps, Some((48.0, 2.0)));
         assert_eq!(snap.face_person_ids, vec!["p1".to_string()]);
         assert!(snap.yolo_person_count.is_none());
     }
 
     #[test]
-    fn snapshot_falls_back_to_file_created_at_when_exif_missing() {
-        use chrono::TimeZone;
-        let updated = Utc.with_ymd_and_hms(2025, 6, 1, 10, 0, 0).unwrap();
-        let file_created = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let asset = ImmichAsset {
-            id: "a1".into(),
-            filename: "IMG_0001.jpg".into(),
-            asset_type: ImmichAssetType::Image,
-            file_created_at: Some(file_created),
-            exif_date_time_original: None,
-            latitude: None,
-            longitude: None,
-            people_ids: vec![],
-            updated_at: updated,
+    fn snapshot_from_index_without_gps_or_faces() {
+        let asset = IndexedAsset {
+            asset_id: "a2".into(),
+            asset_type: AssetType::Photo,
+            taken_at: None,
+            gps: None,
+            person_ids: vec![],
         };
-        let snap = snapshot_from_immich(&asset);
-        assert_eq!(snap.taken_at, Some(file_created));
+        let snap = snapshot_from_index(&asset);
         assert!(snap.gps.is_none());
-    }
-
-    #[test]
-    fn snapshot_other_immich_type_is_photo() {
-        use chrono::TimeZone;
-        let asset = ImmichAsset {
-            id: "a1".into(),
-            filename: "IMG_0001.jpg".into(),
-            asset_type: ImmichAssetType::Other,
-            file_created_at: None,
-            exif_date_time_original: None,
-            latitude: None,
-            longitude: None,
-            people_ids: vec![],
-            updated_at: Utc.timestamp_opt(0, 0).single().unwrap(),
-        };
-        let snap = snapshot_from_immich(&asset);
-        assert_eq!(snap.asset_type, AssetType::Photo);
+        assert!(snap.taken_at.is_none());
+        assert!(snap.face_person_ids.is_empty());
     }
 
     #[test]

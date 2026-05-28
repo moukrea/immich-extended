@@ -22,6 +22,7 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use common::crypto::MasterKey;
 use common::db;
 use server::admin::create_user;
@@ -134,27 +135,27 @@ fn read_fixture(name: &str) -> Vec<u8> {
     std::fs::read(server_fixtures_dir().join(name)).expect("read fixture")
 }
 
-/// Build the single-asset search response used by the YOLO tests. The asset
-/// is a photo with one face id, so a `no_unidentified_humans` rule will pass
-/// the cheap predicates and proceed to YOLO.
-fn single_photo_with_one_face(asset_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "assets": {
-            "items": [
-                {
-                    "id": asset_id,
-                    "type": "IMAGE",
-                    "fileCreatedAt": "2026-01-01T10:00:00Z",
-                    "updatedAt": "2026-02-01T10:00:00Z",
-                    "exifInfo": {
-                        "dateTimeOriginal": "2026-01-01T10:00:00Z"
-                    },
-                    "people": [{"id": "alice-face-id"}]
-                }
-            ],
-            "nextPage": null
-        }
-    })
+/// Seed one indexed photo (taken 2026) with one identified face, so a
+/// `no_unidentified_humans` rule passes the cheap predicates and proceeds to
+/// YOLO. The matching scan reads this row — no Immich `/search/metadata` call.
+async fn seed_index_one_face_photo(pool: &SqlitePool, owner: &str, asset_id: &str) {
+    let taken = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc)
+        .timestamp();
+    sqlx::query(
+        "INSERT INTO asset_index \
+            (user_id, asset_id, filename, updated_at, taken_at, lat, lng, \
+             media_type, person_ids, face_count, indexed_at) \
+         VALUES (?, ?, ?, 0, ?, NULL, NULL, 'photo', '[\"alice-face-id\"]', 1, 0)",
+    )
+    .bind(owner)
+    .bind(asset_id)
+    .bind(format!("{asset_id}.jpg"))
+    .bind(taken)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn no_unidentified_humans_match_spec() -> &'static str {
@@ -172,14 +173,6 @@ async fn no_unidentified_humans_matches_when_yolo_equals_face_count() {
         return;
     };
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(single_photo_with_one_face("a1")))
-        .expect(1)
-        .mount(&server)
-        .await;
 
     Mock::given(method("GET"))
         .and(path("/api/assets/a1/thumbnail"))
@@ -217,6 +210,7 @@ async fn no_unidentified_humans_matches_when_yolo_equals_face_count() {
         no_unidentified_humans_match_spec(),
     )
     .await;
+    seed_index_one_face_photo(&pool, &owner, "a1").await;
 
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &data_dir, "r1").await.unwrap();
@@ -247,14 +241,6 @@ async fn no_unidentified_humans_skips_when_yolo_exceeds_face_count() {
     };
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", OWNER_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(single_photo_with_one_face("a2")))
-        .expect(1)
-        .mount(&server)
-        .await;
-
     // two_persons.jpg → YOLO reports 2, but only 1 face is identified.
     Mock::given(method("GET"))
         .and(path("/api/assets/a2/thumbnail"))
@@ -283,6 +269,7 @@ async fn no_unidentified_humans_skips_when_yolo_exceeds_face_count() {
         no_unidentified_humans_match_spec(),
     )
     .await;
+    seed_index_one_face_photo(&pool, &owner, "a2").await;
 
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &data_dir, "r1").await.unwrap();
@@ -312,13 +299,6 @@ async fn cache_hit_skips_thumbnail_download() {
     // fires.
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../yolo/tests/fixtures");
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(single_photo_with_one_face("a3")))
-        .expect(1)
-        .mount(&server)
-        .await;
 
     Mock::given(method("GET"))
         .and(path("/api/assets/a3/thumbnail"))
@@ -353,6 +333,7 @@ async fn cache_hit_skips_thumbnail_download() {
         no_unidentified_humans_match_spec(),
     )
     .await;
+    seed_index_one_face_photo(&pool, &owner, "a3").await;
 
     // Pre-populate the cache with count=1 for the current model_version.
     common::yolo_cache::upsert_count(&pool, "a3", 1, yolo::MODEL_VERSION, 1_700_000_000)
@@ -382,13 +363,6 @@ async fn non_yolo_rule_never_downloads_thumbnail() {
     // mock server fails the test on drop if anything fires it.
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../yolo/tests/fixtures");
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(single_photo_with_one_face("a4")))
-        .expect(1)
-        .mount(&server)
-        .await;
 
     // Thumbnail / original endpoints MUST NOT be called.
     Mock::given(method("GET"))
@@ -423,6 +397,7 @@ async fn non_yolo_rule_never_downloads_thumbnail() {
     let owner = seed_user(&pool, "alice@example.test", "Alice").await;
     seed_key(&pool, &owner, &server.uri(), OWNER_KEY).await;
     seed_rule(&pool, &owner, "r1", "album-date", date_only_match_spec()).await;
+    seed_index_one_face_photo(&pool, &owner, "a4").await;
 
     let mk = deterministic_key();
     let outcome = run_one_cycle(&pool, &mk, &data_dir, "r1").await.unwrap();

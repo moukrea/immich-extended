@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT owner_user_id, target_album_id, target_album_strategy, managed_album_name, yaml_source, parsed_predicates, last_processed_asset_timestamp FROM rules WHERE id = ?",
+  "query": "SELECT owner_user_id, target_album_id, target_album_strategy, managed_album_name, yaml_source, parsed_predicates FROM rules WHERE id = ?",
   "describe": {
     "columns": [
       {
@@ -32,11 +32,6 @@
         "name": "parsed_predicates",
         "ordinal": 5,
         "type_info": "Text"
-      },
-      {
-        "name": "last_processed_asset_timestamp",
-        "ordinal": 6,
-        "type_info": "Integer"
       }
     ],
     "parameters": {
@@ -48,9 +43,8 @@
       false,
       true,
       false,
-      false,
-      true
+      false
     ]
   },
-  "hash": "3bf7df34be3822fb5317a1df6bf6f8ca6ac7d1fe4d0bbcbad26c0045933a7580"
+  "hash": "9e508158d0ffb7cd3323f7cc71264358c6e1781b0cc1c15f4f545bdcfa7a907a"
 }

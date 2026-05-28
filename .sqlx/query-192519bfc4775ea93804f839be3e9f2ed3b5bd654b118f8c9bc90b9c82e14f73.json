@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO album_managed_assets (rule_id, asset_id, state, changed_at) VALUES (?, ?, 'added', ?) ON CONFLICT(rule_id, asset_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "192519bfc4775ea93804f839be3e9f2ed3b5bd654b118f8c9bc90b9c82e14f73"
+}

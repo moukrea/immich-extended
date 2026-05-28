@@ -1,40 +1,32 @@
-//! Cross-account isolation for the engine poll cycle (M3-T6).
+//! Cross-account isolation for the engine poll cycle (M3-T6 → POSTSHIP-T29).
 //!
-//! Required by PRD §4 P3 + MILESTONES.md §M3. Two users A and B each own
-//! their own encrypted Immich API key, both pointing at the same wiremock
-//! Immich server. Each user has one Active rule against their own album.
-//! Both cycles run concurrently via `tokio::join!`.
+//! Required by PRD §4 P3 + MILESTONES.md §M3. Two users A and B each own their
+//! own encrypted Immich API key (both pointing at the same wiremock Immich) and
+//! one Active rule against their own album. Each user's library is seeded into
+//! `asset_index` under their own `user_id`. Both cycles run concurrently.
 //!
 //! ### What this test proves
 //!
-//! The first property is that every Immich call rule A makes carries key A,
-//! and symmetrically for rule B. This is enforced by four trap mocks
-//! registered with `.expect(0)`: the two cross-key GETs on `/api/albums/{A,B}`
-//! and the two cross-key PUTs on `/api/albums/{A,B}/assets`. Wiremock
-//! validates those counts on `MockServer` drop, so any leak fails the test.
+//! 1. **Key isolation.** Every Immich call rule A makes carries key A, and
+//!    symmetrically for B — enforced by `.expect(0)` trap mocks on the
+//!    cross-key GET/PUT pairs (wiremock validates on drop).
+//! 2. **Correct PUT bodies.** Rule A PUTs only A's ids (`a1, a2`); rule B only
+//!    B's (`b1, b2, b3`).
+//! 3. **Index isolation (T29).** Rule A's match scan reads only A's
+//!    `asset_index` rows. If the scan ever forgot its `WHERE user_id = ?`
+//!    filter, rule A would evaluate B's assets and the counts/PUT bodies would
+//!    cross — so the per-user assertions below pin index isolation directly.
+//! 4. **Decision isolation.** `list_decisions_for_rule("rule-a", …)` returns
+//!    ONLY A's rows; symmetric for B.
 //!
-//! The second is that the PUT bodies that DO fire are correct: rule A's PUT
-//! carries only A's asset ids (`a1, a2`); rule B's PUT carries only B's
-//! (`b1, b2, b3`). If the engine ever crossed keys, the wrong PUT mock would
-//! match (the legit mocks require both the right path AND the right key) and
-//! the request would fall through to wiremock's 404 default — the cycle would
-//! then bubble that up as `CycleError::Immich`, tripping the `.unwrap()`.
-//!
-//! The third is the DB side of P3: `list_decisions_for_rule(pool, "rule-a",
-//! ...)` returns ONLY A's rows (asset ids starting with `a`); the symmetric
-//! query for rule B returns ONLY B's rows. This covers a future bug where a
-//! decisions query forgets to filter by owner.
-//!
-//! ### Why a shared wiremock URL
-//!
-//! Both users' stored `base_url` point at the SAME `server.uri()`. That's
-//! the realistic shape — one Immich, many clients/keys. Separate URLs
-//! would let the test pass trivially without proving header isolation.
+//! Both users' stored `base_url` point at the SAME `server.uri()` — one Immich,
+//! many keys — so the test can't pass trivially without real header isolation.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use common::crypto::MasterKey;
 use common::db;
 use server::admin::create_user;
@@ -120,20 +112,29 @@ async fn seed_rule(
     .unwrap();
 }
 
-/// Match-spec that picks up every asset whose `taken_at >= 2024-01-01`.
-fn date_from_2024_match() -> &'static str {
-    r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#
+/// Seed one matching `asset_index` row (photo, 2024, no faces) for `owner`.
+async fn seed_index_match(pool: &SqlitePool, owner: &str, asset_id: &str) {
+    let taken = DateTime::parse_from_rfc3339("2024-06-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc)
+        .timestamp();
+    sqlx::query(
+        "INSERT INTO asset_index \
+            (user_id, asset_id, filename, updated_at, taken_at, lat, lng, \
+             media_type, person_ids, face_count, indexed_at) \
+         VALUES (?, ?, ?, 0, ?, NULL, NULL, 'photo', '[]', 0, 0)",
+    )
+    .bind(owner)
+    .bind(asset_id)
+    .bind(format!("{asset_id}.jpg"))
+    .bind(taken)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
-fn asset_item(id: &str, updated_at: &str, taken_at: &str) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "type": "IMAGE",
-        "fileCreatedAt": taken_at,
-        "updatedAt": updated_at,
-        "exifInfo": {"dateTimeOriginal": taken_at},
-        "people": [],
-    })
+fn date_from_2024_match() -> &'static str {
+    r#"{"date":{"from":"2024-01-01T00:00:00+00:00"}}"#
 }
 
 #[tokio::test]
@@ -148,21 +149,6 @@ async fn concurrent_cycles_never_cross_user_keys_or_albums() {
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"id": "album-A", "assets": []})),
         )
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", KEY_A))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [
-                    asset_item("a1", "2026-01-15T10:00:00Z", "2024-06-01T10:00:00Z"),
-                    asset_item("a2", "2026-02-15T11:00:00Z", "2024-06-02T11:00:00Z"),
-                ],
-                "nextPage": null
-            }
-        })))
         .mount(&server)
         .await;
 
@@ -190,22 +176,6 @@ async fn concurrent_cycles_never_cross_user_keys_or_albums() {
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"id": "album-B", "assets": []})),
         )
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/search/metadata"))
-        .and(header("x-api-key", KEY_B))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "assets": {
-                "items": [
-                    asset_item("b1", "2026-01-20T10:00:00Z", "2024-07-01T10:00:00Z"),
-                    asset_item("b2", "2026-02-20T11:00:00Z", "2024-07-02T11:00:00Z"),
-                    asset_item("b3", "2026-03-20T12:00:00Z", "2024-07-03T12:00:00Z"),
-                ],
-                "nextPage": null
-            }
-        })))
         .mount(&server)
         .await;
 
@@ -255,7 +225,7 @@ async fn concurrent_cycles_never_cross_user_keys_or_albums() {
         .mount(&server)
         .await;
 
-    // ----- Seed DB: two users, two keys, two rules -----
+    // ----- Seed DB: two users, two keys, two rules, two indexed libraries -----
     let pool = fresh_pool().await;
     let alice = seed_user(&pool, "alice@example.test", "Alice").await;
     let bob = seed_user(&pool, "bob@example.test", "Bob").await;
@@ -263,12 +233,14 @@ async fn concurrent_cycles_never_cross_user_keys_or_albums() {
     seed_key(&pool, &bob, &server.uri(), KEY_B, IMMICH_UID_B).await;
     seed_rule(&pool, &alice, "rule-a", "album-A", date_from_2024_match()).await;
     seed_rule(&pool, &bob, "rule-b", "album-B", date_from_2024_match()).await;
+    seed_index_match(&pool, &alice, "a1").await;
+    seed_index_match(&pool, &alice, "a2").await;
+    seed_index_match(&pool, &bob, "b1").await;
+    seed_index_match(&pool, &bob, "b2").await;
+    seed_index_match(&pool, &bob, "b3").await;
 
     let mk = deterministic_key();
 
-    // Run both cycles concurrently. Single-thread runtime is enough to
-    // interleave the futures; that surfaces any shared state on the engine's
-    // hot path.
     let data_dir = std::env::temp_dir();
     let (out_a, out_b) = tokio::join!(
         run_one_cycle(&pool, &mk, &data_dir, "rule-a"),
@@ -277,11 +249,14 @@ async fn concurrent_cycles_never_cross_user_keys_or_albums() {
     let out_a = out_a.unwrap();
     let out_b = out_b.unwrap();
 
-    assert_eq!(out_a.evaluated, 2, "rule-a should evaluate A's two assets");
+    assert_eq!(
+        out_a.evaluated, 2,
+        "rule-a only sees A's two indexed assets"
+    );
     assert_eq!(out_a.added, 2);
     assert_eq!(
         out_b.evaluated, 3,
-        "rule-b should evaluate B's three assets",
+        "rule-b only sees B's three indexed assets"
     );
     assert_eq!(out_b.added, 3);
 
