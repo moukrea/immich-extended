@@ -136,3 +136,41 @@ POSTSHIP cycle 4 ABSOLUTE rules:
 - **No breaking changes to running rules** — `beba1580` and `714dce95` continue to function or auto-migrate; the user does not have to re-create rules manually.
 - **Branch-safe rebuilds** — every commit that lands also keeps the docker image building cleanly; nothing left in a non-buildable intermediate state.
 
+
+---
+
+## OPERATOR DIRECTIVES (2026-05-28, POSTSHIP cycle 5)
+
+Operator reviewed the deployed cycle-4 build and gave a large batch of feedback. All authorized. These build on cycle-4 directives; same ABSOLUTE RULES apply. Full task specs in TASKS.md under "POSTSHIP cycle 5".
+
+1. **CRITICAL BUG — managed album never gets backfilled.** `beba1580 Paloma (partage Maman)` created its managed album (`e8e8d5e9`) but it's empty, despite 313 `decision=added` rows. Cause: the 313 matches were decided BEFORE the album existed (target_album_id was empty when the cycle ran), recorded as "added" anyway, and the watermark advanced past them — so they never get re-filed once the album appears. Two defects: (i) record `added` only when the Immich PUT actually succeeds; (ii) when an album is created/changed for a rule, re-evaluate the whole library (reset watermark or backfill) so historical matches land in it.
+
+2. **Background whole-library pre-processing** (the big one). Instead of per-cycle Immich fetch + lazy YOLO, immich-extended should index the user's ENTIRE library in the background: per-asset people/faces, YOLO person count, geo, date, media type — stored locally. New assets get indexed incrementally as they're detected. Rule matching then queries the pre-computed index (fast), and album-filling re-files ALL matching assets (not just new-since-watermark). This also naturally fixes bug #1 and powers the live log (#5).
+
+3. **Immich-style account menu + KILL the redundant sign-out buttons.** Currently sign-out appears in the sidebar, the header (with username+email), AND each rule page header — that's dumb. Replace with ONE circular avatar button top-right that opens a popup (mirror Immich, see operator screenshots) containing: Settings link, theme toggle, Sign out. Remove username+email from the header bar and every other stray sign-out.
+
+4. **Merge Overview/global-Activity into the Rules page.** They're near-identical. One page lists rules with status + match count + last run. Remove the "Signed in as <email> (<name>)" line — it's redundant with the account menu.
+
+5. **Global activity = live processing log.** The global activity view should show a live log of the currently-processing asset and what's being retrieved/decided (powered by the background indexer + rule cycles), NOT a duplicate of the rules list.
+
+6. **Per-rule activity rework.** (a) DROP "Recent runs" — it's meaningless to the operator. (b) The view must clearly show WHICH rule it belongs to (rule name in header). (c) Keep "Recent decisions" but: infinite-scroll/lazy-load; the table fixed-height with internal scroll (not whole-page scroll); matched/skipped filter; show the asset FILENAME + a tiny row-height thumbnail that enlarges in a hover popup — not the raw asset UUID.
+
+7. **True drag-and-drop block builder.** The current RuleBuilderV2 is a glorified form, not what was asked. Want: sentence-like draggable blocks, reorder via drag, group blocks into nested AND/OR/NOT groups, visually compose `IF [big block of conditions] [AND/OR] [other block]`. Maps to the same MatchExpr tree. Geo block spawns a map widget. Must be intuitive to a non-technical user.
+
+8. **Show match count per rule** — "N assets currently matched" on the rule list + edit page. Reconcile "matched per decisions" vs "actually in the album".
+
+Cycle-5 ABSOLUTE rules:
+- Bug #1 (album backfill) is the highest priority — fix it first (T26), before the architecture work, so the operator's album fills.
+- The pre-processing architecture (T27-T29) is designed before implemented (T27 = design doc).
+- The drag-drop builder (T34-T35) is designed before implemented (T34 = design doc).
+- Don't write the project-complete sentinel until POSTSHIP-T37 (the cycle-5 close-out) verifies everything live.
+
+
+### Cycle-5 decisions LOCKED (2026-05-28, operator-confirmed)
+
+The three open design forks are now decided; full detail in `.ralph/TASKS.md` "CYCLE 5 — LOCKED DECISIONS (D1–D6)" which OVERRIDES individual task prose:
+- **YOLO = lazy + cached** (index cheap metadata for the whole library; YOLO only on-demand, cached). Do NOT proactively YOLO the library.
+- **Albums respect manual removals** (track `album_managed_assets`; never re-add an asset the operator pulled out).
+- **No operator review gate** — worker designs AND implements straight through. The compensating control is the **mandatory UI self-assessment (D5)**: Chrome-MCP screenshot + critical comparison to the Immich style mirror / wireframe before any UI task is marked done. vitest-green is NOT enough.
+- **Drag-drop builder follows the explicit interaction model in D6** — pill-cards, bordered AND/OR/NOT group containers, "Group selected" as the primary grouping mechanism. Do not ship another flat form.
+
