@@ -1,15 +1,25 @@
-//! Per-rule poll cycle body (M3-T4 → POSTSHIP-T29).
+//! Matching core + the two reusable passes (M3-T4 → POSTSHIP-T39).
 //!
-//! `run_one_cycle(pool, master_key, data_dir, rule_id)` is the unit of work the
-//! scheduler invokes for every tick of every Active rule. Since T29 it matches
-//! against the **local pre-processed index** (`asset_index`, populated by the
-//! background indexer — see [`crate::indexer`]) rather than fetching a
-//! fresh page of assets from Immich each tick. One cycle:
+//! Matching against the **local pre-processed index** (`asset_index`, populated
+//! by the background indexer — see [`crate::indexer`]) runs through one shared
+//! core, [`match_candidates_against_rule`], driven two ways (design
+//! `docs/design/event-driven-matching.md` §3):
+//!
+//! * **Pass (a)** — [`match_rule_full`]: scan ONE rule against the owner's
+//!   *entire* index. Wraps `insert_run`/`finish_run` (audit-worthy). Drivers:
+//!   the rule lifecycle (T41) and the hourly safety sweep (T42).
+//! * **Pass (b)** — [`match_assets`]: evaluate a *touched asset-set* against
+//!   ALL of a user's active rules. Writes no `rule_runs` row (incremental).
+//!   Driver: the indexer sweep hook (T40).
+//!
+//! [`run_one_cycle`] is the thin pass-(a) wrapper the M3/T29 integration tests
+//! drive. Each match:
 //!
 //! 1. loads the rule + decrypts the owner's Immich key,
 //! 2. resolves (find-or-creates) the rule's target album,
-//! 3. scans the owner's **entire** `asset_index` and evaluates each row against
-//!    the rule's predicate tree (lazy YOLO on demand, §"YOLO"),
+//! 3. evaluates each candidate row against the rule's predicate tree (lazy YOLO
+//!    on demand, §"YOLO") — the full library (pass a) or the touched subset
+//!    (pass b),
 //! 4. reconciles the match set against the live album ([`fill_album`]),
 //! 5. records every verdict to `asset_decisions`.
 //!
@@ -65,7 +75,7 @@ use engine::predicate::{
 };
 use engine::rule::{parse_rule, MatchExpr, TargetAlbum};
 use immich_client::{ImmichClient, ValidationError};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -118,6 +128,29 @@ impl CycleError {
     }
 }
 
+/// Error surfaced by pass (b) ([`match_assets`]) for the work it does *outside*
+/// any single rule — loading the active-rule set and the candidate index rows.
+/// A single rule's [`CycleError`] is logged and skipped inside the loop (one
+/// rotated key can't abort the others' matching), so it never bubbles here.
+#[derive(Debug, Error)]
+pub enum MatchError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
+/// Whether a match pass emits the per-asset `Matched`/`Skipped` live-log events.
+///
+/// The single knob that keeps the hourly safety sweep (design §6.2) from
+/// spamming the activity stream: pass (b) and the rule-lifecycle pass (a) use
+/// [`EventVerbosity::Verbose`] (the operator wants to watch); the hourly sweep
+/// uses [`EventVerbosity::SummaryOnly`]. The rule-level `AlbumAdd` summary fires
+/// in both modes — it is one line per fill, not per-asset noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventVerbosity {
+    Verbose,
+    SummaryOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
     pub run_id: String,
@@ -126,8 +159,19 @@ pub struct RunOutcome {
     pub skipped: i64,
 }
 
+/// Counts returned by the shared matching core ([`match_candidates_against_rule`]).
+/// Pass (a) ([`match_rule_full`]) stamps these onto its `rule_runs` row; pass (b)
+/// uses them only for logging.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MatchCounts {
+    pub evaluated: i64,
+    pub added: i64,
+    pub skipped: i64,
+}
+
 /// Owner-scoped data the cycle needs about the rule under evaluation.
 struct LoadedRule {
+    id: String,
     name: String,
     owner_user_id: String,
     target_album_id: String,
@@ -155,53 +199,77 @@ struct IndexedAsset {
     person_ids: Vec<String>,
 }
 
-/// Public entry: run one poll cycle for `rule_id`. Returns the run summary
-/// on success; on failure, the `rule_runs` row is still finalised with an
-/// `error_message` slug.
-///
-/// `data_dir` is the on-disk root the YOLO crate consults for its model file
-/// (`data_dir/models/yolo.onnx`). It's threaded through here because the
-/// lazy YOLO inference path (when a rule sets `no_unidentified_humans=true`)
-/// downloads asset bytes to a tempfile and hands them to `yolo::count_*`.
+/// Public entry: run one full-library poll cycle for `rule_id` with no live-log
+/// events. Thin wrapper over [`match_rule_full`] retained for the M3/T29
+/// integration tests; production drives matching event-style (the indexer hook
+/// → [`match_assets`], the rule lifecycle + hourly sweep → [`match_rule_full`]).
+/// Returns the run summary on success; on failure the `rule_runs` row is still
+/// finalised with an `error_message` slug.
 pub async fn run_one_cycle(
     pool: &SqlitePool,
     master_key: &MasterKey,
     data_dir: &Path,
     rule_id: &str,
 ) -> Result<RunOutcome, CycleError> {
-    run_one_cycle_inner(pool, master_key, data_dir, rule_id, None).await
+    match_rule_full(
+        pool,
+        master_key,
+        data_dir,
+        rule_id,
+        None,
+        EventVerbosity::Verbose,
+    )
+    .await
 }
 
-/// Implementation of [`run_one_cycle`] with an optional live-log buffer. The
-/// public wrapper passes `None` (most tests don't assert on the bus); the
-/// production tick fn ([`production_tick_fn`]) passes `Some(&bus)` so each
-/// verdict surfaces as a "Matched"/"Skipped" event and album fills as an
-/// "AlbumAdd" on `/activity`.
-async fn run_one_cycle_inner(
+/// PASS (a) — full-index scan of ONE rule (design §3.2).
+///
+/// Loads the rule + owner key, resolves (find-or-creates) the target album,
+/// scans the owner's **entire** `asset_index`, and reconciles the match set into
+/// the album. Wraps the work in `insert_run`/`finish_run` bookkeeping: a full
+/// scan is an audit-worthy, low-frequency event (design §6.3), so it writes a
+/// `rule_runs` row. Callers: the rule lifecycle (T41) and the hourly safety
+/// sweep (T42).
+///
+/// `data_dir` is the on-disk root the YOLO crate consults for its model file
+/// (`data_dir/models/yolo.onnx`); the lazy YOLO inference path (a rule with
+/// `no_unidentified_humans=true`) downloads asset bytes to a tempfile and hands
+/// them to `yolo::count_*`.
+pub async fn match_rule_full(
     pool: &SqlitePool,
     master_key: &MasterKey,
     data_dir: &Path,
     rule_id: &str,
     activity: Option<&ActivityBus>,
+    verbosity: EventVerbosity,
 ) -> Result<RunOutcome, CycleError> {
     let run_id = Uuid::new_v4().to_string();
     let started_at = now_unix_seconds();
     insert_run(pool, &run_id, rule_id, started_at).await?;
 
-    match cycle_body(pool, master_key, data_dir, rule_id, &run_id, activity).await {
-        Ok(outcome) => {
+    match full_scan_body(
+        pool, master_key, data_dir, rule_id, &run_id, activity, verbosity,
+    )
+    .await
+    {
+        Ok(counts) => {
             let finished_at = now_unix_seconds();
             finish_run(
                 pool,
                 &run_id,
                 finished_at,
-                outcome.evaluated,
-                outcome.added,
-                outcome.skipped,
+                counts.evaluated,
+                counts.added,
+                counts.skipped,
                 None,
             )
             .await?;
-            Ok(outcome)
+            Ok(RunOutcome {
+                run_id,
+                evaluated: counts.evaluated,
+                added: counts.added,
+                skipped: counts.skipped,
+            })
         }
         Err(err) => {
             let finished_at = now_unix_seconds();
@@ -222,40 +290,179 @@ async fn run_one_cycle_inner(
     }
 }
 
-async fn cycle_body(
+/// Load the rule + key + client + album + the owner's entire index, then run the
+/// shared matching core over it. The run-bookkeeping wrapper
+/// ([`match_rule_full`]) records the resulting counts on the open `rule_runs`
+/// row.
+async fn full_scan_body(
     pool: &SqlitePool,
     master_key: &MasterKey,
     data_dir: &Path,
     rule_id: &str,
     run_id: &str,
     activity: Option<&ActivityBus>,
-) -> Result<RunOutcome, CycleError> {
+    verbosity: EventVerbosity,
+) -> Result<MatchCounts, CycleError> {
     let rule = load_rule(pool, rule_id).await?;
     let key = load_key(pool, master_key, &rule.owner_user_id).await?;
     let client = build_client(&key.base_url)?;
     let match_expr: MatchExpr = serde_json::from_str(&rule.parsed_predicates)
         .map_err(|e| CycleError::BadParsedPredicates(e.to_string()))?;
+    let album_id = resolve_target_album(pool, &client, &key, &rule).await?;
 
-    // Resolve the target album. For Existing-strategy rules `target_album_id`
-    // is already a real Immich id; for Managed-strategy rules an empty
-    // `target_album_id` means the album hasn't been minted yet, so we do
-    // find-or-create now and persist the resulting id back to the row.
-    let album_id = resolve_target_album(pool, &client, &key, &rule, rule_id).await?;
+    // Full-library scan from the local index (T29). Pass (a) always evaluates
+    // the rule owner's entire indexed library — no per-rule watermark — which
+    // makes the managed-album backfill bug structurally impossible.
+    let candidates = load_index_rows(pool, &rule.owner_user_id).await?;
+
+    match_candidates_against_rule(
+        pool,
+        data_dir,
+        &rule,
+        &key,
+        &client,
+        &album_id,
+        &match_expr,
+        &candidates,
+        Some(run_id),
+        activity,
+        verbosity,
+    )
+    .await
+}
+
+/// PASS (b) — evaluate a specific touched asset-set against ALL of a user's
+/// active rules (design §3.3). Called after each indexer sweep (T40) with the
+/// ids that sweep upserted.
+///
+/// Loads the candidate `asset_index` rows ONCE and reuses them across every
+/// active rule. Writes **no** `rule_runs` row (incremental, continuous — design
+/// §6.3); per-asset verdicts surface only through the activity bus and
+/// `rules.last_run_at`. A single rule's failure (rotated key, Immich down) is
+/// logged and skipped so it can't abort the others — the same resilience
+/// contract as the indexer sweep.
+///
+/// Per-account isolation falls out for free: `touched_ids` belong to one user
+/// (the indexer sweeps per user), so this only ever loads that user's index rows
+/// and matches them against that user's rules.
+pub async fn match_assets(
+    pool: &SqlitePool,
+    master_key: &MasterKey,
+    data_dir: &Path,
+    user_id: &str,
+    touched_ids: &[String],
+    activity: Option<&ActivityBus>,
+) -> Result<(), MatchError> {
+    if touched_ids.is_empty() {
+        return Ok(());
+    }
+    let active_rule_ids: Vec<String> = sqlx::query_scalar!(
+        "SELECT id FROM rules WHERE owner_user_id = ? AND status = 'active'",
+        user_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    if active_rule_ids.is_empty() {
+        return Ok(());
+    }
+
+    let candidates = load_index_rows_for_ids(pool, user_id, touched_ids).await?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    for rule_id in &active_rule_ids {
+        if let Err(err) = match_one_rule_against_candidates(
+            pool,
+            master_key,
+            data_dir,
+            rule_id,
+            &candidates,
+            activity,
+        )
+        .await
+        {
+            tracing::warn!(
+                rule_id = %rule_id,
+                user_id = %user_id,
+                error = %err,
+                "event-driven match for rule failed; skipping (other rules unaffected)",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Per-rule body of pass (b): set up the rule's key/client/album and run the
+/// shared core over the already-loaded candidate slice. No run bookkeeping.
+async fn match_one_rule_against_candidates(
+    pool: &SqlitePool,
+    master_key: &MasterKey,
+    data_dir: &Path,
+    rule_id: &str,
+    candidates: &[IndexedAsset],
+    activity: Option<&ActivityBus>,
+) -> Result<MatchCounts, CycleError> {
+    let rule = load_rule(pool, rule_id).await?;
+    let key = load_key(pool, master_key, &rule.owner_user_id).await?;
+    let client = build_client(&key.base_url)?;
+    let match_expr: MatchExpr = serde_json::from_str(&rule.parsed_predicates)
+        .map_err(|e| CycleError::BadParsedPredicates(e.to_string()))?;
+    let album_id = resolve_target_album(pool, &client, &key, &rule).await?;
+
+    match_candidates_against_rule(
+        pool,
+        data_dir,
+        &rule,
+        &key,
+        &client,
+        &album_id,
+        &match_expr,
+        candidates,
+        None,
+        activity,
+        EventVerbosity::Verbose,
+    )
+    .await
+}
+
+/// The matching unit both passes share (design §3.1). Evaluates `candidates`
+/// against one already-loaded rule, fills its album with the matched subset,
+/// records decisions, emits per-asset events. Does NOT touch `rule_runs` — the
+/// caller decides whether the match is audit-worthy.
+///
+/// `run_id` is the open `rule_runs` id for pass (a), or `None` for pass (b) (no
+/// run row → the `asset_decisions.run_id` column is left NULL).
+///
+/// A PARTIAL `candidates` slice (pass b) is still correct: `compute_album_plan`
+/// derives `newly_removed = prior_added − in_album` from the FULL
+/// `album_managed_assets` set and the FULL live album, independent of the
+/// `matched` slice, so operator removals are respected even for untouched
+/// assets (design §3.4).
+#[allow(clippy::too_many_arguments)]
+async fn match_candidates_against_rule(
+    pool: &SqlitePool,
+    data_dir: &Path,
+    rule: &LoadedRule,
+    key: &ResolvedKey,
+    client: &ImmichClient,
+    album_id: &str,
+    match_expr: &MatchExpr,
+    candidates: &[IndexedAsset],
+    run_id: Option<&str>,
+    activity: Option<&ActivityBus>,
+    verbosity: EventVerbosity,
+) -> Result<MatchCounts, CycleError> {
     let have_album = !album_id.is_empty();
 
-    // Full-library scan from the local index (T29). Every cycle evaluates the
-    // rule owner's entire indexed library — no per-rule watermark — which makes
-    // the managed-album backfill bug structurally impossible.
-    let assets = load_index_rows(pool, &rule.owner_user_id).await?;
-
-    // Pre-pass: evaluate every indexed asset, dispatching to YOLO when (and
-    // only when) a `no_unidentified_humans` rule has all other predicates
-    // passing. Building the full `(asset, outcome)` set BEFORE the transaction
-    // lets the YOLO downloads + tempfile writes happen outside any held locks.
-    let mut decided: Vec<(IndexedAsset, PredicateOutcome)> = Vec::with_capacity(assets.len());
-    for asset in assets {
+    // Pre-pass: evaluate every candidate, dispatching to YOLO when (and only
+    // when) a `no_unidentified_humans` rule has all other predicates passing.
+    // Building the full `(asset, outcome)` set BEFORE the transaction lets the
+    // YOLO downloads + tempfile writes happen outside any held locks.
+    let mut decided: Vec<(&IndexedAsset, PredicateOutcome)> = Vec::with_capacity(candidates.len());
+    for asset in candidates {
         let outcome =
-            decide_with_optional_yolo(pool, &client, &key.api_key, data_dir, &match_expr, &asset)
+            decide_with_optional_yolo(pool, client, &key.api_key, data_dir, match_expr, asset)
                 .await?;
         decided.push((asset, outcome));
     }
@@ -268,34 +475,28 @@ async fn cycle_body(
 
     // Album-fill diff (D3): respect manual removals, record `added` only after
     // a successful PUT (T26 invariant). Runs BEFORE the decisions commit so a
-    // failed PUT aborts the cycle with nothing recorded.
+    // failed PUT aborts the match with nothing recorded.
     let (filled, removed) = if have_album {
-        fill_album(
-            pool,
-            &client,
-            &key.api_key,
-            rule_id,
-            &album_id,
-            &matched_ids,
-        )
-        .await?
+        fill_album(pool, client, &key.api_key, &rule.id, album_id, &matched_ids).await?
     } else {
         (0, 0)
     };
     tracing::debug!(
-        rule_id,
+        rule_id = %rule.id,
         matched = matched_ids.len(),
         filled,
         removed,
         have_album,
         "album fill diff applied",
     );
+    // The rule-level AlbumAdd summary fires regardless of verbosity — it is one
+    // line per fill, not per-asset spam.
     if let (Some(bus), true) = (activity, filled > 0) {
         bus.album_add(
             &rule.owner_user_id,
-            rule_id,
+            &rule.id,
             &rule.name,
-            &album_id,
+            album_id,
             filled as i64,
         );
     }
@@ -304,14 +505,13 @@ async fn cycle_body(
     // otherwise → `skipped`. `album_managed_assets` (written by fill_album) is
     // the source of truth for actual album membership; `asset_decisions` is the
     // rule's verdict for the decisions/activity UI (T32/T36).
-    let mut evaluated: i64 = 0;
-    let mut added: i64 = 0;
-    let mut skipped: i64 = 0;
+    let mut counts = MatchCounts::default();
     let decided_at = now_unix_seconds();
+    let emit_per_asset = matches!(verbosity, EventVerbosity::Verbose);
 
     let mut tx = pool.begin().await?;
     for (asset, outcome) in &decided {
-        evaluated += 1;
+        counts.evaluated += 1;
         let (decision_str, reason_slug) = decision_columns(outcome);
         sqlx::query!(
             "INSERT INTO asset_decisions (rule_id, asset_id, decision, reason, run_id, decided_at) \
@@ -321,7 +521,7 @@ async fn cycle_body(
                  reason = excluded.reason, \
                  run_id = excluded.run_id, \
                  decided_at = excluded.decided_at",
-            rule_id,
+            rule.id,
             asset.asset_id,
             decision_str,
             reason_slug,
@@ -331,16 +531,16 @@ async fn cycle_body(
         .execute(&mut *tx)
         .await?;
         if outcome.matched {
-            added += 1;
+            counts.added += 1;
         } else {
-            skipped += 1;
+            counts.skipped += 1;
         }
-        if let Some(bus) = activity {
+        if let (Some(bus), true) = (activity, emit_per_asset) {
             let filename = Some(asset.filename.as_str());
             if outcome.matched {
                 bus.matched(
                     &rule.owner_user_id,
-                    rule_id,
+                    &rule.id,
                     &rule.name,
                     &asset.asset_id,
                     filename,
@@ -348,7 +548,7 @@ async fn cycle_body(
             } else {
                 bus.skipped(
                     &rule.owner_user_id,
-                    rule_id,
+                    &rule.id,
                     &rule.name,
                     &asset.asset_id,
                     filename,
@@ -359,14 +559,9 @@ async fn cycle_body(
     }
     tx.commit().await?;
 
-    update_last_run(pool, rule_id, now_unix_seconds()).await?;
+    update_last_run(pool, &rule.id, now_unix_seconds()).await?;
 
-    Ok(RunOutcome {
-        run_id: run_id.to_string(),
-        evaluated,
-        added,
-        skipped,
-    })
+    Ok(counts)
 }
 
 /// Reconcile the rule's match set against its live album (POSTSHIP-T29, D3).
@@ -460,9 +655,44 @@ async fn load_managed_assets(
     Ok(rows.into_iter().map(|r| r.asset_id).collect())
 }
 
-/// Load the rule owner's entire indexed library. The matching scan reads every
-/// row (no watermark window); per-account isolation holds because the filter is
-/// `WHERE user_id = <owner>`.
+/// One raw `asset_index` row. The dynamic IN-list loader
+/// ([`load_index_rows_for_ids`]) materialises rows into this via `FromRow`;
+/// [`load_index_rows`] reuses the row → [`IndexedAsset`] mapping
+/// ([`IndexRowRaw::into_indexed`]) so the two loaders can't drift.
+#[derive(sqlx::FromRow)]
+struct IndexRowRaw {
+    asset_id: String,
+    filename: String,
+    taken_at: Option<i64>,
+    lat: Option<f64>,
+    lng: Option<f64>,
+    media_type: String,
+    person_ids: String,
+}
+
+impl IndexRowRaw {
+    fn into_indexed(self) -> IndexedAsset {
+        // person_ids is JSON written by the indexer; a corrupt value degrades
+        // to "no faces" rather than failing the whole match.
+        let person_ids: Vec<String> = serde_json::from_str(&self.person_ids).unwrap_or_default();
+        let gps = match (self.lat, self.lng) {
+            (Some(lat), Some(lng)) => Some((lat, lng)),
+            _ => None,
+        };
+        IndexedAsset {
+            asset_id: self.asset_id,
+            filename: self.filename,
+            asset_type: asset_type_from_media(&self.media_type),
+            taken_at: self.taken_at.map(epoch_to_utc),
+            gps,
+            person_ids,
+        }
+    }
+}
+
+/// Load the rule owner's entire indexed library (pass a). The matching scan
+/// reads every row (no watermark window); per-account isolation holds because
+/// the filter is `WHERE user_id = <owner>`.
 async fn load_index_rows(
     pool: &SqlitePool,
     owner_user_id: &str,
@@ -477,23 +707,57 @@ async fn load_index_rows(
     Ok(rows
         .into_iter()
         .map(|r| {
-            // person_ids is JSON written by the indexer; a corrupt value
-            // degrades to "no faces" rather than failing the whole cycle.
-            let person_ids: Vec<String> = serde_json::from_str(&r.person_ids).unwrap_or_default();
-            let gps = match (r.lat, r.lng) {
-                (Some(lat), Some(lng)) => Some((lat, lng)),
-                _ => None,
-            };
-            IndexedAsset {
+            IndexRowRaw {
                 asset_id: r.asset_id,
                 filename: r.filename,
-                asset_type: asset_type_from_media(&r.media_type),
-                taken_at: r.taken_at.map(epoch_to_utc),
-                gps,
-                person_ids,
+                taken_at: r.taken_at,
+                lat: r.lat,
+                lng: r.lng,
+                media_type: r.media_type,
+                person_ids: r.person_ids,
             }
+            .into_indexed()
         })
         .collect())
+}
+
+/// Maximum asset ids bound into one `asset_index` IN-list query. SQLite's
+/// default bind-parameter ceiling is 999 on older builds; chunking keeps the
+/// pass-(b) candidate load well under it regardless of how many ids a single
+/// sweep touched.
+const INDEX_ID_CHUNK: usize = 400;
+
+/// Load the `asset_index` rows for a specific set of `asset_ids`, scoped to
+/// `user_id` (pass b — design §3.3). Chunked to stay under SQLite's
+/// bind-parameter limit; ids absent from the index (not yet swept, or pruned)
+/// simply don't come back.
+async fn load_index_rows_for_ids(
+    pool: &SqlitePool,
+    user_id: &str,
+    asset_ids: &[String],
+) -> Result<Vec<IndexedAsset>, sqlx::Error> {
+    let mut out: Vec<IndexedAsset> = Vec::new();
+    for chunk in asset_ids.chunks(INDEX_ID_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut q: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            "SELECT asset_id, filename, taken_at, lat, lng, media_type, person_ids \
+             FROM asset_index WHERE user_id = ",
+        );
+        q.push_bind(user_id);
+        q.push(" AND asset_id IN (");
+        {
+            let mut sep = q.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+        }
+        q.push(")");
+        let rows: Vec<IndexRowRaw> = q.build_query_as().fetch_all(pool).await?;
+        out.extend(rows.into_iter().map(IndexRowRaw::into_indexed));
+    }
+    Ok(out)
 }
 
 /// Count how many of the owner's indexed assets currently match `match_expr`
@@ -559,6 +823,7 @@ async fn load_rule(pool: &SqlitePool, rule_id: &str) -> Result<LoadedRule, Cycle
     .await?;
     let row = row.ok_or_else(|| CycleError::RuleNotFound(rule_id.to_string()))?;
     Ok(LoadedRule {
+        id: rule_id.to_string(),
         name: row.name,
         owner_user_id: row.owner_user_id,
         target_album_id: row.target_album_id,
@@ -618,7 +883,6 @@ async fn resolve_target_album(
     client: &ImmichClient,
     key: &ResolvedKey,
     rule: &LoadedRule,
-    rule_id: &str,
 ) -> Result<String, CycleError> {
     if !rule.target_album_id.is_empty() {
         return Ok(rule.target_album_id.clone());
@@ -627,7 +891,7 @@ async fn resolve_target_album(
         return Ok(String::new());
     }
     let name = resolve_managed_name(rule)
-        .ok_or_else(|| CycleError::ManagedAlbumNameMissing(rule_id.to_string()))?;
+        .ok_or_else(|| CycleError::ManagedAlbumNameMissing(rule.id.clone()))?;
 
     // Caller's Immich user id is needed by `list_albums` to derive writability.
     // If it's missing (key not validated yet) we still go through `list_albums`
@@ -659,12 +923,12 @@ async fn resolve_target_album(
     sqlx::query!(
         "UPDATE rules SET target_album_id = ? WHERE id = ?",
         resolved_id,
-        rule_id,
+        rule.id,
     )
     .execute(pool)
     .await?;
     tracing::info!(
-        rule_id,
+        rule_id = %rule.id,
         album_id = %resolved_id,
         album_name = %name,
         "managed target album resolved",
@@ -873,9 +1137,10 @@ fn now_unix_seconds() -> i64 {
 }
 
 /// Build the scheduler's production tick function. The closure captures the
-/// pool + master key + data_dir and delegates each tick to [`run_one_cycle`].
-/// Lives here (next to the cycle body) so a future refactor can swap
-/// implementations in one place without touching the scheduler module.
+/// pool + master key + data_dir and delegates each tick to [`match_rule_full`]
+/// (pass a, `Verbose`). Lives here (next to the match passes) so a future
+/// refactor can swap implementations in one place without touching the
+/// scheduler module. Retired alongside the per-rule timers in T42.
 pub fn production_tick_fn(
     pool: SqlitePool,
     master_key: MasterKey,
@@ -888,8 +1153,15 @@ pub fn production_tick_fn(
         let data_dir = data_dir.clone();
         let activity = activity.clone();
         Box::pin(async move {
-            match run_one_cycle_inner(&pool, &master_key, &data_dir, &rule_id, Some(&activity))
-                .await
+            match match_rule_full(
+                &pool,
+                &master_key,
+                &data_dir,
+                &rule_id,
+                Some(&activity),
+                EventVerbosity::Verbose,
+            )
+            .await
             {
                 Ok(outcome) => {
                     tracing::info!(
