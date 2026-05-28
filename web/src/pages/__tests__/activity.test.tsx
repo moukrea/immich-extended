@@ -33,6 +33,37 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+const EMPTY_STATUS = {
+  indexed: 0,
+  last_swept_at: null,
+  library_total: null,
+  sweeping: false,
+};
+
+/// Branch the fetch mock by path so the two independent pollers (the cheap
+/// stream + the slower `/me/index/status`) each get a *fresh* Response — a
+/// shared `mockResolvedValue` body can only be read once.
+function mockApi(opts: {
+  stream?: (after: number) => unknown;
+  status?: unknown;
+}) {
+  fetchMock.mockImplementation((input: string | URL) => {
+    const url = new URL(String(input), "http://localhost");
+    if (url.pathname.endsWith("/me/index/status")) {
+      return Promise.resolve(jsonResponse(opts.status ?? EMPTY_STATUS));
+    }
+    const after = Number(url.searchParams.get("after") ?? "0");
+    return Promise.resolve(
+      jsonResponse(opts.stream ? opts.stream(after) : { events: [], last_seq: 0 }),
+    );
+  });
+}
+
+const streamCalls = () =>
+  fetchMock.mock.calls.filter((c) =>
+    String(c[0]).includes("/activity/stream"),
+  ).length;
+
 /// `useLivePoll` re-fetches immediately on a visibility change while the
 /// document is visible (the default in jsdom), so this drives the next poll
 /// deterministically without leaning on the 2 s interval.
@@ -41,18 +72,17 @@ function triggerPoll() {
 }
 
 describe("Activity live log", () => {
-  it("appends events across polls and follows the seq cursor", async () => {
-    fetchMock.mockImplementation((input: string | URL) => {
-      const url = new URL(String(input), "http://localhost");
-      const after = Number(url.searchParams.get("after") ?? "0");
-      if (after === 0) {
-        return Promise.resolve(
-          jsonResponse({
+  it("groups an asset's events into one card and adds a card per new asset across polls", async () => {
+    mockApi({
+      stream: (after) => {
+        if (after === 0) {
+          return {
             events: [
               {
                 seq: 1,
                 at: 1747000000,
                 kind: "indexed",
+                asset_id: "a-1",
                 filename: "IMG_1.jpg",
                 person_count: 2,
                 has_gps: true,
@@ -69,12 +99,9 @@ describe("Activity live log", () => {
               },
             ],
             last_seq: 2,
-          }),
-        );
-      }
-      // Subsequent polls (after=2) return the next event.
-      return Promise.resolve(
-        jsonResponse({
+          };
+        }
+        return {
           events: [
             {
               seq: 3,
@@ -88,69 +115,90 @@ describe("Activity live log", () => {
             },
           ],
           last_seq: 3,
-        }),
-      );
+        };
+      },
     });
 
     const { findByText, getAllByTestId } = render(() => <Activity />);
     await findByText("IMG_1.jpg");
-    expect(getAllByTestId("activity-event")).toHaveLength(2);
+    // indexed + matched for the same asset collapse into one card.
+    expect(getAllByTestId("activity-asset")).toHaveLength(1);
 
     triggerPoll();
     await waitFor(() =>
-      expect(getAllByTestId("activity-event")).toHaveLength(3),
+      expect(getAllByTestId("activity-asset")).toHaveLength(2),
     );
-    await findByText(/IMG_2.jpg/);
+    await findByText("IMG_2.jpg");
   });
 
   it("dedups repeated events by seq", async () => {
-    fetchMock.mockImplementation(() =>
-      Promise.resolve(
-        jsonResponse({
-          events: [
-            {
-              seq: 1,
-              at: 1,
-              kind: "indexed",
-              filename: "DUP.jpg",
-              person_count: 0,
-              has_gps: false,
-              taken_at: null,
-            },
-            { seq: 2, at: 2, kind: "sweep_done", indexed: 5, took_ms: 12 },
-          ],
-          last_seq: 2,
-        }),
-      ),
-    );
-
-    const { findByText, getAllByTestId } = render(() => <Activity />);
-    await findByText("DUP.jpg");
-    expect(getAllByTestId("activity-event")).toHaveLength(2);
-
-    triggerPoll();
-    triggerPoll();
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    // The same seqs come back each poll; they must not pile up.
-    expect(getAllByTestId("activity-event")).toHaveLength(2);
-  });
-
-  it("shows the idle empty state when nothing is processing", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ events: [], last_seq: 0 }));
-
-    const { findByTestId, queryAllByTestId } = render(() => <Activity />);
-    await findByTestId("activity-empty");
-    expect(queryAllByTestId("activity-event")).toHaveLength(0);
-  });
-
-  it("pauses (and shows a hint) while hovering the log", async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse({
+    mockApi({
+      stream: () => ({
         events: [
           {
             seq: 1,
             at: 1,
             kind: "indexed",
+            asset_id: "a-dup",
+            filename: "DUP.jpg",
+            person_count: 0,
+            has_gps: false,
+            taken_at: null,
+          },
+          { seq: 2, at: 2, kind: "sweep_done", indexed: 5, took_ms: 12 },
+        ],
+        last_seq: 2,
+      }),
+    });
+
+    const { findByText, getAllByTestId } = render(() => <Activity />);
+    await findByText("DUP.jpg");
+    expect(getAllByTestId("activity-asset")).toHaveLength(1);
+    expect(getAllByTestId("activity-summary")).toHaveLength(1);
+
+    triggerPoll();
+    triggerPoll();
+    await waitFor(() => expect(streamCalls()).toBeGreaterThanOrEqual(3));
+    // The same seqs come back each poll; they must not pile up.
+    expect(getAllByTestId("activity-asset")).toHaveLength(1);
+    expect(getAllByTestId("activity-summary")).toHaveLength(1);
+  });
+
+  it("shows the idle empty state when nothing is processing", async () => {
+    mockApi({ stream: () => ({ events: [], last_seq: 0 }) });
+
+    const { findByTestId, queryAllByTestId } = render(() => <Activity />);
+    await findByTestId("activity-empty");
+    expect(queryAllByTestId("activity-asset")).toHaveLength(0);
+  });
+
+  it("renders the index status header with the indexing state", async () => {
+    mockApi({
+      stream: () => ({ events: [], last_seq: 0 }),
+      status: {
+        indexed: 3,
+        last_swept_at: Math.floor(Date.now() / 1000) - 30,
+        library_total: 10,
+        sweeping: true,
+      },
+    });
+
+    const { findByTestId } = render(() => <Activity />);
+    const header = await findByTestId("activity-status");
+    await waitFor(() => expect(header.textContent).toContain("3 / 10"));
+    const state = await findByTestId("activity-state");
+    expect(state.textContent).toContain("indexing");
+  });
+
+  it("pauses (and shows a hint) while hovering the log", async () => {
+    mockApi({
+      stream: () => ({
+        events: [
+          {
+            seq: 1,
+            at: 1,
+            kind: "indexed",
+            asset_id: "a-h",
             filename: "H.jpg",
             person_count: 1,
             has_gps: false,
@@ -159,7 +207,7 @@ describe("Activity live log", () => {
         ],
         last_seq: 1,
       }),
-    );
+    });
 
     const { findByTestId, queryByTestId } = render(() => <Activity />);
     const log = await findByTestId("activity-log");

@@ -1,5 +1,6 @@
 import {
   createEffect,
+  createMemo,
   createSignal,
   For,
   Match,
@@ -8,14 +9,29 @@ import {
   type Component,
 } from "solid-js";
 import { useNavigate } from "@solidjs/router";
-import { fetchActivityStream, type ActivityEvent } from "../lib/api";
+import {
+  fetchActivityStream,
+  fetchIndexStatus,
+  type ActivityEvent,
+  type IndexStatus,
+} from "../lib/api";
+import {
+  groupActivity,
+  type AssetGroup,
+  type RuleVerdict,
+} from "../lib/activityGrouping";
 import { reasonLabel } from "../lib/decisionReasons";
 import { useLivePoll } from "../lib/livePoll";
 
 const POLL_MS = 2000;
+/// The status header hits Immich's statistics endpoint server-side, so poll it
+/// far less often than the cheap local stream.
+const STATUS_POLL_MS = 10000;
 /// Client-side cap. The server ring buffer is bounded too; this just keeps the
 /// rendered DOM small during a long-running session.
 const MAX_EVENTS = 200;
+
+type Preview = { src: string; x: number; y: number };
 
 function assetThumbUrl(assetId: string): string {
   return `/api/v1/me/assets/${encodeURIComponent(assetId)}/thumbnail`;
@@ -30,14 +46,26 @@ function timeLabel(at: number): string {
   });
 }
 
+function agoLabel(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds) || seconds <= 0)
+    return "never";
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
+  if (diff < 5) return "just now";
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
 function shortHash(id: string): string {
   if (id.length <= 12) return id;
   return `${id.slice(0, 6)}…${id.slice(-4)}`;
 }
 
-/// The global live processing log (POSTSHIP-T33). Polls
-/// `/api/v1/me/activity/stream` every couple of seconds, appending whatever the
-/// background indexer and rule cycles published since the last cursor.
+/// The global live processing log (cycle-6 T44). A status header fed by
+/// `/me/index/status` sits above a per-asset grouped narrative of the
+/// `/me/activity/stream` events — each asset's indexed/matched/skipped lines
+/// fold into one card, with rule-level/sweep summaries interleaved.
 const Activity: Component = () => {
   const navigate = useNavigate();
   const [events, setEvents] = createSignal<ActivityEvent[]>([]);
@@ -45,9 +73,13 @@ const Activity: Component = () => {
   const [paused, setPaused] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [started, setStarted] = createSignal(false);
+  const [status, setStatus] = createSignal<IndexStatus | null>(null);
+  const [preview, setPreview] = createSignal<Preview | null>(null);
   let scrollEl: HTMLDivElement | undefined;
 
-  const poll = async () => {
+  const rows = createMemo(() => groupActivity(events()));
+
+  const pollStream = async () => {
     const res = await fetchActivityStream(lastSeq());
     setStarted(true);
     if (res.ok) {
@@ -73,12 +105,22 @@ const Activity: Component = () => {
     }
   };
 
-  useLivePoll({ intervalMs: POLL_MS, fetcher: poll });
+  const pollStatus = async () => {
+    const res = await fetchIndexStatus();
+    if (res.ok) {
+      setStatus(res.data);
+    } else if (res.status === 401) {
+      navigate("/login", { replace: true });
+    }
+  };
+
+  useLivePoll({ intervalMs: POLL_MS, fetcher: pollStream });
+  useLivePoll({ intervalMs: STATUS_POLL_MS, fetcher: pollStatus });
 
   // Tail-follow: jump to the newest event on each append, unless the operator
   // is hovering the log to read older entries (pause-on-hover).
   createEffect(() => {
-    events();
+    rows();
     if (!paused() && scrollEl) {
       scrollEl.scrollTop = scrollEl.scrollHeight;
     }
@@ -95,7 +137,9 @@ const Activity: Component = () => {
         </p>
       </div>
 
-      <div class="rounded-2xl border border-ui-border bg-white shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray">
+      <StatusHeader status={status()} />
+
+      <div class="mt-5 rounded-2xl border border-ui-border bg-white shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray">
         <header class="flex flex-wrap items-center gap-3 border-b border-ui-border px-5 py-3 dark:border-gray-700">
           <span class="relative flex h-2.5 w-2.5" aria-hidden="true">
             <span class="absolute inline-flex h-2.5 w-2.5 animate-ping rounded-full bg-immich-primary opacity-60 dark:bg-immich-dark-primary" />
@@ -104,7 +148,9 @@ const Activity: Component = () => {
           <h2 class="text-base font-semibold">Live processing</h2>
           <span class="ml-auto text-xs text-ui-muted tabular-nums">
             <Show when={paused()} fallback={`${events().length} events`}>
-              <span data-testid="activity-paused">Paused — move away to resume</span>
+              <span data-testid="activity-paused">
+                Paused — move away to resume
+              </span>
             </Show>
           </span>
         </header>
@@ -123,10 +169,7 @@ const Activity: Component = () => {
         <Show
           when={!isIdle()}
           fallback={
-            <div
-              class="px-6 py-12 text-center"
-              data-testid="activity-empty"
-            >
+            <div class="px-6 py-12 text-center" data-testid="activity-empty">
               <h3 class="text-base font-medium text-immich-fg dark:text-immich-dark-fg">
                 Nothing processing right now
               </h3>
@@ -151,102 +194,189 @@ const Activity: Component = () => {
               }
             >
               <ul class="divide-y divide-ui-border dark:divide-gray-800">
-                <For each={events()}>
-                  {(event) => <EventRow event={event} />}
+                <For each={rows()}>
+                  {(row) => (
+                    <Switch>
+                      <Match when={row.kind === "asset" && row}>
+                        {(g) => (
+                          <AssetCard
+                            group={g()}
+                            onPreview={setPreview}
+                            onPreviewEnd={() => setPreview(null)}
+                          />
+                        )}
+                      </Match>
+                      <Match when={row.kind === "summary" && row}>
+                        {(s) => <SummaryRow event={s().event} />}
+                      </Match>
+                    </Switch>
+                  )}
                 </For>
               </ul>
             </Show>
           </div>
         </Show>
       </div>
+
+      <Show when={preview()}>
+        {(p) => (
+          <div
+            ref={(el) => {
+              el.style.left = `${p().x}px`;
+              el.style.top = `${p().y}px`;
+            }}
+            class="pointer-events-none fixed z-50 overflow-hidden rounded-xl border border-ui-border bg-white shadow-xl dark:border-gray-700 dark:bg-immich-dark-gray"
+            data-testid="thumb-preview"
+          >
+            <img src={p().src} alt="" class="h-48 w-48 object-cover" loading="lazy" />
+          </div>
+        )}
+      </Show>
     </section>
   );
 };
 
-const KIND_BADGE: Record<ActivityEvent["kind"], { label: string; cls: string }> =
-  {
-    indexed: {
-      label: "indexed",
-      cls: "bg-slate-100 text-slate-700 ring-slate-200 dark:bg-gray-700 dark:text-gray-200 dark:ring-gray-600",
-    },
-    matched: {
-      label: "matched",
-      cls: "bg-emerald-100 text-emerald-800 ring-emerald-200 dark:bg-emerald-500/20 dark:text-emerald-200 dark:ring-emerald-500/30",
-    },
-    skipped: {
-      label: "skipped",
-      cls: "bg-slate-100 text-slate-700 ring-slate-200 dark:bg-gray-700 dark:text-gray-200 dark:ring-gray-600",
-    },
-    album_add: {
-      label: "album",
-      cls: "bg-immich-primary/10 text-immich-primary ring-immich-primary/20 dark:bg-immich-dark-primary/20 dark:text-immich-dark-primary dark:ring-immich-dark-primary/30",
-    },
-    sweep_done: {
-      label: "sweep",
-      cls: "bg-slate-100 text-slate-700 ring-slate-200 dark:bg-gray-700 dark:text-gray-200 dark:ring-gray-600",
-    },
+const StatusHeader: Component<{ status: IndexStatus | null }> = (props) => {
+  const indexedLabel = () => {
+    const s = props.status;
+    if (!s) return "—";
+    const n = s.indexed.toLocaleString();
+    return s.library_total === null
+      ? n
+      : `${n} / ${s.library_total.toLocaleString()}`;
   };
+  const sweeping = () => props.status?.sweeping ?? false;
 
-const EventRow: Component<{ event: ActivityEvent }> = (props) => {
-  const badge = () => KIND_BADGE[props.event.kind];
   return (
-    <li class="flex items-center gap-3 px-5 py-2.5 text-sm" data-testid="activity-event">
+    <div
+      class="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-2xl border border-ui-border bg-white px-5 py-4 shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray"
+      data-testid="activity-status"
+    >
+      <div class="flex items-baseline gap-2">
+        <span class="text-xs uppercase tracking-wider text-ui-muted">
+          Indexed
+        </span>
+        <span class="text-lg font-semibold tabular-nums text-immich-fg dark:text-immich-dark-fg">
+          {indexedLabel()}
+        </span>
+      </div>
+      <div class="flex items-baseline gap-2">
+        <span class="text-xs uppercase tracking-wider text-ui-muted">
+          Last sweep
+        </span>
+        <span class="text-sm text-immich-fg dark:text-immich-dark-fg">
+          {agoLabel(props.status?.last_swept_at ?? null)}
+        </span>
+      </div>
+      <span
+        class={`ml-auto inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-medium ring-1 ring-inset ${
+          sweeping()
+            ? "bg-immich-primary/10 text-immich-primary ring-immich-primary/20 dark:bg-immich-dark-primary/20 dark:text-immich-dark-primary dark:ring-immich-dark-primary/30"
+            : "bg-slate-100 text-slate-600 ring-slate-200 dark:bg-gray-700 dark:text-gray-300 dark:ring-gray-600"
+        }`}
+        data-testid="activity-state"
+      >
+        <Show
+          when={sweeping()}
+          fallback={
+            <>
+              <span class="h-1.5 w-1.5 rounded-full bg-slate-400 dark:bg-gray-400" />
+              idle
+            </>
+          }
+        >
+          <span class="relative flex h-1.5 w-1.5" aria-hidden="true">
+            <span class="absolute inline-flex h-1.5 w-1.5 animate-ping rounded-full bg-immich-primary opacity-60 dark:bg-immich-dark-primary" />
+            <span class="relative inline-flex h-1.5 w-1.5 rounded-full bg-immich-primary dark:bg-immich-dark-primary" />
+          </span>
+          indexing
+        </Show>
+      </span>
+    </div>
+  );
+};
+
+const AssetCard: Component<{
+  group: AssetGroup;
+  onPreview: (p: Preview) => void;
+  onPreviewEnd: () => void;
+}> = (props) => {
+  const label = () =>
+    props.group.filename ?? shortHash(props.group.asset_id);
+  return (
+    <li
+      class="flex items-start gap-3 px-5 py-3 text-sm"
+      data-testid="activity-asset"
+    >
+      <span class="w-16 shrink-0 pt-0.5 text-xs text-ui-muted tabular-nums">
+        {timeLabel(props.group.at)}
+      </span>
+      <AssetThumb
+        assetId={props.group.asset_id}
+        onPreview={props.onPreview}
+        onPreviewEnd={props.onPreviewEnd}
+      />
+      <div class="min-w-0 flex-1">
+        <div class="flex flex-wrap items-baseline gap-x-2">
+          <span class="truncate font-medium text-immich-fg dark:text-immich-dark-fg">
+            {label()}
+          </span>
+          <Show when={props.group.indexed}>
+            {(idx) => (
+              <span class="shrink-0 text-xs text-ui-muted">
+                indexed · {idx().person_count}{" "}
+                {idx().person_count === 1 ? "person" : "people"}
+                {idx().has_gps ? " · GPS" : ""}
+              </span>
+            )}
+          </Show>
+        </div>
+        <Show when={props.group.verdicts.length > 0}>
+          <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
+            <For each={props.group.verdicts}>
+              {(verdict) => <VerdictChip verdict={verdict} />}
+            </For>
+          </div>
+        </Show>
+      </div>
+    </li>
+  );
+};
+
+const VerdictChip: Component<{ verdict: RuleVerdict }> = (props) => {
+  const matched = () => props.verdict.decision === "matched";
+  return (
+    <span
+      class={`inline-flex max-w-full items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${
+        matched()
+          ? "bg-emerald-100 text-emerald-800 ring-emerald-200 dark:bg-emerald-500/20 dark:text-emerald-200 dark:ring-emerald-500/30"
+          : "bg-slate-100 text-slate-700 ring-slate-200 dark:bg-gray-700 dark:text-gray-200 dark:ring-gray-600"
+      }`}
+      data-testid={matched() ? "verdict-matched" : "verdict-skipped"}
+    >
+      <span>{matched() ? "matched" : "skipped"}</span>
+      <span class="truncate font-semibold">“{props.verdict.rule_name}”</span>
+      <Show when={!matched() && props.verdict.reason}>
+        {(reason) => (
+          <span class="text-ui-muted">· {reasonLabel(reason())}</span>
+        )}
+      </Show>
+    </span>
+  );
+};
+
+const SummaryRow: Component<{
+  event: Extract<ActivityEvent, { kind: "album_add" | "sweep_done" }>;
+}> = (props) => {
+  return (
+    <li
+      class="flex items-center gap-3 px-5 py-2.5 text-sm"
+      data-testid="activity-summary"
+    >
       <span class="w-16 shrink-0 text-xs text-ui-muted tabular-nums">
         {timeLabel(props.event.at)}
       </span>
-      <span
-        class={`inline-flex w-[4.5rem] shrink-0 items-center justify-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${badge().cls}`}
-      >
-        {badge().label}
-      </span>
       <Switch>
-        <Match when={props.event.kind === "indexed" && props.event}>
-          {(e) => (
-            <span class="flex min-w-0 items-baseline gap-2">
-              <span class="truncate text-immich-fg dark:text-immich-dark-fg">
-                {e().filename}
-              </span>
-              <span class="shrink-0 text-xs text-ui-muted">
-                {e().person_count}{" "}
-                {e().person_count === 1 ? "person" : "people"}
-                {e().has_gps ? " · GPS" : ""}
-              </span>
-            </span>
-          )}
-        </Match>
-        <Match when={props.event.kind === "matched" && props.event}>
-          {(e) => (
-            <span class="flex min-w-0 items-center gap-3">
-              <AssetThumb assetId={e().asset_id} />
-              <span class="min-w-0 truncate">
-                <span class="font-medium text-immich-fg dark:text-immich-dark-fg">
-                  {e().rule_name}
-                </span>
-                <span class="text-ui-muted">
-                  {" "}
-                  matched {e().filename ?? shortHash(e().asset_id)}
-                </span>
-              </span>
-            </span>
-          )}
-        </Match>
-        <Match when={props.event.kind === "skipped" && props.event}>
-          {(e) => (
-            <span class="flex min-w-0 items-center gap-3">
-              <AssetThumb assetId={e().asset_id} />
-              <span class="min-w-0 truncate">
-                <span class="font-medium text-immich-fg dark:text-immich-dark-fg">
-                  {e().rule_name}
-                </span>
-                <span class="text-ui-muted">
-                  {" "}
-                  skipped {e().filename ?? shortHash(e().asset_id)} ·{" "}
-                  {reasonLabel(e().reason)}
-                </span>
-              </span>
-            </span>
-          )}
-        </Match>
         <Match when={props.event.kind === "album_add" && props.event}>
           {(e) => (
             <span class="min-w-0 truncate">
@@ -279,12 +409,30 @@ const EventRow: Component<{ event: ActivityEvent }> = (props) => {
   );
 };
 
-const AssetThumb: Component<{ assetId: string }> = (props) => {
+const AssetThumb: Component<{
+  assetId: string;
+  onPreview: (p: Preview) => void;
+  onPreviewEnd: () => void;
+}> = (props) => {
   const [broken, setBroken] = createSignal(false);
+  const src = () => assetThumbUrl(props.assetId);
+
+  const showPreview = (e: MouseEvent) => {
+    if (broken()) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // Anchor to the right of the thumbnail, clamped into the viewport so a row
+    // near an edge doesn't push the preview off-screen.
+    const x = Math.min(rect.right + 8, window.innerWidth - 208);
+    const y = Math.min(rect.top, window.innerHeight - 208);
+    props.onPreview({ src: src(), x: Math.max(8, x), y: Math.max(8, y) });
+  };
+
   return (
     <span
-      class="inline-flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-100 dark:bg-gray-800"
+      class="inline-flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-100 dark:bg-gray-800"
       data-testid="activity-thumb"
+      onMouseEnter={showPreview}
+      onMouseLeave={() => props.onPreviewEnd()}
     >
       <Show
         when={!broken()}
@@ -295,9 +443,9 @@ const AssetThumb: Component<{ assetId: string }> = (props) => {
         }
       >
         <img
-          src={assetThumbUrl(props.assetId)}
+          src={src()}
           alt=""
-          class="h-8 w-8 object-cover"
+          class="h-9 w-9 object-cover"
           loading="lazy"
           onError={() => setBroken(true)}
         />

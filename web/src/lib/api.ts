@@ -381,6 +381,7 @@ interface ActivityEventBase {
 export type ActivityEvent =
   | (ActivityEventBase & {
       kind: "indexed";
+      asset_id: string;
       filename: string;
       person_count: number;
       has_gps: boolean;
@@ -430,4 +431,21 @@ export function fetchActivityStream(
   return request<ActivityStreamResponse>(`/api/v1/me/activity/stream${qs}`, {
     method: "GET",
   });
+}
+
+/// Library-indexing progress for the Activity status header (cycle-6 §8.1).
+export interface IndexStatus {
+  /// Assets indexed locally for the caller.
+  indexed: number;
+  /// Unix seconds of the last completed sweep, or null if never swept.
+  last_swept_at: number | null;
+  /// Best-effort live Immich asset count; null when the key is missing or
+  /// Immich is unreachable — render `indexed N` without the `/ M` denominator.
+  library_total: number | null;
+  /// True while the local index is still catching up to the library.
+  sweeping: boolean;
+}
+
+export function fetchIndexStatus(): Promise<ApiResult<IndexStatus>> {
+  return request<IndexStatus>("/api/v1/me/index/status", { method: "GET" });
 }
