@@ -24,7 +24,7 @@ interface Props {
   onChange: (next: MatchExpr) => void;
 }
 
-interface Partition {
+export interface Partition {
   /** The expression rendered in the main composer (NodeView at path `[]`). */
   positive: MatchExpr;
   /** The original exclude child nodes, in order — reused verbatim on recombine. */
@@ -52,8 +52,9 @@ function excludePersonId(node: MatchExpr): string | null {
 }
 
 // §3.1 — partition the root AND into positive + exclude buckets. A non-AND root
-// (or / not / leaf) is wholly positive with no excludes.
-function partitionRoot(root: MatchExpr): Partition {
+// (or / not / leaf) is wholly positive with no excludes. Exported for the §14
+// load→partition→recombine round-trip test.
+export function partitionRoot(root: MatchExpr): Partition {
   if (root.kind === "group" && root.op === "and") {
     const positiveChildren: MatchExpr[] = [];
     const excludeNodes: MatchExpr[] = [];
@@ -79,8 +80,8 @@ function partitionRoot(root: MatchExpr): Partition {
 // §3.2 — fold the (possibly edited) positive expression back together with the
 // excludes. A top-level positive AND is flattened so excludes stay direct
 // children of the root AND (matching the deployed shape + round-tripping bit-
-// for-bit); anything else is wrapped.
-function recombine(positive: MatchExpr, excludeNodes: MatchExpr[]): MatchExpr {
+// for-bit); anything else is wrapped. Exported for the §14 round-trip test.
+export function recombine(positive: MatchExpr, excludeNodes: MatchExpr[]): MatchExpr {
   if (excludeNodes.length === 0) return positive;
   if (positive.kind === "group" && positive.op === "and") {
     return and([...positive.children, ...excludeNodes]);
