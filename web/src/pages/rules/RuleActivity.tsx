@@ -1,318 +1,345 @@
-import {
-  createMemo,
-  createSignal,
-  For,
-  Show,
-  type Component,
-} from "solid-js";
+import { createSignal, For, onMount, Show, type Component } from "solid-js";
 import { A, useNavigate, useParams } from "@solidjs/router";
-import {
-  fetchDecisions,
-  fetchRuleRuns,
-  type DecisionItem,
-  type RuleRunItem,
-} from "../../lib/api";
-import { useLivePoll } from "../../lib/livePoll";
+import { fetchDecisions, getRule, type DecisionItem } from "../../lib/api";
 import { reasonLabel } from "../../lib/decisionReasons";
 
-const RUNS_LIMIT = 20;
-const DECISIONS_LIMIT = 50;
-const POLL_INTERVAL_MS = 5000;
+const PAGE_SIZE = 50;
+/// How close to the bottom of the scroll container (px) before the next page
+/// is fetched. Generous so the append feels seamless rather than juddery.
+const SCROLL_THRESHOLD_PX = 160;
+
+type Filter = "all" | "matched" | "skipped";
+
+const FILTERS: { key: Filter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "matched", label: "Matched" },
+  { key: "skipped", label: "Skipped" },
+];
+
+/// The Matched/Skipped chips map onto the `decision` verdict column; All sends
+/// no filter.
+function decisionParam(filter: Filter): "added" | "skipped" | undefined {
+  if (filter === "matched") return "added";
+  if (filter === "skipped") return "skipped";
+  return undefined;
+}
+
+function assetThumbUrl(assetId: string): string {
+  return `/api/v1/me/assets/${encodeURIComponent(assetId)}/thumbnail`;
+}
 
 const RuleActivity: Component = () => {
   const navigate = useNavigate();
   const params = useParams<{ id: string }>();
-  const [runs, setRuns] = createSignal<RuleRunItem[] | null>(null);
-  const [runsError, setRunsError] = createSignal<string | null>(null);
-  const [decisions, setDecisions] = createSignal<DecisionItem[] | null>(null);
-  const [decisionsTotal, setDecisionsTotal] = createSignal<number>(0);
-  const [decisionsError, setDecisionsError] = createSignal<string | null>(null);
 
-  const refresh = async () => {
-    const [runsRes, decisionsRes] = await Promise.all([
-      fetchRuleRuns(params.id, { limit: RUNS_LIMIT, offset: 0 }),
-      fetchDecisions(params.id, { limit: DECISIONS_LIMIT, offset: 0 }),
-    ]);
+  const [ruleName, setRuleName] = createSignal<string | null>(null);
+  const [filter, setFilter] = createSignal<Filter>("all");
+  const [decisions, setDecisions] = createSignal<DecisionItem[]>([]);
+  const [total, setTotal] = createSignal(0);
+  const [loading, setLoading] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [loaded, setLoaded] = createSignal(false);
 
-    if (runsRes.ok) {
-      setRuns(runsRes.data.runs);
-      setRunsError(null);
-    } else if (runsRes.status === 401) {
+  // Enlarged-thumbnail hover preview. Held at the page level with a `fixed`
+  // position so it escapes the table's `overflow` clip instead of being
+  // truncated inside the scroll container.
+  const [preview, setPreview] = createSignal<{
+    src: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const hasMore = () => decisions().length < total();
+
+  // Monotonic request token: a newer load (e.g. a filter switch) supersedes an
+  // in-flight one so a slow earlier response can't clobber fresher rows.
+  let reqSeq = 0;
+
+  const loadPage = async (reset: boolean) => {
+    if (loading() && !reset) return;
+    const mySeq = ++reqSeq;
+    setLoading(true);
+    const offset = reset ? 0 : decisions().length;
+    const res = await fetchDecisions(params.id, {
+      limit: PAGE_SIZE,
+      offset,
+      decision: decisionParam(filter()),
+    });
+    if (mySeq !== reqSeq) return; // superseded
+    setLoading(false);
+    setLoaded(true);
+    if (res.ok) {
+      setError(null);
+      setTotal(res.data.total);
+      if (reset) {
+        setDecisions(res.data.decisions);
+      } else {
+        setDecisions((prev) => [...prev, ...res.data.decisions]);
+      }
+    } else if (res.status === 401) {
       navigate("/login", { replace: true });
-      return;
-    } else if (runsRes.status === 404) {
-      setRunsError("Rule not found.");
+    } else if (res.status === 404) {
+      setError("Rule not found.");
     } else {
-      setRunsError("Could not load recent runs.");
-    }
-
-    if (decisionsRes.ok) {
-      setDecisions(decisionsRes.data.decisions);
-      setDecisionsTotal(decisionsRes.data.total);
-      setDecisionsError(null);
-    } else if (decisionsRes.status === 401) {
-      navigate("/login", { replace: true });
-      return;
-    } else if (decisionsRes.status === 404) {
-      setDecisionsError("Rule not found.");
-    } else {
-      setDecisionsError("Could not load recent decisions.");
+      setError("Could not load decisions.");
     }
   };
 
-  useLivePoll({ intervalMs: POLL_INTERVAL_MS, fetcher: refresh });
+  const selectFilter = (next: Filter) => {
+    if (next === filter()) return;
+    setFilter(next);
+    setDecisions([]);
+    void loadPage(true);
+  };
+
+  const onScroll = (e: Event) => {
+    const el = e.currentTarget as HTMLElement;
+    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (remaining <= SCROLL_THRESHOLD_PX && hasMore() && !loading()) {
+      void loadPage(false);
+    }
+  };
+
+  onMount(() => {
+    void getRule(params.id).then((res) => {
+      if (res.ok) setRuleName(res.data.name);
+      else if (res.status === 401) navigate("/login", { replace: true });
+    });
+    void loadPage(true);
+  });
 
   return (
     <section class="max-w-5xl mx-auto">
-      <div class="mb-6 flex flex-wrap items-center gap-3">
+      <div class="mb-6">
         <A
           href={`/rules/${params.id}`}
           class="text-sm text-ui-muted hover:text-immich-fg dark:hover:text-immich-dark-fg"
         >
-          ← Rule
+          ← Back to rule
         </A>
-        <h1 class="text-2xl font-semibold tracking-tight">Activity</h1>
-        <span
-          class="ml-auto inline-flex items-center gap-1.5 text-xs text-ui-muted"
-          aria-live="polite"
-        >
-          <span class="relative flex h-2 w-2" aria-hidden="true">
-            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-immich-primary opacity-60 dark:bg-immich-dark-primary" />
-            <span class="relative inline-flex h-2 w-2 rounded-full bg-immich-primary dark:bg-immich-dark-primary" />
-          </span>
-          Live — refreshing every {POLL_INTERVAL_MS / 1000}s
-        </span>
+        <h1 class="mt-1 text-2xl font-semibold tracking-tight">
+          Activity
+          <Show when={ruleName()}>
+            {(name) => (
+              <span class="text-ui-muted font-normal"> — {name()}</span>
+            )}
+          </Show>
+        </h1>
+        <p class="mt-1 text-sm text-ui-muted">
+          Every asset this rule has matched or skipped, newest first.
+        </p>
       </div>
 
-      <RunsPanel runs={runs()} error={runsError()} />
-      <DecisionsPanel
-        decisions={decisions()}
-        total={decisionsTotal()}
-        error={decisionsError()}
-      />
+      <div class="rounded-2xl border border-ui-border bg-white shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray">
+        <header class="flex flex-wrap items-center gap-3 border-b border-ui-border px-5 py-3 dark:border-gray-700">
+          <h2 class="text-base font-semibold">Decisions</h2>
+          <div
+            class="flex items-center gap-1"
+            role="tablist"
+            aria-label="Filter decisions"
+          >
+            <For each={FILTERS}>
+              {(f) => (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={filter() === f.key}
+                  data-testid={`filter-${f.key}`}
+                  onClick={() => selectFilter(f.key)}
+                  class={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+                    filter() === f.key
+                      ? "bg-immich-primary text-white dark:bg-immich-dark-primary dark:text-immich-dark-bg"
+                      : "text-ui-muted hover:bg-slate-100 dark:hover:bg-gray-700/50"
+                  }`}
+                >
+                  {f.label}
+                </button>
+              )}
+            </For>
+          </div>
+          <span class="ml-auto text-xs text-ui-muted tabular-nums">
+            <Show when={loaded()} fallback="Loading…">
+              {total()} {filter() === "all" ? "total" : "shown"}
+            </Show>
+          </span>
+        </header>
+
+        <Show
+          when={error() === null}
+          fallback={
+            <p class="px-5 py-6 text-sm text-ui-danger" role="alert">
+              {error()}
+            </p>
+          }
+        >
+          <Show
+            when={loaded()}
+            fallback={
+              <p class="px-5 py-6 text-sm text-ui-muted">Loading decisions…</p>
+            }
+          >
+            <Show
+              when={decisions().length > 0}
+              fallback={
+                <p class="px-5 py-6 text-sm text-ui-muted">
+                  No {filter() === "all" ? "" : `${filter()} `}decisions yet.
+                  They'll appear here after the rule's next poll cycle.
+                </p>
+              }
+            >
+              <div
+                class="max-h-[28rem] overflow-y-auto"
+                data-testid="decisions-scroll"
+                onScroll={onScroll}
+              >
+                <table class="min-w-full text-sm">
+                  <thead class="sticky top-0 z-10 bg-slate-50 dark:bg-immich-dark-gray">
+                    <tr class="border-b border-ui-border dark:border-gray-700">
+                      <th class="px-4 py-2 text-left font-medium text-ui-muted">
+                        Asset
+                      </th>
+                      <th class="px-4 py-2 text-left font-medium text-ui-muted">
+                        Decision
+                      </th>
+                      <th class="px-4 py-2 text-left font-medium text-ui-muted">
+                        Reason
+                      </th>
+                      <th class="px-4 py-2 text-left font-medium text-ui-muted">
+                        Decided
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-ui-border dark:divide-gray-800">
+                    <For each={decisions()}>
+                      {(row) => (
+                        <DecisionRow
+                          row={row}
+                          onPreview={setPreview}
+                          onPreviewEnd={() => setPreview(null)}
+                        />
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+
+                <div class="px-4 py-3 text-center">
+                  <Show
+                    when={hasMore()}
+                    fallback={
+                      <span class="text-xs text-ui-muted">
+                        <Show when={decisions().length > 0}>
+                          End of list — {decisions().length} shown
+                        </Show>
+                      </span>
+                    }
+                  >
+                    <button
+                      type="button"
+                      data-testid="load-more"
+                      disabled={loading()}
+                      onClick={() => void loadPage(false)}
+                      class="rounded-lg border border-ui-border px-3 py-1.5 text-xs font-medium text-ui-muted hover:bg-slate-100 disabled:opacity-50 dark:border-gray-700 dark:hover:bg-gray-700/50"
+                    >
+                      {loading() ? "Loading…" : "Load more"}
+                    </button>
+                  </Show>
+                </div>
+              </div>
+            </Show>
+          </Show>
+        </Show>
+      </div>
+
+      <Show when={preview()}>
+        {(p) => (
+          <div
+            ref={(el) => {
+              el.style.left = `${p().x}px`;
+              el.style.top = `${p().y}px`;
+            }}
+            class="pointer-events-none fixed z-50 overflow-hidden rounded-xl border border-ui-border bg-white shadow-xl dark:border-gray-700 dark:bg-immich-dark-gray"
+            data-testid="thumb-preview"
+          >
+            <img
+              src={p().src}
+              alt=""
+              class="h-48 w-48 object-cover"
+              loading="lazy"
+            />
+          </div>
+        )}
+      </Show>
     </section>
   );
 };
 
-const RunsPanel: Component<{
-  runs: RuleRunItem[] | null;
-  error: string | null;
+const DecisionRow: Component<{
+  row: DecisionItem;
+  onPreview: (p: { src: string; x: number; y: number }) => void;
+  onPreviewEnd: () => void;
 }> = (props) => {
-  return (
-    <div class="mb-8 rounded-2xl border border-ui-border bg-white shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray">
-      <header class="border-b border-ui-border px-5 py-3 dark:border-gray-700">
-        <h2 class="text-base font-semibold">Recent runs</h2>
-        <p class="mt-0.5 text-xs text-ui-muted">
-          Last {RUNS_LIMIT} cycles, newest first.
-        </p>
-      </header>
-      <Show
-        when={props.error === null}
-        fallback={
-          <p class="px-5 py-6 text-sm text-ui-danger" role="alert">
-            {props.error}
-          </p>
-        }
-      >
-        <Show
-          when={props.runs !== null}
-          fallback={
-            <p class="px-5 py-6 text-sm text-ui-muted">Loading runs…</p>
-          }
-        >
-          <Show
-            when={(props.runs ?? []).length > 0}
-            fallback={
-              <p class="px-5 py-6 text-sm text-ui-muted">
-                No runs yet. The first row will appear after the rule's next
-                poll cycle.
-              </p>
-            }
-          >
-            <div class="overflow-x-auto">
-              <table class="min-w-full divide-y divide-ui-border text-sm dark:divide-gray-700">
-                <thead class="bg-slate-50 dark:bg-gray-800/40">
-                  <tr>
-                    <th class="px-4 py-2 text-left font-medium text-ui-muted">
-                      Started
-                    </th>
-                    <th class="px-4 py-2 text-left font-medium text-ui-muted">
-                      Duration
-                    </th>
-                    <th class="px-4 py-2 text-right font-medium text-ui-muted">
-                      Evaluated
-                    </th>
-                    <th class="px-4 py-2 text-right font-medium text-ui-muted">
-                      Added
-                    </th>
-                    <th class="px-4 py-2 text-right font-medium text-ui-muted">
-                      Skipped
-                    </th>
-                    <th class="px-4 py-2 text-left font-medium text-ui-muted">
-                      Status
-                    </th>
-                  </tr>
-                </thead>
-                <tbody class="divide-y divide-ui-border dark:divide-gray-800">
-                  <For each={props.runs ?? []}>
-                    {(row) => <RunRow row={row} />}
-                  </For>
-                </tbody>
-              </table>
-            </div>
-          </Show>
-        </Show>
-      </Show>
-    </div>
-  );
-};
+  const [broken, setBroken] = createSignal(false);
+  const src = () => assetThumbUrl(props.row.asset_id);
+  const label = () => props.row.filename ?? shortHash(props.row.asset_id);
 
-const RunRow: Component<{ row: RuleRunItem }> = (props) => {
-  const duration = createMemo(() => {
-    if (props.row.finished_at === null) return null;
-    const ms = (props.row.finished_at - props.row.started_at) * 1000;
-    return ms;
-  });
-  const hasError = createMemo(() => props.row.error_message !== null);
-  return (
-    <tr
-      class={
-        hasError()
-          ? "bg-red-50 text-red-900 dark:bg-red-900/20 dark:text-red-200"
-          : ""
-      }
-      data-testid={hasError() ? "run-row-error" : "run-row"}
-    >
-      <td class="whitespace-nowrap px-4 py-2 text-immich-fg dark:text-immich-dark-fg">
-        {formatTimestamp(props.row.started_at)}
-      </td>
-      <td class="whitespace-nowrap px-4 py-2 text-ui-muted">
-        {props.row.finished_at === null
-          ? "running…"
-          : formatDuration(duration() ?? 0)}
-      </td>
-      <td class="whitespace-nowrap px-4 py-2 text-right tabular-nums">
-        {props.row.assets_evaluated}
-      </td>
-      <td class="whitespace-nowrap px-4 py-2 text-right tabular-nums">
-        {props.row.assets_added}
-      </td>
-      <td class="whitespace-nowrap px-4 py-2 text-right tabular-nums">
-        {props.row.assets_skipped}
-      </td>
-      <td class="px-4 py-2">
-        <Show
-          when={props.row.error_message}
-          fallback={
-            <span class="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-500/20 dark:text-emerald-200">
-              ok
-            </span>
-          }
-        >
-          {(msg) => (
-            <span
-              class="inline-block max-w-xs truncate align-middle text-xs"
-              title={msg()}
-            >
-              {msg()}
-            </span>
-          )}
-        </Show>
-      </td>
-    </tr>
-  );
-};
-
-const DecisionsPanel: Component<{
-  decisions: DecisionItem[] | null;
-  total: number;
-  error: string | null;
-}> = (props) => {
-  return (
-    <div class="rounded-2xl border border-ui-border bg-white shadow-sm dark:border-immich-dark-gray dark:bg-immich-dark-gray">
-      <header class="border-b border-ui-border px-5 py-3 dark:border-gray-700">
-        <h2 class="text-base font-semibold">Recent decisions</h2>
-        <p class="mt-0.5 text-xs text-ui-muted">
-          Last {DECISIONS_LIMIT} decisions, newest first.
-          <Show when={props.total > 0}>
-            {" "}
-            <span>{props.total} total</span>
-          </Show>
-        </p>
-      </header>
-      <Show
-        when={props.error === null}
-        fallback={
-          <p class="px-5 py-6 text-sm text-ui-danger" role="alert">
-            {props.error}
-          </p>
-        }
-      >
-        <Show
-          when={props.decisions !== null}
-          fallback={
-            <p class="px-5 py-6 text-sm text-ui-muted">Loading decisions…</p>
-          }
-        >
-          <Show
-            when={(props.decisions ?? []).length > 0}
-            fallback={
-              <p class="px-5 py-6 text-sm text-ui-muted">
-                No decisions yet. They'll appear here after the rule's next
-                poll cycle.
-              </p>
-            }
-          >
-            <div class="overflow-x-auto">
-              <table class="min-w-full divide-y divide-ui-border text-sm dark:divide-gray-700">
-                <thead class="bg-slate-50 dark:bg-gray-800/40">
-                  <tr>
-                    <th class="px-4 py-2 text-left font-medium text-ui-muted">
-                      Asset
-                    </th>
-                    <th class="px-4 py-2 text-left font-medium text-ui-muted">
-                      Decision
-                    </th>
-                    <th class="px-4 py-2 text-left font-medium text-ui-muted">
-                      Reason
-                    </th>
-                    <th class="px-4 py-2 text-left font-medium text-ui-muted">
-                      Decided
-                    </th>
-                  </tr>
-                </thead>
-                <tbody class="divide-y divide-ui-border dark:divide-gray-800">
-                  <For each={props.decisions ?? []}>
-                    {(row) => <DecisionRow row={row} />}
-                  </For>
-                </tbody>
-              </table>
-            </div>
-          </Show>
-        </Show>
-      </Show>
-    </div>
-  );
-};
-
-const DecisionRow: Component<{ row: DecisionItem }> = (props) => {
   const decisionClass = () =>
     props.row.decision === "added"
       ? "bg-emerald-100 text-emerald-800 ring-emerald-200 dark:bg-emerald-500/20 dark:text-emerald-200 dark:ring-emerald-500/30"
       : "bg-slate-100 text-slate-700 ring-slate-200 dark:bg-gray-700 dark:text-gray-200 dark:ring-gray-600";
+
+  const showPreview = (e: MouseEvent) => {
+    if (broken()) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // Anchor to the right of the thumbnail, clamped into the viewport so a row
+    // near the bottom of the table doesn't push the preview off-screen.
+    const x = Math.min(rect.right + 8, window.innerWidth - 208);
+    const y = Math.min(rect.top, window.innerHeight - 208);
+    props.onPreview({ src: src(), x: Math.max(8, x), y: Math.max(8, y) });
+  };
+
   return (
     <tr>
-      <td class="whitespace-nowrap px-4 py-2 font-mono text-xs">
-        {shortHash(props.row.asset_id)}
+      <td class="px-4 py-2">
+        <div class="flex items-center gap-3">
+          <span
+            class="inline-flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-100 dark:bg-gray-800"
+            data-testid="thumb"
+            onMouseEnter={showPreview}
+            onMouseLeave={() => props.onPreviewEnd()}
+          >
+            <Show
+              when={!broken()}
+              fallback={
+                <span class="text-[10px] text-ui-muted" aria-hidden="true">
+                  ?
+                </span>
+              }
+            >
+              <img
+                src={src()}
+                alt={label()}
+                class="h-9 w-9 object-cover"
+                loading="lazy"
+                onError={() => setBroken(true)}
+              />
+            </Show>
+          </span>
+          <span
+            class="max-w-[16rem] truncate text-immich-fg dark:text-immich-dark-fg"
+            title={props.row.asset_id}
+          >
+            {label()}
+          </span>
+        </div>
       </td>
       <td class="px-4 py-2">
         <span
           class={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${decisionClass()}`}
         >
-          {props.row.decision}
+          {props.row.decision === "added" ? "matched" : "skipped"}
         </span>
       </td>
-      <td class="px-4 py-2">{reasonLabel(props.row.reason)}</td>
+      <td class="px-4 py-2 text-ui-muted">{reasonLabel(props.row.reason)}</td>
       <td class="whitespace-nowrap px-4 py-2 text-ui-muted">
         {formatTimestamp(props.row.decided_at)}
       </td>
@@ -335,14 +362,6 @@ function formatTimestamp(seconds: number): string {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${Math.max(0, Math.round(ms))} ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.round((ms % 60_000) / 1000);
-  return `${minutes}m ${seconds}s`;
 }
 
 export default RuleActivity;

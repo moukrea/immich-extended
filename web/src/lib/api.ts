@@ -208,6 +208,9 @@ export interface DecisionItem {
   reason: string;
   run_id: string | null;
   decided_at: number;
+  /// Human filename from the asset index; null when the asset isn't indexed
+  /// (deleted / not yet swept) — the UI falls back to a short hash of the id.
+  filename: string | null;
 }
 
 export interface DecisionsResponse {
@@ -221,6 +224,8 @@ export interface FetchDecisionsParams {
   limit?: number;
   offset?: number;
   reasons?: string[];
+  /// Verdict filter for the Matched/Skipped chips. Omit for the All chip.
+  decision?: "added" | "skipped";
 }
 
 export function fetchDecisions(
@@ -233,6 +238,7 @@ export function fetchDecisions(
   if (params.reasons && params.reasons.length > 0) {
     search.set("reason", params.reasons.join(","));
   }
+  if (params.decision !== undefined) search.set("decision", params.decision);
   const qs = search.toString();
   const path = `/api/v1/rules/${encodeURIComponent(ruleId)}/decisions${
     qs ? `?${qs}` : ""

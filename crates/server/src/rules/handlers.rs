@@ -525,6 +525,10 @@ pub struct DecisionsQuery {
     /// Empty / missing means no filter. Whitespace / empty tokens are dropped.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Decision verdict filter for the Activity table's Matched/Skipped chips
+    /// (T32): `added` or `skipped`. Missing means no filter (the All chip).
+    #[serde(default)]
+    pub decision: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -534,6 +538,9 @@ pub struct DecisionItem {
     pub reason: String,
     pub run_id: Option<String>,
     pub decided_at: i64,
+    /// Human filename from `asset_index` (T28); `null` when the asset is not
+    /// indexed (deleted / not yet swept) so the UI falls back to a short hash.
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -609,11 +616,25 @@ pub(super) async fn list_rule_decisions(
                 .collect()
         })
         .unwrap_or_default();
+    let decision = match params.decision.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(d @ ("added" | "skipped")) => Some(d),
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_decision",
+                    "detail": format!("decision must be 'added' or 'skipped', got '{other}'"),
+                })),
+            ));
+        }
+    };
 
-    let rows = list_decisions_for_rule_filtered(&state.db, &id, &reasons, limit, offset)
-        .await
-        .map_err(decisions_error_response)?;
-    let total = count_decisions_for_rule_filtered(&state.db, &id, &reasons)
+    let rows =
+        list_decisions_for_rule_filtered(&state.db, &id, &uid, &reasons, decision, limit, offset)
+            .await
+            .map_err(decisions_error_response)?;
+    let total = count_decisions_for_rule_filtered(&state.db, &id, &reasons, decision)
         .await
         .map_err(decisions_error_response)?;
 
@@ -625,6 +646,7 @@ pub(super) async fn list_rule_decisions(
             reason: r.reason,
             run_id: r.run_id,
             decided_at: r.decided_at,
+            filename: r.filename,
         })
         .collect();
 

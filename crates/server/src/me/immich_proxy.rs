@@ -1,4 +1,5 @@
-//! `/api/v1/me/people` + `/api/v1/me/albums` + `/api/v1/me/people/:id/thumbnail`.
+//! `/api/v1/me/people` + `/api/v1/me/albums` + `/api/v1/me/people/:id/thumbnail`
+//! + `/api/v1/me/assets/:id/thumbnail`.
 //!
 //! Read-only proxies the rule builder uses to populate its people / target-
 //! album controls. Every call decrypts the caller's stored Immich API key,
@@ -119,6 +120,31 @@ pub(super) async fn person_thumbnail(
     let bytes = resolved
         .client
         .download_person_thumbnail(&resolved.api_key, &person_id)
+        .await
+        .map_err(immich_error_response)?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "private, max-age=86400"),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+/// `GET /api/v1/me/assets/:id/thumbnail` — JPEG bytes pass-through for the
+/// per-rule decisions table (T32). Same cookie-auth + private-cache contract
+/// as [`person_thumbnail`]; the Immich API key never reaches the browser.
+pub(super) async fn asset_thumbnail(
+    State(state): State<AppState>,
+    AuthenticatedUser(UserId(uid)): AuthenticatedUser,
+    Path(asset_id): Path<String>,
+) -> Result<Response, ErrorResponse> {
+    let resolved = load_resolved_key(&state, &uid).await?;
+    let bytes = resolved
+        .client
+        .download_thumbnail(&resolved.api_key, &asset_id)
         .await
         .map_err(immich_error_response)?;
     Ok((

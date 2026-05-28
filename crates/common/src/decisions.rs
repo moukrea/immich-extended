@@ -25,6 +25,22 @@ pub struct DecisionRow {
     pub decided_at: i64,
 }
 
+/// A decision row enriched with the asset's `filename` from `asset_index`
+/// (T28). The per-rule Activity table (T32) shows the human filename + a
+/// thumbnail instead of the raw asset UUID. `filename` is `None` when the
+/// asset is not (yet) in the index — e.g. it was deleted from Immich, or the
+/// background indexer hasn't reached it — and the UI falls back to a short
+/// hash of the id.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DecisionDetailRow {
+    pub asset_id: String,
+    pub decision: String,
+    pub reason: String,
+    pub run_id: Option<String>,
+    pub decided_at: i64,
+    pub filename: Option<String>,
+}
+
 /// One row in `rule_runs` as returned to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleRunRow {
@@ -126,64 +142,83 @@ pub async fn count_decisions_for_rule(
     Ok(total)
 }
 
-/// Same as [`list_decisions_for_rule`], but additionally filters by `reasons`.
+/// List decisions for `rule_id`, newest first, enriched with each asset's
+/// `filename` and optionally narrowed by `reasons` and/or `decision`.
 ///
-/// An empty `reasons` slice delegates to the unfiltered helper so the offline
-/// `.sqlx/` cache still covers the common path. The non-empty branch builds a
-/// dynamic `IN (?, ?, …)` clause via [`sqlx::QueryBuilder`], which does NOT go
-/// through the offline cache (the macro can't validate a variable-length IN
-/// list). The frontend caps the reason filter at the known slug set so the
-/// query length stays bounded.
+/// `user_id` scopes the `asset_index` LEFT JOIN that supplies `filename` — it
+/// must be the rule owner (the handler already verifies ownership). The join
+/// is LEFT so decisions for un-indexed / deleted assets still surface with a
+/// `None` filename.
+///
+/// `reasons` is an `IN (…)` filter (empty = no reason filter); `decision`, when
+/// `Some`, narrows to `'added'` / `'skipped'`. Because the shape is dynamic
+/// (variable IN-list + the JOIN), this uses [`sqlx::QueryBuilder`] rather than
+/// the offline `.sqlx/` macro cache. All user input arrives via bind
+/// parameters, so the dynamic SQL is injection-safe; the frontend caps the
+/// reason filter to the known slug set so the query length stays bounded.
 pub async fn list_decisions_for_rule_filtered(
     pool: &SqlitePool,
     rule_id: &str,
+    user_id: &str,
     reasons: &[&str],
+    decision: Option<&str>,
     limit: i64,
     offset: i64,
-) -> Result<Vec<DecisionRow>, DecisionsError> {
-    if reasons.is_empty() {
-        return list_decisions_for_rule(pool, rule_id, limit, offset).await;
-    }
+) -> Result<Vec<DecisionDetailRow>, DecisionsError> {
     let mut q: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
-        "SELECT rule_id, asset_id, decision, reason, run_id, decided_at \
-         FROM asset_decisions \
-         WHERE rule_id = ",
+        "SELECT ad.asset_id AS asset_id, ad.decision AS decision, ad.reason AS reason, \
+                ad.run_id AS run_id, ad.decided_at AS decided_at, ai.filename AS filename \
+         FROM asset_decisions ad \
+         LEFT JOIN asset_index ai ON ai.user_id = ",
     );
+    q.push_bind(user_id);
+    q.push(" AND ai.asset_id = ad.asset_id WHERE ad.rule_id = ");
     q.push_bind(rule_id);
-    q.push(" AND reason IN (");
-    let mut sep = q.separated(", ");
-    for r in reasons {
-        sep.push_bind(*r);
+    if !reasons.is_empty() {
+        q.push(" AND ad.reason IN (");
+        let mut sep = q.separated(", ");
+        for r in reasons {
+            sep.push_bind(*r);
+        }
+        q.push(")");
     }
-    q.push(") ORDER BY decided_at DESC LIMIT ");
+    if let Some(d) = decision {
+        q.push(" AND ad.decision = ");
+        q.push_bind(d);
+    }
+    q.push(" ORDER BY ad.decided_at DESC LIMIT ");
     q.push_bind(limit);
     q.push(" OFFSET ");
     q.push_bind(offset);
-    let rows: Vec<DecisionRow> = q.build_query_as().fetch_all(pool).await?;
+    let rows: Vec<DecisionDetailRow> = q.build_query_as().fetch_all(pool).await?;
     Ok(rows)
 }
 
-/// Same as [`count_decisions_for_rule`], but additionally filters by `reasons`.
-///
-/// Mirrors [`list_decisions_for_rule_filtered`] so the handler's `total`
-/// stays consistent with the paginated list when a reason filter is active.
+/// Count decisions for `rule_id` under the same `reasons` / `decision` filter
+/// as [`list_decisions_for_rule_filtered`], so the handler's `total` stays
+/// consistent with the paginated list. No JOIN needed — count is over
+/// `asset_decisions` alone.
 pub async fn count_decisions_for_rule_filtered(
     pool: &SqlitePool,
     rule_id: &str,
     reasons: &[&str],
+    decision: Option<&str>,
 ) -> Result<i64, DecisionsError> {
-    if reasons.is_empty() {
-        return count_decisions_for_rule(pool, rule_id).await;
-    }
     let mut q: QueryBuilder<'_, Sqlite> =
         QueryBuilder::new("SELECT COUNT(*) FROM asset_decisions WHERE rule_id = ");
     q.push_bind(rule_id);
-    q.push(" AND reason IN (");
-    let mut sep = q.separated(", ");
-    for r in reasons {
-        sep.push_bind(*r);
+    if !reasons.is_empty() {
+        q.push(" AND reason IN (");
+        let mut sep = q.separated(", ");
+        for r in reasons {
+            sep.push_bind(*r);
+        }
+        q.push(")");
     }
-    q.push(")");
+    if let Some(d) = decision {
+        q.push(" AND decision = ");
+        q.push_bind(d);
+    }
     let total: i64 = q.build_query_scalar().fetch_one(pool).await?;
     Ok(total)
 }
@@ -472,70 +507,179 @@ mod tests {
         .await
         .unwrap();
 
-        // Empty filter delegates to the unfiltered helper.
-        let rows = list_decisions_for_rule_filtered(&pool, "r1", &[], 10, 0)
+        // Empty filter → all rows, newest first.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", "u1", &[], None, 10, 0)
             .await
             .unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(
-            count_decisions_for_rule_filtered(&pool, "r1", &[])
+            count_decisions_for_rule_filtered(&pool, "r1", &[], None)
                 .await
                 .unwrap(),
             4,
         );
 
         // Single reason → only matching rows + count.
-        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["matched"], 10, 0)
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", "u1", &["matched"], None, 10, 0)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].asset_id, "a");
         assert_eq!(
-            count_decisions_for_rule_filtered(&pool, "r1", &["matched"])
+            count_decisions_for_rule_filtered(&pool, "r1", &["matched"], None)
                 .await
                 .unwrap(),
             1,
         );
 
         // Multi reason → IN clause walks the list.
-        let rows =
-            list_decisions_for_rule_filtered(&pool, "r1", &["matched", "date_out_of_range"], 10, 0)
-                .await
-                .unwrap();
+        let rows = list_decisions_for_rule_filtered(
+            &pool,
+            "r1",
+            "u1",
+            &["matched", "date_out_of_range"],
+            None,
+            10,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].asset_id, "c"); // newest-first
         assert_eq!(rows[1].asset_id, "b");
         assert_eq!(rows[2].asset_id, "a");
         assert_eq!(
-            count_decisions_for_rule_filtered(&pool, "r1", &["matched", "date_out_of_range"])
+            count_decisions_for_rule_filtered(&pool, "r1", &["matched", "date_out_of_range"], None)
                 .await
                 .unwrap(),
             3,
         );
 
         // Unknown reason → empty, total 0.
-        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["does_not_exist"], 10, 0)
-            .await
-            .unwrap();
+        let rows =
+            list_decisions_for_rule_filtered(&pool, "r1", "u1", &["does_not_exist"], None, 10, 0)
+                .await
+                .unwrap();
         assert!(rows.is_empty());
         assert_eq!(
-            count_decisions_for_rule_filtered(&pool, "r1", &["does_not_exist"])
+            count_decisions_for_rule_filtered(&pool, "r1", &["does_not_exist"], None)
                 .await
                 .unwrap(),
             0,
         );
 
         // Pagination still works through the filtered path.
-        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["date_out_of_range"], 1, 0)
+        let rows =
+            list_decisions_for_rule_filtered(&pool, "r1", "u1", &["date_out_of_range"], None, 1, 0)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id, "c");
+        let rows =
+            list_decisions_for_rule_filtered(&pool, "r1", "u1", &["date_out_of_range"], None, 1, 1)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id, "b");
+    }
+
+    /// Insert a minimal `asset_index` row so the LEFT JOIN can resolve a
+    /// filename for `(user_id, asset_id)`.
+    async fn seed_index_row(pool: &SqlitePool, user_id: &str, asset_id: &str, filename: &str) {
+        sqlx::query(
+            "INSERT INTO asset_index \
+                 (user_id, asset_id, filename, updated_at, media_type, indexed_at) \
+             VALUES (?, ?, ?, 0, 'image', 0)",
+        )
+        .bind(user_id)
+        .bind(asset_id)
+        .bind(filename)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn filtered_decisions_carry_filename_and_respect_decision_filter() {
+        let pool = fresh_pool().await;
+        seed_user_and_rule(&pool, "u1", "r1").await;
+
+        upsert_decision(&pool, "r1", "a", "added", "matched", None, 100)
+            .await
+            .unwrap();
+        upsert_decision(&pool, "r1", "b", "skipped", "date_out_of_range", None, 200)
+            .await
+            .unwrap();
+        // "a" is indexed (has a filename); "b" is not (deleted / un-indexed).
+        seed_index_row(&pool, "u1", "a", "IMG_0001.jpg").await;
+
+        // Unfiltered: both rows, filename present only where the index has it.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", "u1", &[], None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let added = rows.iter().find(|r| r.asset_id == "a").unwrap();
+        assert_eq!(added.filename.as_deref(), Some("IMG_0001.jpg"));
+        let skipped = rows.iter().find(|r| r.asset_id == "b").unwrap();
+        assert_eq!(skipped.filename, None, "un-indexed asset → None filename");
+
+        // The index join is scoped by user_id: another user's index row with
+        // the same asset_id must not leak in.
+        seed_user_and_rule(&pool, "u2", "r2").await;
+        seed_index_row(&pool, "u2", "a", "WRONG.jpg").await;
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", "u1", &[], None, 10, 0)
+            .await
+            .unwrap();
+        let added = rows.iter().find(|r| r.asset_id == "a").unwrap();
+        assert_eq!(added.filename.as_deref(), Some("IMG_0001.jpg"));
+
+        // decision=added → only the added row + matching count.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", "u1", &[], Some("added"), 10, 0)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].asset_id, "c");
-        let rows = list_decisions_for_rule_filtered(&pool, "r1", &["date_out_of_range"], 1, 1)
+        assert_eq!(rows[0].asset_id, "a");
+        assert_eq!(rows[0].decision, "added");
+        assert_eq!(
+            count_decisions_for_rule_filtered(&pool, "r1", &[], Some("added"))
+                .await
+                .unwrap(),
+            1,
+        );
+
+        // decision=skipped → only the skipped row.
+        let rows = list_decisions_for_rule_filtered(&pool, "r1", "u1", &[], Some("skipped"), 10, 0)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].asset_id, "b");
+        assert_eq!(rows[0].decision, "skipped");
+        assert_eq!(
+            count_decisions_for_rule_filtered(&pool, "r1", &[], Some("skipped"))
+                .await
+                .unwrap(),
+            1,
+        );
+
+        // reason + decision compose (AND).
+        let rows =
+            list_decisions_for_rule_filtered(&pool, "r1", "u1", &["matched"], Some("added"), 10, 0)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id, "a");
+        let rows = list_decisions_for_rule_filtered(
+            &pool,
+            "r1",
+            "u1",
+            &["matched"],
+            Some("skipped"),
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty(), "matched+skipped is contradictory → empty");
     }
 
     #[tokio::test]

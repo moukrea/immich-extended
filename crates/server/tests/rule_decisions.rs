@@ -431,6 +431,120 @@ async fn reason_filter_unknown_value_returns_empty_with_zero_total() {
     assert_eq!(body["offset"], 0);
 }
 
+/// Insert an `asset_index` row so the decisions LEFT JOIN can resolve a
+/// filename for `(owner, asset_id)`.
+async fn seed_index_row(pool: &SqlitePool, owner: &str, asset_id: &str, filename: &str) {
+    sqlx::query(
+        "INSERT INTO asset_index \
+             (user_id, asset_id, filename, updated_at, media_type, indexed_at) \
+         VALUES (?, ?, ?, 0, 'image', 0)",
+    )
+    .bind(owner)
+    .bind(asset_id)
+    .bind(filename)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn decisions_carry_filename_and_filter_by_decision() {
+    let (state, pool, owner_a, _b) = fresh_state_two_users().await;
+    let cookie = login(&state, OWNER_A_EMAIL, OWNER_A_PW).await;
+    let rule_id = create_rule_as(&state, &cookie, YAML_RULE_A).await;
+
+    upsert_decision(&pool, &rule_id, "asset-add", "added", "matched", None, 2000)
+        .await
+        .unwrap();
+    upsert_decision(
+        &pool,
+        &rule_id,
+        "asset-skip",
+        "skipped",
+        "date_out_of_range",
+        None,
+        1000,
+    )
+    .await
+    .unwrap();
+    // Only the added asset is indexed; the skipped one is not.
+    seed_index_row(&pool, &owner_a, "asset-add", "IMG_2942.jpg").await;
+
+    // Unfiltered → filename present where indexed, null otherwise.
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{rule_id}/decisions"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let decisions = body["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0]["asset_id"], "asset-add"); // newest first
+    assert_eq!(decisions[0]["filename"], "IMG_2942.jpg");
+    assert_eq!(decisions[1]["asset_id"], "asset-skip");
+    assert!(
+        decisions[1]["filename"].is_null(),
+        "un-indexed asset surfaces with a null filename",
+    );
+
+    // decision=added → only the added row + matching total.
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{rule_id}/decisions?decision=added"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let decisions = body["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["asset_id"], "asset-add");
+    assert_eq!(body["total"], 1);
+
+    // decision=skipped → only the skipped row.
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{rule_id}/decisions?decision=skipped"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let decisions = body["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["asset_id"], "asset-skip");
+    assert_eq!(body["total"], 1);
+
+    // Bogus decision verb → 400.
+    let resp = call(
+        &state,
+        req(
+            Method::GET,
+            &format!("/api/v1/rules/{rule_id}/decisions?decision=banana"),
+            None,
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "invalid_decision");
+}
+
 #[tokio::test]
 async fn empty_result_returns_200_with_empty_array() {
     let (state, _pool, _a, _b) = fresh_state_two_users().await;

@@ -18,5 +18,6 @@ pub fn router() -> Router<AppState> {
         .route("/immich-key", delete(immich_key::delete_key))
         .route("/people", get(immich_proxy::list_people))
         .route("/people/:id/thumbnail", get(immich_proxy::person_thumbnail))
+        .route("/assets/:id/thumbnail", get(immich_proxy::asset_thumbnail))
         .route("/albums", get(immich_proxy::list_albums))
 }
