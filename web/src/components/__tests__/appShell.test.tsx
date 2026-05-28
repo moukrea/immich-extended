@@ -85,30 +85,47 @@ describe("AppShell", () => {
     expect(getByTestId("topbar")).not.toBeNull();
     expect(getByTestId("sidebar")).not.toBeNull();
     expect(getByTestId("page").textContent).toBe("hello");
-    expect(getByTestId("topbar-user-name").textContent).toBe("Alice");
+    expect(getByTestId("account-menu-button")).not.toBeNull();
     expect(container.textContent).toContain("Rules");
     expect(container.textContent).toContain("Activity");
     expect(container.textContent).toContain("Settings");
   });
 
-  it("falls back to email when display_name is null", () => {
-    const { getByTestId } = render(() => (
+  it("exposes name + email only inside the account menu popup", () => {
+    const { getByTestId, queryByTestId } = render(() => (
       <AppShell
         initialMe={{ user_id: "u1", email: "a@b.com", display_name: null }}
       >
         <span />
       </AppShell>
     ));
-    expect(getByTestId("topbar-user-name").textContent).toBe("a@b.com");
+    // Closed: identity is not in the DOM.
+    expect(queryByTestId("account-menu-name")).toBeNull();
+    fireEvent.click(getByTestId("account-menu-button"));
+    // Open: name falls back to email when display_name is null.
+    expect(getByTestId("account-menu-name").textContent).toBe("a@b.com");
   });
 
-  it("signs out via api + navigates to /login", async () => {
+  it("has no sign-out controls outside the account menu", () => {
+    const { queryByTestId } = render(() => (
+      <AppShell initialMe={{ user_id: "u1", email: "a@b", display_name: "Alice" }}>
+        <span />
+      </AppShell>
+    ));
+    expect(queryByTestId("topbar-signout")).toBeNull();
+    expect(queryByTestId("sidebar-signout")).toBeNull();
+    // The only sign-out lives in the (closed-by-default) account menu.
+    expect(queryByTestId("account-menu-signout")).toBeNull();
+  });
+
+  it("signs out via the account menu + navigates to /login", async () => {
     const { getByTestId } = render(() => (
       <AppShell initialMe={{ user_id: "u1", email: "a@b", display_name: null }}>
         <span />
       </AppShell>
     ));
-    fireEvent.click(getByTestId("topbar-signout"));
+    fireEvent.click(getByTestId("account-menu-button"));
+    fireEvent.click(getByTestId("account-menu-signout"));
     // microtask drain
     await Promise.resolve();
     await Promise.resolve();

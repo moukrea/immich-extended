@@ -131,37 +131,6 @@ const AppShell: Component<AppShellProps> = (props) => {
           ].join(" ")}
         >
           <SidebarNav items={navItems()} />
-          <div class="mt-auto pt-4">
-            <button
-              type="button"
-              data-testid="sidebar-signout"
-              onClick={signOut}
-              class={[
-                "flex w-full items-center gap-3 rounded-xl px-3 py-2",
-                "text-sm font-medium text-gray-700 dark:text-gray-300",
-                "hover:bg-immich-primary/10 dark:hover:bg-immich-dark-primary/10",
-                "hover:text-immich-primary dark:hover:text-immich-dark-primary",
-                "transition ease-immich duration-150",
-                "focus:outline-none focus-visible:ring-2 focus-visible:ring-immich-primary",
-              ].join(" ")}
-            >
-              <span class="flex h-5 w-5 items-center justify-center" aria-hidden="true">
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                >
-                  <path
-                    d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  />
-                </svg>
-              </span>
-              Sign out
-            </button>
-          </div>
         </aside>
         <Show when={mobileOpen()}>
           <div
@@ -216,20 +185,6 @@ const AppShell: Component<AppShellProps> = (props) => {
                 items={navItems()}
                 onNavigate={() => setMobileOpen(false)}
               />
-              <button
-                type="button"
-                onClick={() => {
-                  setMobileOpen(false);
-                  void signOut();
-                }}
-                class={[
-                  "mt-auto flex w-full items-center gap-3 rounded-xl px-3 py-2",
-                  "text-sm font-medium text-gray-700 dark:text-gray-300",
-                  "hover:bg-immich-primary/10 dark:hover:bg-immich-dark-primary/10",
-                ].join(" ")}
-              >
-                Sign out
-              </button>
             </div>
           </div>
         </Show>

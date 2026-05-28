@@ -16,7 +16,6 @@ import {
   getRule,
   MAX_POLL_INTERVAL_SECONDS,
   MIN_POLL_INTERVAL_SECONDS,
-  postLogout,
   updateRule,
   type MeAlbum,
   type Rule,
@@ -289,11 +288,6 @@ const RuleBuilderV2: Component = () => {
     onYamlInput(text);
   };
 
-  const onLogout = async () => {
-    await postLogout();
-    navigate("/login", { replace: true });
-  };
-
   const applyStatus = async (next: RuleStatus) => {
     const id = params.id;
     if (!id) return;
@@ -433,9 +427,6 @@ const RuleBuilderV2: Component = () => {
                 Decisions
               </A>
             </Show>
-            <Button variant="secondary" size="sm" onClick={onLogout}>
-              Sign out
-            </Button>
           </div>
         </div>
       </header>
