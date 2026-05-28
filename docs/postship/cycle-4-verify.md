@@ -470,9 +470,18 @@ All assertions passed in this iteration's drive-through against
 | T22 | GET /rules/:id/runs endpoint | verified (curl drive-through) |
 | T23 | Live activity feed UI | verified (route literal + bundle, endpoint live) |
 | T24 | This document | landed |
-| T25 | YOLO SHA256 strip + cycle-4 close-out | next |
+| T25 | YOLO SHA256 strip + cycle-4 close-out | live, verified (image `8f79e316b292`, post-redeploy cycles at 00:18:39Z for both rules, error_message NULL, `docker logs … grep -iE 'sha256\|hash'` empty) |
 
-T24 leaves the cycle-4 close-out sentinel-write to T25 per the
-2026-05-27 operator clarification (T25 strips the SHA256
-verification path entirely before sentinel-writing). T24 does not
-modify the worker terminator.
+T24 deferred the cycle-4 close-out sentinel-write to T25 per the
+2026-05-27 operator clarification (T25 stripped the SHA256
+verification path entirely before sentinel-writing). Post-T25,
+`crates/yolo/src/model.rs` no longer reads `YOLO_MODEL_SHA256`,
+no longer defines `DEFAULT_MODEL_SHA256`, and no longer hashes
+downloaded bytes; `ensure_model` is now `download → rename`.
+The `sha2` + `hex` deps were dropped from
+`crates/yolo/Cargo.toml`. The deployed container at
+`sha256:8f79e316b2923e6bbc1b26d8f592656833396f6b46b85b85b31cede72a78fe06`
+runs the cycle-4 binary with no hash code path. `714dce95` and
+`beba1580` both ran one full cycle after the recreate (00:18:39Z),
+both finished with `evaluated=1 added=0 skipped=1` and a NULL
+error_message — the SHA256 strip did not regress runtime behavior.
