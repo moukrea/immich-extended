@@ -294,7 +294,11 @@ struct SearchResponse {
 /// tick (PRD: "bounded work per tick") — this ceiling is the safety net for
 /// a misbehaving server returning a `nextPage` forever. 250/page × 200 pages
 /// = 50k assets, well above any single tick's realistic batch.
-const MAX_SEARCH_PAGES: u32 = 200;
+///
+/// Public so callers that must drain a full `updatedAfter` window in one call
+/// (the background indexer — see `server::indexer`) can pass it as their page
+/// budget, walking until `nextPage` is null rather than truncating mid-window.
+pub const MAX_SEARCH_PAGES: u32 = 200;
 
 /// Album shape used by [`ImmichClient::get_album_asset_ids`]. Only carries
 /// the asset id list; the full asset payload is large and unnecessary for

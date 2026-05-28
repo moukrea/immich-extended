@@ -19,9 +19,9 @@ use chrono::DateTime;
 use common::crypto::MasterKey;
 use common::db;
 use server::admin::create_user;
-use server::indexer::sweep_one_user;
+use server::indexer::{sweep_one_user, IndexerConfig};
 use sqlx::SqlitePool;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const OWNER_KEY: &str = "owner-immich-key";
@@ -206,6 +206,66 @@ async fn sweep_one_user_indexes_a_page() {
             .await
             .unwrap();
     assert_eq!(last_updated, ts("2026-02-20T09:30:00.000Z"));
+}
+
+#[tokio::test]
+async fn sweep_drains_the_full_multi_page_window() {
+    // Regression: a sweep must walk the user's ENTIRE `updatedAfter` window in
+    // one pass, not truncate at a small page budget. We ship 10 pages — more
+    // than the 8-page cap the indexer originally used — so a truncating sweep
+    // would index only 8 and then advance the watermark past the unfetched
+    // tail (Immich orders by `fileCreatedAt`, not `updatedAt`), permanently
+    // stranding pages 9-10. The production default must drain all 10.
+    const PAGES: u32 = 10;
+    let server = MockServer::start().await;
+    for p in 1..=PAGES {
+        let next = if p < PAGES {
+            serde_json::Value::from((p + 1).to_string())
+        } else {
+            serde_json::Value::Null
+        };
+        let body = serde_json::json!({
+            "assets": {
+                "items": [asset_json(
+                    &format!("pg{p}"),
+                    &format!("pg{p}.jpg"),
+                    "IMAGE",
+                    "2024-01-01T00:00:00.000Z",
+                    &format!("2026-01-{p:02}T00:00:00.000Z"),
+                    None,
+                    &[],
+                )],
+                "nextPage": next,
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/search/metadata"))
+            .and(header("x-api-key", OWNER_KEY))
+            .and(body_partial_json(serde_json::json!({ "page": p })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+    }
+
+    let pool = fresh_pool().await;
+    let user = seed_user(&pool, "owner@example.com").await;
+    seed_key(&pool, &user, &server.uri(), OWNER_KEY).await;
+
+    // Sweep with the PRODUCTION page budget, binding the test to the default.
+    let cap = IndexerConfig::default().max_pages_per_sweep;
+    let summary = sweep_one_user(&pool, &deterministic_key(), &user, cap)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.indexed, PAGES as usize,
+        "the sweep must drain every page of the window, not truncate"
+    );
+    assert_eq!(index_count(&pool, &user).await, PAGES as i64);
+    assert_eq!(
+        summary.watermark,
+        ts("2026-01-10T00:00:00.000Z"),
+        "watermark is the max updatedAt across the whole drained window"
+    );
 }
 
 #[tokio::test]

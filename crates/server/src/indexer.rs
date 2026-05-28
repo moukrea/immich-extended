@@ -52,11 +52,22 @@ use url::Url;
 /// Once the library is fully indexed a sweep returns ~0 new rows and is cheap.
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 
-/// Pages (× 250 assets/page) consumed per user per sweep. Bounds a single
-/// sweep so an initial large backfill spreads over consecutive sweeps instead
-/// of pinning one tick — the watermark advances within the sweep, so the next
-/// sweep resumes mid-backfill. 8 × 250 = 2 000 assets/user/sweep.
-const DEFAULT_MAX_PAGES_PER_SWEEP: u32 = 8;
+/// Pages (× 250 assets/page) a sweep may walk for one user. The sweep drains
+/// the user's **entire** `updatedAfter` window in one pass (capped only by this
+/// ceiling), because Immich's `search/metadata` orders results by
+/// `fileCreatedAt`, NOT by `updatedAt` — the watermark key. A smaller per-sweep
+/// cap (we shipped 8) truncates that window mid-walk and then advances the
+/// watermark to the max `updatedAt` *seen so far*, which can be the global max
+/// (an old-capture photo recently re-tagged sits early in `fileCreatedAt`
+/// order). The unfetched tail then has `updatedAt <= watermark` forever, so a
+/// library larger than the cap permanently strands its newest-by-capture
+/// assets. Draining the full window each sweep removes that failure mode while
+/// keeping the `updatedAt` ingest watermark (D2 re-tag detection): a fully
+/// drained window leaves nothing below the new watermark. `list_assets` stops
+/// at the first null `nextPage`, so a caught-up steady-state sweep is still one
+/// short page regardless of this ceiling. Matches the client's own
+/// [`immich_client::MAX_SEARCH_PAGES`] safety net (50k assets).
+const DEFAULT_MAX_PAGES_PER_SWEEP: u32 = immich_client::MAX_SEARCH_PAGES;
 
 #[derive(Debug, Error)]
 pub enum IndexerError {
@@ -126,7 +137,8 @@ impl std::fmt::Debug for Indexer {
 }
 
 impl Indexer {
-    /// Production constructor (120 s sweep, 8 pages/user/sweep).
+    /// Production constructor (120 s sweep; drains the full `updatedAfter`
+    /// window per user, capped at the `MAX_SEARCH_PAGES` safety ceiling).
     pub fn new(pool: SqlitePool, master_key: MasterKey) -> Self {
         Self::new_with(pool, master_key, IndexerConfig::default())
     }
@@ -435,10 +447,13 @@ mod tests {
     }
 
     #[test]
-    fn config_default_is_120s_8_pages() {
+    fn config_default_drains_full_window() {
         let c = IndexerConfig::default();
         assert_eq!(c.sweep_interval, Duration::from_secs(120));
-        assert_eq!(c.max_pages_per_sweep, 8);
+        // The sweep drains the entire `updatedAfter` window (capped only by the
+        // client's safety ceiling), never truncating mid-window — see the
+        // DEFAULT_MAX_PAGES_PER_SWEEP doc for why an 8-page cap stranded the tail.
+        assert_eq!(c.max_pages_per_sweep, immich_client::MAX_SEARCH_PAGES);
     }
 
     #[test]
