@@ -8,6 +8,9 @@ import {
 
 interface Props {
   label?: string;
+  // Which group kinds the menu offers; defaults to all. The DnD builder footer
+  // passes ["and", "or"] (NOT is a per-group checkbox there, not an add item).
+  groupKinds?: AddableGroupKind[];
   onAddLeaf: (kind: AddableLeafKind) => void;
   onAddGroup: (kind: AddableGroupKind) => void;
 }
@@ -83,7 +86,14 @@ const AddBlockDropdown: Component<Props> = (props) => {
             Group
           </p>
           <ul class="py-1">
-            <For each={Object.entries(GROUP_LABEL) as [AddableGroupKind, string][]}>
+            <For
+              each={
+                (props.groupKinds ??
+                  (Object.keys(GROUP_LABEL) as AddableGroupKind[])).map(
+                  (k) => [k, GROUP_LABEL[k]] as [AddableGroupKind, string],
+                )
+              }
+            >
               {([key, label]) => (
                 <li>
                   <button
