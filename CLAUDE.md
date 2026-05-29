@@ -194,3 +194,27 @@ Cycle-6 ABSOLUTE rules:
 - Don't write the project-complete sentinel until POSTSHIP-T45 verifies live.
 - Worker + supervisor now run on `claude-opus-4-8[1m]` at `--effort max` (config.env, set 2026-05-28).
 
+
+---
+
+## OPERATOR DIRECTIVES (2026-05-29, POSTSHIP cycle 7)
+
+Operator wants the visual rule builder REDESIGNED as an inline natural-language sentence composer. Full design + locked decisions in `.ralph/TASKS.md` "POSTSHIP cycle 7" and (after T46) `docs/design/inline-sentence-builder.md`. **This is a pure frontend rebuild — NO engine/schema/API changes.** The `MatchExpr` tree already expresses everything (verified); the new builder emits the same `yaml_source`.
+
+The desired model (LOCKED):
+- Blocks compose INLINE into a readable sentence: "Include to album if Paloma is present and Emeric may be present. Except if an unrecognized person is present and some faces are known." Each pill reads as plain language at rest, reveals inline editors on click; a live full-sentence readout is always shown.
+- **L1 Inverse fill**: lead block toggles "Include to album if" / "Exclude from album if"; Exclude wraps the whole match in `Not(...)`.
+- **L2 Per-clause all/any**: each clause (primary `if` + every `except if`) has ONE all(AND)/any(OR) toggle. No inline per-connector grouping.
+- **L3 Geo areas**: "taken in Area N" pill inline, linked to a numbered `MapPicker` block below the sentence; multiple areas, renumbered on add/remove.
+- **L4** at-rest natural language for every pill.
+- **L5 D5 UI quality gate (mandatory every UI task)**: Chrome-MCP screenshot + critical compare to the design + `docs/design/immich-style-mirror.md` before marking done; vitest-green is NOT sufficient. No operator review gate exists — this self-check is the only quality control.
+
+THE marquee bug to fix (T47): person blocks have no mode dropdown (`PillCard.tsx` renders mode read-only; `defaults.ts:32` hard-defaults `must_include`), so a second "may be present" person is impossible. New person pill gets an inline mode dropdown {is present, may be present, is not present}.
+
+Cycle-7 ABSOLUTE rules:
+- REUSE `MapPicker.tsx`, `PersonPicker.tsx`, `ruleYamlV2.ts` (YAML↔tree), `matchTree.ts` (TS types), `treeOps`. Don't rebuild them.
+- Backend (`match_expr.rs`, rules `handlers.rs` `yaml_source` API) is untouched — keep `cargo` gates green but expect no Rust changes.
+- Loader must not corrupt non-fitting trees: fall back to the Advanced YAML panel with a notice.
+- Worker + supervisor run on `claude-opus-4-8[1m]` / `--effort max`.
+- Don't write the project-complete sentinel until POSTSHIP-T53.
+
