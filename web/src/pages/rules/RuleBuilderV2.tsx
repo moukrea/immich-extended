@@ -28,7 +28,7 @@ import {
   yamlToFormStateV2,
   type RuleMetaState,
 } from "../../lib/ruleYamlV2";
-import BlockTreeEditor from "../../components/blocks/BlockTreeEditor";
+import InlineSentenceBuilder from "../../components/blocks/InlineSentenceBuilder";
 import { PeopleProvider } from "../../components/PeopleContext";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import { Button, Card, Field, Input, Select } from "../../components/ui";
@@ -509,13 +509,18 @@ const RuleBuilderV2: Component = () => {
             </Card>
 
             <Card>
-              <h2 class="text-sm font-semibold mb-2">Include media when</h2>
+              <h2 class="text-sm font-semibold mb-2">Conditions</h2>
               <p class="text-xs text-ui-muted dark:text-gray-400 mb-3">
-                Compose blocks with AND, OR, and NOT. Cheaper conditions are
-                evaluated first; YOLO runs only when nothing cheaper rejects.
+                Build the rule as a sentence. Click a condition to edit it.
+                Cheaper conditions are evaluated first; YOLO runs only when
+                nothing cheaper rejects.
               </p>
               <PeopleProvider>
-                <BlockTreeEditor expr={expr()} onChange={mutateExpr} />
+                <InlineSentenceBuilder
+                  expr={expr()}
+                  onChange={mutateExpr}
+                  onRequiresAdvanced={() => setShowAdvanced(true)}
+                />
               </PeopleProvider>
             </Card>
 

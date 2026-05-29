@@ -203,3 +203,77 @@ export function phraseText(parts: PhrasePart[]): string {
 export function leafPhraseText(leaf: MatchLeaf, lookup: PersonNameLookup): string {
   return phraseText(leafPhrase(leaf, lookup).parts);
 }
+
+// --------------------------------------------------------------------------
+// leafSentence — at-rest natural language for the inline sentence builder
+// (POSTSHIP cycle 7, per `docs/design/inline-sentence-builder.md` §4).
+//
+// Distinct from `leafPhrase`/`leafPhraseText` (which carry control slots for
+// the old stacked PillCard): this produces the plain reading shown on a pill
+// at rest and in the live readout. `location` reads as "Area N" — the number
+// is assigned by document order across the sentence and passed in by the
+// builder; the coordinates live in the linked numbered map block.
+// --------------------------------------------------------------------------
+
+/** "2024-07-15T00:00:00Z" → "2024-07-15"; passes through a bare date. */
+function isoDateOnly(iso: string | null): string {
+  if (!iso) return "";
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(iso);
+  return m ? m[1]! : iso;
+}
+
+export function leafSentence(
+  leaf: MatchLeaf,
+  lookup: PersonNameLookup,
+  areaNumber?: number,
+): string {
+  switch (leaf.leaf) {
+    case "person": {
+      // Empty id means the operator hasn't picked yet — keep it reading as a
+      // sentence and as a prompt to click the pill.
+      const name = leaf.person_id ? personLabel(leaf.person_id, lookup) : "someone";
+      switch (leaf.mode) {
+        case "must_include":
+          return `${name} is present`;
+        case "may_include":
+          return `${name} may be present`;
+        case "must_exclude":
+          return `${name} is not present`;
+        case "includes":
+          return `${name} appears`;
+      }
+      return name;
+    }
+
+    case "people_count":
+      return `people count ${opSymbol(leaf.op)} ${leaf.value}`;
+
+    case "face_recognition": {
+      if (!leaf.allow_unrecognized) {
+        return leaf.yolo_count_check
+          ? "all faces must be recognized · reject extra humans (YOLO)"
+          : "all faces must be recognized";
+      }
+      return leaf.yolo_count_check
+        ? "no unidentified extra humans (YOLO)"
+        : "unrecognized faces allowed";
+    }
+
+    case "date_range": {
+      const from = isoDateOnly(leaf.from);
+      const to = isoDateOnly(leaf.to);
+      if (from && to) return `taken between ${from} and ${to}`;
+      if (from) return `taken after ${from}`;
+      if (to) return `taken before ${to}`;
+      return "taken on any date";
+    }
+
+    case "location":
+      return areaNumber !== undefined ? `taken in Area ${areaNumber}` : "taken in an area";
+
+    case "media_type": {
+      const label = mediaTypesLabel(leaf.types);
+      return `is a ${label}`;
+    }
+  }
+}
