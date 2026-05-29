@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { and, isEmpty, not, or, type MatchLeaf } from "../matchTree";
+import { and, isEmpty, not, or, type MatchExpr, type MatchLeaf } from "../matchTree";
+import { formStateToYamlV2, yamlToFormStateV2 } from "../ruleYamlV2";
 import {
   emptySentence,
   movePill,
@@ -123,7 +124,7 @@ describe("sentenceToTree", () => {
 });
 
 describe("treeToSentence (loader)", () => {
-  it("loads a bare person leaf (legacy beba1580 shape)", () => {
+  it("loads a bare person leaf (legacy 714dce95 must_include-only shape)", () => {
     expect(treeToSentence(person("must_include", "paloma"))).toEqual({
       fill: "include",
       primary: { mode: "all", pills: [person("must_include", "paloma")] },
@@ -177,6 +178,15 @@ describe("treeToSentence (loader)", () => {
     expect(treeToSentence(tree)).toBeNull();
   });
 
+  it("returns null for a nested group inside the primary And → fallback", () => {
+    // A non-Not, non-leaf primary child (a nested And) can't be one flat clause.
+    const tree = and([
+      person("must_include", "a"),
+      and([person("must_include", "b"), person("must_include", "c")]),
+    ]);
+    expect(treeToSentence(tree)).toBeNull();
+  });
+
   it("loads an empty match as the empty include sentence", () => {
     expect(treeToSentence(and([]))).toEqual(emptySentence());
   });
@@ -205,11 +215,103 @@ describe("round-trip treeToSentence(sentenceToTree(m)) ≅ m", () => {
       primary: { mode: "all", pills: [person("must_include", "p")] },
       excepts: [{ mode: "any", pills: [count("gte", 2), person("must_include", "x")] }],
     },
+    // The cycle-7 headline: a 2-pill primary plus one except clause.
+    {
+      fill: "include",
+      primary: {
+        mode: "all",
+        pills: [person("must_include", "Paloma"), person("may_include", "Emeric")],
+      },
+      excepts: [{ mode: "all", pills: [person("must_include", "Manon")] }],
+    },
     emptySentence(),
   ];
 
   it.each(canonical.map((m, i) => [i, m] as const))("shape %i", (_i, m) => {
     expect(treeToSentence(sentenceToTree(m))).toEqual(m);
+  });
+});
+
+describe("loads the deployed production rules without corruption (T52)", () => {
+  // The operator's two live rules, by their real Immich person ids. The full
+  // path mirrors RuleBuilderV2: legacy YAML → tree → sentence → (edit) → tree →
+  // YAML → re-parse. The match tree must survive that loop unchanged, so an
+  // operator opening either rule in the new builder never corrupts it.
+  const PALOMA = "6ca4c495-fcba-4f18-ab51-2950a47f60d8";
+  const MAMAN = "851eba3a-1666-4a5e-b601-215472bd8304";
+
+  const roundTrip = (yamlSource: string): { tree: MatchExpr; reparsed: MatchExpr } => {
+    const parsed = yamlToFormStateV2(yamlSource);
+    expect(parsed.error).toBeNull();
+    const model = treeToSentence(parsed.expr);
+    expect(model).not.toBeNull();
+    const reSaved = formStateToYamlV2(parsed.meta, sentenceToTree(model!));
+    const reparsed = yamlToFormStateV2(reSaved);
+    expect(reparsed.error).toBeNull();
+    return { tree: parsed.expr, reparsed: reparsed.expr };
+  };
+
+  it("714dce95 'Paloma (partage)' — must_include only → single bare person pill", () => {
+    const yamlSource = [
+      "name: Paloma (partage)",
+      "target_album:",
+      "  type: existing",
+      "  album_id: d51179c1-7b2a-4968-816c-3980fdd37146",
+      "match:",
+      "  people:",
+      "    must_include:",
+      `      - ${PALOMA}`,
+      "status: active",
+    ].join("\n");
+    const parsed = yamlToFormStateV2(yamlSource);
+    expect(parsed.expr).toEqual(person("must_include", PALOMA));
+    const model = treeToSentence(parsed.expr);
+    expect(model).toEqual({
+      fill: "include",
+      primary: { mode: "all", pills: [person("must_include", PALOMA)] },
+      excepts: [],
+    });
+    const { tree, reparsed } = roundTrip(yamlSource);
+    expect(reparsed).toEqual(tree);
+  });
+
+  it("beba1580 'Paloma (partage Maman)' — must/may + face gate → 3-pill all-clause", () => {
+    const yamlSource = [
+      "name: Paloma (partage Maman)",
+      "target_album:",
+      "  type: managed",
+      "  name: Paloma (partage Maman)",
+      "match:",
+      "  people:",
+      "    must_include:",
+      `      - ${PALOMA}`,
+      "    may_include:",
+      `      - ${MAMAN}`,
+      "    must_exclude_other_identifiable: true",
+      "    no_unidentified_humans: true",
+      "status: active",
+    ].join("\n");
+    const face: MatchLeaf = {
+      kind: "leaf",
+      leaf: "face_recognition",
+      allow_unrecognized: false,
+      yolo_count_check: true,
+    };
+    const parsed = yamlToFormStateV2(yamlSource);
+    expect(parsed.expr).toEqual(
+      and([person("must_include", PALOMA), person("may_include", MAMAN), face]),
+    );
+    const model = treeToSentence(parsed.expr);
+    expect(model).toEqual({
+      fill: "include",
+      primary: {
+        mode: "all",
+        pills: [person("must_include", PALOMA), person("may_include", MAMAN), face],
+      },
+      excepts: [],
+    });
+    const { tree, reparsed } = roundTrip(yamlSource);
+    expect(reparsed).toEqual(tree);
   });
 });
 

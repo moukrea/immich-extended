@@ -217,7 +217,15 @@ function baseMatch(model: SentenceModel): MatchExpr {
     .filter((c) => c.pills.length > 0)
     .map((c) => not(clauseExpr(c)));
   if (exceptNots.length === 0) return primary;
-  return and([primary, ...exceptNots]);
+  // Flatten an all-clause primary so the base is `And[...pills, ...Not(except)]`
+  // (flat siblings), NOT `And[And[pills], ...]`. The flat shape is exactly what
+  // `treeToSentence` loads back AND what the legacy parser emits, so a
+  // builder-saved multi-pill rule with excepts reloads into the sentence instead
+  // of falling back to YAML. An any-clause primary stays a single nested
+  // `Or[...]` child — an Or can't merge into the surrounding And.
+  const primaryChildren: MatchExpr[] =
+    model.primary.mode === "all" ? model.primary.pills : [primary];
+  return and([...primaryChildren, ...exceptNots]);
 }
 
 export function sentenceToTree(model: SentenceModel): MatchExpr {
