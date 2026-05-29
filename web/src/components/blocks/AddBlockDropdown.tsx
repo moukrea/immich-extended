@@ -11,9 +11,15 @@ interface Props {
   // Which group kinds the menu offers; defaults to all. The DnD builder footer
   // passes ["and", "or"] (NOT is a per-group checkbox there, not an add item).
   groupKinds?: AddableGroupKind[];
+  // Optional override for the trigger button styling so the inline sentence
+  // builder can render it as a dashed pill in-line with the sentence.
+  triggerClass?: string;
   onAddLeaf: (kind: AddableLeafKind) => void;
   onAddGroup: (kind: AddableGroupKind) => void;
 }
+
+const DEFAULT_TRIGGER_CLASS =
+  "rounded-md border border-dashed border-ui-border bg-white dark:bg-immich-dark-gray px-3 py-1.5 text-xs font-medium text-immich-fg dark:text-immich-dark-fg hover:bg-slate-50 dark:hover:bg-gray-700";
 
 /**
  * "+ Add block" trigger that pops a flat list of leaf types and group types
@@ -61,7 +67,7 @@ const AddBlockDropdown: Component<Props> = (props) => {
         onClick={toggle}
         aria-haspopup="menu"
         aria-expanded={open()}
-        class="rounded-md border border-dashed border-ui-border bg-white dark:bg-immich-dark-gray px-3 py-1.5 text-xs font-medium text-immich-fg dark:text-immich-dark-fg hover:bg-slate-50 dark:hover:bg-gray-700"
+        class={props.triggerClass ?? DEFAULT_TRIGGER_CLASS}
       >
         {props.label ?? "+ Add block"} ▾
       </button>

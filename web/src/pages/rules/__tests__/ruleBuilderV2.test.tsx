@@ -70,7 +70,8 @@ function readYaml(textarea: HTMLTextAreaElement): Record<string, unknown> {
 // then close the editor so the next un-picked pill ("someone is present") is
 // uniquely queryable.
 async function addPerson(api: Api, pickName: string) {
-  fireEvent.click(api.getByRole("button", { name: "Add condition" }));
+  fireEvent.click(api.getByRole("button", { name: /\+ condition/ }));
+  fireEvent.click(api.getByRole("menuitem", { name: "Person" }));
   fireEvent.click(api.getByRole("button", { name: "someone is present" }));
   fireEvent.click(await api.findByLabelText(`Pick ${pickName}`));
   fireEvent.click(api.getByRole("button", { name: `${pickName} is present` }));

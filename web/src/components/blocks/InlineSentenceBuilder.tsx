@@ -18,7 +18,9 @@
 import {
   For,
   Index,
+  Match,
   Show,
+  Switch,
   createEffect,
   createMemo,
   createSignal,
@@ -30,6 +32,8 @@ import {
   serializeMatchExpr,
   type MatchExpr,
   type MatchLeaf,
+  type MediaTypeValue,
+  type PeopleCountOp,
   type PersonMode,
 } from "../../lib/matchTree";
 import { normalizeTree } from "../../lib/treeOps";
@@ -43,7 +47,8 @@ import {
   type Fill,
   type SentenceModel,
 } from "../../lib/sentenceModel";
-import { defaultLeaf } from "./defaults";
+import { defaultLeaf, type AddableLeafKind } from "./defaults";
+import AddBlockDropdown from "./AddBlockDropdown";
 import { usePeople } from "../PeopleContext";
 import PersonPicker from "./PersonPicker";
 
@@ -62,6 +67,53 @@ const PERSON_MODE_LABEL: Record<"must_include" | "may_include" | "must_exclude",
   may_include: "may be present",
   must_exclude: "is not present",
 };
+
+// Operator labels for the people-count select — symbol + word so the dropdown
+// is legible; the at-rest pill phrase (phrases.ts) shows just the symbol.
+const OP_SELECT_LABEL: Record<PeopleCountOp, string> = {
+  eq: "= equals",
+  ne: "≠ not equals",
+  lt: "< fewer than",
+  lte: "≤ at most",
+  gt: "> more than",
+  gte: "≥ at least",
+};
+
+function isoToInput(iso: string | null): string {
+  if (!iso) return "";
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(iso);
+  return m ? m[1]! : "";
+}
+
+function inputToIso(date: string, endOfDay: boolean): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  return endOfDay ? `${date}T23:59:59Z` : `${date}T00:00:00Z`;
+}
+
+function mediaSelectValue(types: MediaTypeValue[]): "photo" | "video" | "both" {
+  const hasPhoto = types.includes("photo");
+  const hasVideo = types.includes("video");
+  if (hasPhoto && hasVideo) return "both";
+  if (hasVideo) return "video";
+  return "photo";
+}
+
+function mediaTypesFromValue(value: string): MediaTypeValue[] {
+  if (value === "video") return ["video"];
+  if (value === "both") return ["photo", "video"];
+  return ["photo"];
+}
+
+function clampNonNegInt(raw: string, fallback: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.round(n));
+}
+
+/** Every leaf is editable inline except location (its map lands in T50). */
+function isEditableLeaf(leaf: MatchLeaf): boolean {
+  return leaf.leaf !== "location";
+}
 
 // --------------------------------------------------------------------------
 // Segmented toggle — used for Include/Exclude (L1) and all/any (L2).
@@ -112,7 +164,7 @@ const ConditionPill: Component<{
   onRemove: () => void;
 }> = (props) => {
   const [open, setOpen] = createSignal(false);
-  const isPerson = () => props.leaf.leaf === "person";
+  const editable = () => isEditableLeaf(props.leaf);
   const atRest = createMemo(() => leafSentence(props.leaf, props.lookup, props.areaNumber));
 
   return (
@@ -120,15 +172,15 @@ const ConditionPill: Component<{
       <span class="inline-flex items-center rounded-full border border-ui-border bg-white py-1 pl-3 pr-1 text-sm shadow-sm dark:bg-immich-dark-gray">
         <button
           type="button"
-          disabled={!isPerson()}
-          aria-haspopup={isPerson() ? "true" : undefined}
-          aria-expanded={isPerson() ? open() : undefined}
-          onClick={() => isPerson() && setOpen((o) => !o)}
+          disabled={!editable()}
+          aria-haspopup={editable() ? "true" : undefined}
+          aria-expanded={editable() ? open() : undefined}
+          onClick={() => editable() && setOpen((o) => !o)}
           class="inline-flex items-center gap-1 font-medium text-immich-fg dark:text-immich-dark-fg"
-          classList={{ "cursor-pointer hover:text-immich-primary": isPerson() }}
+          classList={{ "cursor-pointer hover:text-immich-primary": editable() }}
         >
           <span>{atRest()}</span>
-          <Show when={isPerson()}>
+          <Show when={editable()}>
             <span aria-hidden="true" class="text-ui-muted">
               ▾
             </span>
@@ -144,42 +196,194 @@ const ConditionPill: Component<{
         </button>
       </span>
 
-      <Show when={open() && props.leaf.leaf === "person"}>
-        <div class="absolute left-0 top-full z-20 mt-1 w-72 space-y-2 rounded-xl border border-ui-border bg-white p-3 shadow-lg dark:bg-immich-dark-gray">
-          <label class="block">
-            <span class="mb-1 block text-xs font-medium text-ui-muted">Condition</span>
-            <select
-              aria-label="Person condition mode"
-              class={`${INLINE_SELECT} w-full`}
-              value={props.leaf.leaf === "person" ? props.leaf.mode : "must_include"}
-              onChange={(e) => {
-                if (props.leaf.leaf !== "person") return;
-                props.onChange({
-                  ...props.leaf,
-                  mode: e.currentTarget.value as PersonMode,
-                });
-              }}
-            >
-              <For
-                each={
-                  Object.entries(PERSON_MODE_LABEL) as [
-                    "must_include" | "may_include" | "must_exclude",
-                    string,
-                  ][]
-                }
-              >
-                {([value, label]) => <option value={value}>{label}</option>}
-              </For>
-            </select>
-          </label>
-          <PersonPicker
-            label="Person"
-            value={props.leaf.leaf === "person" ? props.leaf.person_id : ""}
-            onChange={(id) => {
-              if (props.leaf.leaf !== "person") return;
-              props.onChange({ ...props.leaf, person_id: id });
-            }}
-          />
+      <Show when={open() && editable()}>
+        <div
+          class="absolute left-0 top-full z-20 mt-1 space-y-2 rounded-xl border border-ui-border bg-white p-3 shadow-lg dark:bg-immich-dark-gray"
+          classList={{
+            "w-72": props.leaf.leaf === "person",
+            "w-64": props.leaf.leaf !== "person",
+          }}
+        >
+          <Switch>
+            <Match when={props.leaf.leaf === "person"}>
+              <label class="block">
+                <span class="mb-1 block text-xs font-medium text-ui-muted">Condition</span>
+                <select
+                  aria-label="Person condition mode"
+                  class={`${INLINE_SELECT} w-full`}
+                  value={props.leaf.leaf === "person" ? props.leaf.mode : "must_include"}
+                  onChange={(e) => {
+                    if (props.leaf.leaf !== "person") return;
+                    props.onChange({
+                      ...props.leaf,
+                      mode: e.currentTarget.value as PersonMode,
+                    });
+                  }}
+                >
+                  <For
+                    each={
+                      Object.entries(PERSON_MODE_LABEL) as [
+                        "must_include" | "may_include" | "must_exclude",
+                        string,
+                      ][]
+                    }
+                  >
+                    {([value, label]) => <option value={value}>{label}</option>}
+                  </For>
+                </select>
+              </label>
+              <PersonPicker
+                label="Person"
+                value={props.leaf.leaf === "person" ? props.leaf.person_id : ""}
+                onChange={(id) => {
+                  if (props.leaf.leaf !== "person") return;
+                  props.onChange({ ...props.leaf, person_id: id });
+                }}
+              />
+            </Match>
+
+            <Match when={props.leaf.leaf === "people_count"}>
+              <label class="block">
+                <span class="mb-1 block text-xs font-medium text-ui-muted">People count</span>
+                <div class="flex items-center gap-2">
+                  <select
+                    aria-label="People count operator"
+                    class={INLINE_SELECT}
+                    value={props.leaf.leaf === "people_count" ? props.leaf.op : "gte"}
+                    onChange={(e) => {
+                      if (props.leaf.leaf !== "people_count") return;
+                      props.onChange({
+                        ...props.leaf,
+                        op: e.currentTarget.value as PeopleCountOp,
+                      });
+                    }}
+                  >
+                    <For each={Object.entries(OP_SELECT_LABEL) as [PeopleCountOp, string][]}>
+                      {([key, label]) => <option value={key}>{label}</option>}
+                    </For>
+                  </select>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    class={`${INLINE_SELECT} w-20`}
+                    aria-label="People count value"
+                    value={props.leaf.leaf === "people_count" ? props.leaf.value : 0}
+                    onInput={(e) => {
+                      if (props.leaf.leaf !== "people_count") return;
+                      props.onChange({
+                        ...props.leaf,
+                        value: clampNonNegInt(e.currentTarget.value, props.leaf.value),
+                      });
+                    }}
+                  />
+                </div>
+              </label>
+            </Match>
+
+            <Match when={props.leaf.leaf === "face_recognition"}>
+              <span class="block text-xs font-medium text-ui-muted">Face recognition</span>
+              <label class="flex items-center gap-2 text-sm text-immich-fg dark:text-immich-dark-fg">
+                <input
+                  type="checkbox"
+                  checked={
+                    props.leaf.leaf === "face_recognition"
+                      ? !props.leaf.allow_unrecognized
+                      : false
+                  }
+                  aria-label="Require all faces recognized"
+                  onChange={(e) => {
+                    if (props.leaf.leaf !== "face_recognition") return;
+                    props.onChange({
+                      ...props.leaf,
+                      allow_unrecognized: !e.currentTarget.checked,
+                    });
+                  }}
+                />
+                all faces must be recognized
+              </label>
+              <label class="flex items-center gap-2 text-sm text-immich-fg dark:text-immich-dark-fg">
+                <input
+                  type="checkbox"
+                  checked={
+                    props.leaf.leaf === "face_recognition"
+                      ? props.leaf.yolo_count_check
+                      : false
+                  }
+                  aria-label="Also reject extra humans (YOLO)"
+                  onChange={(e) => {
+                    if (props.leaf.leaf !== "face_recognition") return;
+                    props.onChange({
+                      ...props.leaf,
+                      yolo_count_check: e.currentTarget.checked,
+                    });
+                  }}
+                />
+                also reject extra humans (YOLO)
+              </label>
+            </Match>
+
+            <Match when={props.leaf.leaf === "date_range"}>
+              <label class="block">
+                <span class="mb-1 block text-xs font-medium text-ui-muted">From</span>
+                <input
+                  type="date"
+                  class={`${INLINE_SELECT} w-full`}
+                  aria-label="Date from"
+                  value={props.leaf.leaf === "date_range" ? isoToInput(props.leaf.from) : ""}
+                  onInput={(e) => {
+                    if (props.leaf.leaf !== "date_range") return;
+                    props.onChange({
+                      ...props.leaf,
+                      from: inputToIso(e.currentTarget.value, false),
+                    });
+                  }}
+                />
+              </label>
+              <label class="block">
+                <span class="mb-1 block text-xs font-medium text-ui-muted">To</span>
+                <input
+                  type="date"
+                  class={`${INLINE_SELECT} w-full`}
+                  aria-label="Date to"
+                  value={props.leaf.leaf === "date_range" ? isoToInput(props.leaf.to) : ""}
+                  onInput={(e) => {
+                    if (props.leaf.leaf !== "date_range") return;
+                    props.onChange({
+                      ...props.leaf,
+                      to: inputToIso(e.currentTarget.value, true),
+                    });
+                  }}
+                />
+              </label>
+            </Match>
+
+            <Match when={props.leaf.leaf === "media_type"}>
+              <label class="block">
+                <span class="mb-1 block text-xs font-medium text-ui-muted">Media type</span>
+                <select
+                  aria-label="Media type"
+                  class={`${INLINE_SELECT} w-full`}
+                  value={
+                    props.leaf.leaf === "media_type"
+                      ? mediaSelectValue(props.leaf.types)
+                      : "photo"
+                  }
+                  onChange={(e) => {
+                    if (props.leaf.leaf !== "media_type") return;
+                    props.onChange({
+                      ...props.leaf,
+                      types: mediaTypesFromValue(e.currentTarget.value),
+                    });
+                  }}
+                >
+                  <option value="photo">photo</option>
+                  <option value="video">video</option>
+                  <option value="both">photo or video</option>
+                </select>
+              </label>
+            </Match>
+          </Switch>
         </div>
       </Show>
     </span>
@@ -196,7 +400,7 @@ const ClauseView: Component<{
   onModeChange: (mode: ClauseMode) => void;
   onPillChange: (index: number, next: MatchLeaf) => void;
   onPillRemove: (index: number) => void;
-  onAddPerson: () => void;
+  onAdd: (kind: AddableLeafKind) => void;
 }> = (props) => {
   return (
     <div class="flex flex-wrap items-center gap-x-2 gap-y-2">
@@ -228,14 +432,13 @@ const ClauseView: Component<{
           </>
         )}
       </Index>
-      <button
-        type="button"
-        onClick={() => props.onAddPerson()}
-        aria-label="Add condition"
-        class="inline-flex items-center gap-1 rounded-full border border-dashed border-ui-border px-2.5 py-1 text-sm text-ui-muted hover:border-immich-primary hover:text-immich-primary"
-      >
-        <span aria-hidden="true">+</span> condition
-      </button>
+      <AddBlockDropdown
+        label="+ condition"
+        groupKinds={[]}
+        triggerClass="inline-flex items-center gap-1 rounded-full border border-dashed border-ui-border px-2.5 py-1 text-sm text-ui-muted hover:border-immich-primary hover:text-immich-primary"
+        onAddLeaf={(kind) => props.onAdd(kind)}
+        onAddGroup={() => {}}
+      />
     </div>
   );
 };
@@ -301,10 +504,10 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
     const pills = m.primary.pills.filter((_, i) => i !== index);
     commit({ ...m, primary: { ...m.primary, pills } });
   };
-  const addPrimaryPerson = () => {
+  const addPrimaryPill = (kind: AddableLeafKind) => {
     const m = model();
     if (!m) return;
-    const pills = [...m.primary.pills, defaultLeaf("person")];
+    const pills = [...m.primary.pills, defaultLeaf(kind)];
     commit({ ...m, primary: { ...m.primary, pills } });
   };
 
@@ -342,7 +545,7 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
               onModeChange={setPrimaryMode}
               onPillChange={changePrimaryPill}
               onPillRemove={removePrimaryPill}
-              onAddPerson={addPrimaryPerson}
+              onAdd={addPrimaryPill}
             />
           </div>
 
