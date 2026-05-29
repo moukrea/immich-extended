@@ -511,6 +511,48 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
     commit({ ...m, primary: { ...m.primary, pills } });
   };
 
+  // Except-clause mutations mirror the primary ones, keyed by clause index `i`.
+  const addExcept = () => {
+    const m = model();
+    if (!m) return;
+    commit({ ...m, excepts: [...m.excepts, { mode: "all", pills: [] }] });
+  };
+  const removeExcept = (i: number) => {
+    const m = model();
+    if (!m) return;
+    commit({ ...m, excepts: m.excepts.filter((_, idx) => idx !== i) });
+  };
+  const setExceptMode = (i: number, mode: ClauseMode) => {
+    const m = model();
+    if (!m) return;
+    const excepts = m.excepts.slice();
+    excepts[i] = { ...excepts[i]!, mode };
+    commit({ ...m, excepts });
+  };
+  const changeExceptPill = (i: number, j: number, next: MatchLeaf) => {
+    const m = model();
+    if (!m) return;
+    const excepts = m.excepts.slice();
+    const pills = excepts[i]!.pills.slice();
+    pills[j] = next;
+    excepts[i] = { ...excepts[i]!, pills };
+    commit({ ...m, excepts });
+  };
+  const removeExceptPill = (i: number, j: number) => {
+    const m = model();
+    if (!m) return;
+    const excepts = m.excepts.slice();
+    excepts[i] = { ...excepts[i]!, pills: excepts[i]!.pills.filter((_, idx) => idx !== j) };
+    commit({ ...m, excepts });
+  };
+  const addExceptPill = (i: number, kind: AddableLeafKind) => {
+    const m = model();
+    if (!m) return;
+    const excepts = m.excepts.slice();
+    excepts[i] = { ...excepts[i]!, pills: [...excepts[i]!.pills, defaultLeaf(kind)] };
+    commit({ ...m, excepts });
+  };
+
   return (
     <Show
       when={model()}
@@ -548,6 +590,40 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
               onAdd={addPrimaryPill}
             />
           </div>
+
+          <Index each={m().excepts}>
+            {(clause, i) => (
+              <div class="flex flex-wrap items-center gap-2 border-l-2 border-amber-300 pl-3 dark:border-amber-700/50">
+                <span class="text-sm font-medium text-ui-muted dark:text-gray-400">
+                  Except if
+                </span>
+                <ClauseView
+                  clause={clause()}
+                  lookup={lookup}
+                  onModeChange={(mode) => setExceptMode(i, mode)}
+                  onPillChange={(j, next) => changeExceptPill(i, j, next)}
+                  onPillRemove={(j) => removeExceptPill(i, j)}
+                  onAdd={(kind) => addExceptPill(i, kind)}
+                />
+                <button
+                  type="button"
+                  onClick={() => removeExcept(i)}
+                  aria-label={`Remove except clause ${i + 1}`}
+                  class="ml-1 rounded-md px-2 py-1 text-xs font-medium text-ui-muted hover:text-ui-danger"
+                >
+                  ✕ clause
+                </button>
+              </div>
+            )}
+          </Index>
+
+          <button
+            type="button"
+            onClick={addExcept}
+            class="inline-flex items-center gap-1 rounded-md border border-dashed border-ui-border px-3 py-1.5 text-xs font-medium text-ui-muted hover:border-immich-primary hover:text-immich-primary"
+          >
+            + Except clause
+          </button>
 
           <p
             data-testid="sentence-readout"

@@ -32,7 +32,7 @@ vi.mock("../../PeopleContext", () => {
 });
 
 import InlineSentenceBuilder from "../InlineSentenceBuilder";
-import { emptyMatch, type MatchExpr, type MatchLeaf } from "../../../lib/matchTree";
+import { and, emptyMatch, not, type MatchExpr, type MatchLeaf } from "../../../lib/matchTree";
 import {
   defaultRuleMeta,
   formStateToYamlV2,
@@ -57,10 +57,23 @@ function mountBuilder(initial: MatchExpr = emptyMatch()) {
 }
 
 type GetByRole = ReturnType<typeof mountBuilder>["getByRole"];
+type GetAllByRole = ReturnType<typeof mountBuilder>["getAllByRole"];
 
 // The "+ condition" affordance is now a leaf-type menu (AddBlockDropdown).
 function addLeaf(getByRole: GetByRole, label: string) {
   fireEvent.click(getByRole("button", { name: /\+ condition/ }));
+  fireEvent.click(getByRole("menuitem", { name: label }));
+}
+
+// Each clause (primary + every except) has its own "+ condition" menu; they
+// render in document order, so clausePos 0 = primary, 1 = first except, …
+function addLeafToClause(
+  getAllByRole: GetAllByRole,
+  getByRole: GetByRole,
+  clausePos: number,
+  label: string,
+) {
+  fireEvent.click(getAllByRole("button", { name: /\+ condition/ })[clausePos]!);
   fireEvent.click(getByRole("menuitem", { name: label }));
 }
 
@@ -69,6 +82,13 @@ const person = (mode: "must_include" | "may_include", id: string): MatchExpr => 
   leaf: "person",
   mode,
   person_id: id,
+});
+
+const count = (op: "eq" | "gte", value: number): MatchLeaf => ({
+  kind: "leaf",
+  leaf: "people_count",
+  op,
+  value,
 });
 
 describe("InlineSentenceBuilder", () => {
@@ -207,5 +227,113 @@ describe("InlineSentenceBuilder", () => {
     addLeaf(getByRole, "Location");
     const pill = getByRole("button", { name: "taken in an area" }) as HTMLButtonElement;
     expect(pill.disabled).toBe(true);
+  });
+
+  it("a single-condition primary serializes as a bare leaf (never And[leaf])", () => {
+    const { getByRole, getAllByRole, getCaptured } = mountBuilder();
+    addLeafToClause(getAllByRole, getByRole, 0, "People count (YOLO)");
+    expect(getCaptured()).toEqual(count("gte", 1));
+  });
+
+  it("include + one except clause → And[primary, Not(except)], round-trips YAML", () => {
+    const { getByRole, getAllByRole, getByLabelText, getByTestId, getCaptured } = mountBuilder();
+
+    // Primary: Paloma is present.
+    addLeafToClause(getAllByRole, getByRole, 0, "Person");
+    fireEvent.click(getByRole("button", { name: "someone is present" }));
+    fireEvent.click(getByLabelText("Pick Paloma"));
+    fireEvent.click(getByRole("button", { name: "Paloma is present" })); // close editor
+
+    // Except: Emeric is present.
+    fireEvent.click(getByRole("button", { name: "+ Except clause" }));
+    addLeafToClause(getAllByRole, getByRole, 1, "Person");
+    fireEvent.click(getByRole("button", { name: "someone is present" }));
+    fireEvent.click(getByLabelText("Pick Emeric"));
+
+    expect(getByTestId("sentence-readout").textContent).toBe(
+      "Include to album if Paloma is present. Except if Emeric is present.",
+    );
+    const expected = and([
+      person("must_include", "paloma"),
+      not(person("must_include", "emeric")),
+    ]);
+    expect(getCaptured()).toEqual(expected);
+    const yaml = formStateToYamlV2(defaultRuleMeta(), getCaptured());
+    expect(yamlToFormStateV2(yaml).expr).toEqual(expected);
+  });
+
+  it("include + two except clauses → one And with both Nots, round-trips YAML", () => {
+    const { getByRole, getAllByRole, getByLabelText, getCaptured } = mountBuilder();
+
+    // Primary: Paloma is present.
+    addLeafToClause(getAllByRole, getByRole, 0, "Person");
+    fireEvent.click(getByRole("button", { name: "someone is present" }));
+    fireEvent.click(getByLabelText("Pick Paloma"));
+    fireEvent.click(getByRole("button", { name: "Paloma is present" }));
+
+    // Except 1: Emeric is present.
+    fireEvent.click(getByRole("button", { name: "+ Except clause" }));
+    addLeafToClause(getAllByRole, getByRole, 1, "Person");
+    fireEvent.click(getByRole("button", { name: "someone is present" }));
+    fireEvent.click(getByLabelText("Pick Emeric"));
+    fireEvent.click(getByRole("button", { name: "Emeric is present" }));
+
+    // Except 2: people count ≥ 1.
+    fireEvent.click(getByRole("button", { name: "+ Except clause" }));
+    addLeafToClause(getAllByRole, getByRole, 2, "People count (YOLO)");
+
+    const expected = and([
+      person("must_include", "paloma"),
+      not(person("must_include", "emeric")),
+      not(count("gte", 1)),
+    ]);
+    expect(getCaptured()).toEqual(expected);
+    const yaml = formStateToYamlV2(defaultRuleMeta(), getCaptured());
+    expect(yamlToFormStateV2(yaml).expr).toEqual(expected);
+  });
+
+  it("exclude + except wraps the whole match in a single Not (no double-NOT)", () => {
+    const { getByRole, getAllByRole, getByLabelText, getCaptured } = mountBuilder();
+
+    fireEvent.click(getByRole("button", { name: "Exclude" }));
+
+    addLeafToClause(getAllByRole, getByRole, 0, "Person");
+    fireEvent.click(getByRole("button", { name: "someone is present" }));
+    fireEvent.click(getByLabelText("Pick Paloma"));
+    fireEvent.click(getByRole("button", { name: "Paloma is present" }));
+
+    fireEvent.click(getByRole("button", { name: "+ Except clause" }));
+    addLeafToClause(getAllByRole, getByRole, 1, "Person");
+    fireEvent.click(getByRole("button", { name: "someone is present" }));
+    fireEvent.click(getByLabelText("Pick Emeric"));
+
+    const expected = not(
+      and([person("must_include", "paloma"), not(person("must_include", "emeric"))]),
+    );
+    expect(getCaptured()).toEqual(expected);
+    // The outer node is a single Not; its child is an And, never another Not.
+    const tree = getCaptured();
+    expect(tree.kind === "group" && tree.op === "not").toBe(true);
+    if (tree.kind === "group" && tree.op === "not") {
+      expect(tree.child.kind === "group" && tree.child.op === "and").toBe(true);
+    }
+    const yaml = formStateToYamlV2(defaultRuleMeta(), getCaptured());
+    expect(yamlToFormStateV2(yaml).expr).toEqual(expected);
+  });
+
+  it("an empty except clause is a tree no-op yet stays editable, and is removable", () => {
+    const { getByRole, getAllByRole, getCaptured, queryByRole } = mountBuilder();
+    addLeafToClause(getAllByRole, getByRole, 0, "People count (YOLO)");
+    expect(getCaptured()).toEqual(count("gte", 1));
+
+    // Adding an empty "except if" must NOT alter the emitted tree…
+    fireEvent.click(getByRole("button", { name: "+ Except clause" }));
+    expect(getCaptured()).toEqual(count("gte", 1));
+    // …but the clause persists in the UI so the operator can fill it.
+    expect(getByRole("button", { name: "Remove except clause 1" })).toBeTruthy();
+
+    fireEvent.click(getByRole("button", { name: "Remove except clause 1" }));
+    expect(queryByRole("button", { name: "Remove except clause 1" })).toBeNull();
+    expect(getCaptured()).toEqual(count("gte", 1));
   });
 });

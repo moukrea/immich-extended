@@ -75,8 +75,19 @@ function clauseExpr(clause: Clause): MatchExpr {
 
 function baseMatch(model: SentenceModel): MatchExpr {
   const primary = clauseExpr(model.primary);
-  if (model.excepts.length === 0) return primary;
-  return and([primary, ...model.excepts.map((c) => not(clauseExpr(c)))]);
+  // An empty primary can't anchor any "except" — without a base condition
+  // there is nothing to subtract from. Emit just the (empty) primary so the
+  // tree never degenerates into `Not(And[])`/double-NOT.
+  if (model.primary.pills.length === 0) return primary;
+  // Drop "except if" clauses that have no conditions yet (the operator just
+  // clicked "+ Except clause"). An empty clause serializes as `Not(And[])`,
+  // which `normalizeTree` strips anyway — filtering here keeps `sentenceToTree`
+  // self-consistent so the echo-guard never re-seeds and clears the open clause.
+  const exceptNots = model.excepts
+    .filter((c) => c.pills.length > 0)
+    .map((c) => not(clauseExpr(c)));
+  if (exceptNots.length === 0) return primary;
+  return and([primary, ...exceptNots]);
 }
 
 export function sentenceToTree(model: SentenceModel): MatchExpr {
