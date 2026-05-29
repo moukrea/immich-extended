@@ -20,11 +20,14 @@ import {
   Index,
   Match,
   Show,
+  Suspense,
   Switch,
   createEffect,
   createMemo,
   createSignal,
+  lazy,
   on,
+  onCleanup,
   type Component,
   type JSX,
 } from "solid-js";
@@ -39,9 +42,11 @@ import {
 import { normalizeTree } from "../../lib/treeOps";
 import { leafSentence, type PersonNameLookup } from "../../lib/phrases";
 import {
+  locationAreas,
   sentenceReadout,
   sentenceToTree,
   treeToSentence,
+  type AreaRef,
   type Clause,
   type ClauseMode,
   type Fill,
@@ -51,6 +56,10 @@ import { defaultLeaf, type AddableLeafKind } from "./defaults";
 import AddBlockDropdown from "./AddBlockDropdown";
 import { usePeople } from "../PeopleContext";
 import PersonPicker from "./PersonPicker";
+
+// The map is the lazy 1054 kB MapLibre chunk; only pulled when a geo Area
+// exists (the area blocks below the sentence mount it under a <Suspense>).
+const MapPicker = lazy(() => import("../MapPicker"));
 
 interface Props {
   expr: MatchExpr;
@@ -110,7 +119,11 @@ function clampNonNegInt(raw: string, fallback: number): number {
   return Math.max(0, Math.round(n));
 }
 
-/** Every leaf is editable inline except location (its map lands in T50). */
+/**
+ * Leaves that open an inline popup editor — everything except `location`, whose
+ * editor is the numbered map block below the sentence. A location pill is not
+ * disabled: clicking it scrolls to (and flashes) its linked Area block.
+ */
 function isEditableLeaf(leaf: MatchLeaf): boolean {
   return leaf.leaf !== "location";
 }
@@ -162,9 +175,11 @@ const ConditionPill: Component<{
   areaNumber?: number;
   onChange: (next: MatchLeaf) => void;
   onRemove: () => void;
+  onFocusArea?: () => void;
 }> = (props) => {
   const [open, setOpen] = createSignal(false);
   const editable = () => isEditableLeaf(props.leaf);
+  const isLocation = () => props.leaf.leaf === "location";
   const atRest = createMemo(() => leafSentence(props.leaf, props.lookup, props.areaNumber));
 
   return (
@@ -172,17 +187,24 @@ const ConditionPill: Component<{
       <span class="inline-flex items-center rounded-full border border-ui-border bg-white py-1 pl-3 pr-1 text-sm shadow-sm dark:bg-immich-dark-gray">
         <button
           type="button"
-          disabled={!editable()}
           aria-haspopup={editable() ? "true" : undefined}
           aria-expanded={editable() ? open() : undefined}
-          onClick={() => editable() && setOpen((o) => !o)}
+          onClick={() => {
+            if (editable()) setOpen((o) => !o);
+            else if (isLocation()) props.onFocusArea?.();
+          }}
           class="inline-flex items-center gap-1 font-medium text-immich-fg dark:text-immich-dark-fg"
-          classList={{ "cursor-pointer hover:text-immich-primary": editable() }}
+          classList={{ "cursor-pointer hover:text-immich-primary": editable() || isLocation() }}
         >
           <span>{atRest()}</span>
           <Show when={editable()}>
             <span aria-hidden="true" class="text-ui-muted">
               ▾
+            </span>
+          </Show>
+          <Show when={isLocation()}>
+            <span aria-hidden="true" class="text-ui-muted">
+              📍
             </span>
           </Show>
         </button>
@@ -397,11 +419,25 @@ const ConditionPill: Component<{
 const ClauseView: Component<{
   clause: Clause;
   lookup: PersonNameLookup;
+  areaBase: number;
   onModeChange: (mode: ClauseMode) => void;
   onPillChange: (index: number, next: MatchLeaf) => void;
   onPillRemove: (index: number) => void;
   onAdd: (kind: AddableLeafKind) => void;
+  onFocusArea: (areaNumber: number) => void;
 }> = (props) => {
+  // The "Area N" shown on a location pill = locations in earlier clauses
+  // (areaBase) + locations in this clause up to and including this pill.
+  const areaNumberAt = (localIndex: number): number | undefined => {
+    const pills = props.clause.pills;
+    if (pills[localIndex]?.leaf !== "location") return undefined;
+    let n = props.areaBase;
+    for (let k = 0; k <= localIndex; k++) {
+      if (pills[k]?.leaf === "location") n += 1;
+    }
+    return n;
+  };
+
   return (
     <div class="flex flex-wrap items-center gap-x-2 gap-y-2">
       <Show when={props.clause.pills.length >= 2}>
@@ -426,8 +462,13 @@ const ClauseView: Component<{
             <ConditionPill
               leaf={leaf()}
               lookup={props.lookup}
+              areaNumber={areaNumberAt(i)}
               onChange={(next) => props.onPillChange(i, next)}
               onRemove={() => props.onPillRemove(i)}
+              onFocusArea={() => {
+                const n = areaNumberAt(i);
+                if (n !== undefined) props.onFocusArea(n);
+              }}
             />
           </>
         )}
@@ -553,6 +594,48 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
     commit({ ...m, excepts });
   };
 
+  // --- Geo areas (L3) ------------------------------------------------------
+  // Numbering is derived from the model; the pills, the readout legend, and the
+  // map blocks all agree because each scans Location leaves in document order.
+  const areas = createMemo(() => {
+    const m = model();
+    return m ? locationAreas(m) : [];
+  });
+
+  const locationCount = (clause: Clause): number =>
+    clause.pills.reduce((n, p) => n + (p.leaf === "location" ? 1 : 0), 0);
+
+  // Locations in every clause before except[i] — the base offset for that
+  // clause's "Area N" numbering (the primary clause's locations come first).
+  const exceptAreaBase = (exceptIndex: number): number => {
+    const m = model();
+    if (!m) return 0;
+    let base = locationCount(m.primary);
+    for (let k = 0; k < exceptIndex; k++) base += locationCount(m.excepts[k]!);
+    return base;
+  };
+
+  const setAreaLocation = (ref: AreaRef, center: [number, number], radiusKm: number) => {
+    const leaf: MatchLeaf = { kind: "leaf", leaf: "location", center, radius_km: radiusKm };
+    if (ref.clause === "primary") changePrimaryPill(ref.pill, leaf);
+    else changeExceptPill(ref.except, ref.pill, leaf);
+  };
+
+  // Clicking a "taken in Area N" pill scrolls to and briefly flashes its map
+  // block, so the operator can tell which area the inline pill controls.
+  const areaEls: (HTMLDivElement | undefined)[] = [];
+  const [flashArea, setFlashArea] = createSignal<number | null>(null);
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  const focusArea = (areaNumber: number) => {
+    areaEls[areaNumber - 1]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    setFlashArea(areaNumber);
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => setFlashArea(null), 1500);
+  };
+  onCleanup(() => {
+    if (flashTimer) clearTimeout(flashTimer);
+  });
+
   return (
     <Show
       when={model()}
@@ -584,10 +667,12 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
             <ClauseView
               clause={m().primary}
               lookup={lookup}
+              areaBase={0}
               onModeChange={setPrimaryMode}
               onPillChange={changePrimaryPill}
               onPillRemove={removePrimaryPill}
               onAdd={addPrimaryPill}
+              onFocusArea={focusArea}
             />
           </div>
 
@@ -600,10 +685,12 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
                 <ClauseView
                   clause={clause()}
                   lookup={lookup}
+                  areaBase={exceptAreaBase(i)}
                   onModeChange={(mode) => setExceptMode(i, mode)}
                   onPillChange={(j, next) => changeExceptPill(i, j, next)}
                   onPillRemove={(j) => removeExceptPill(i, j)}
                   onAdd={(kind) => addExceptPill(i, kind)}
+                  onFocusArea={focusArea}
                 />
                 <button
                   type="button"
@@ -632,6 +719,39 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
           >
             {sentenceReadout(m(), lookup)}
           </p>
+
+          <Show when={areas().length > 0}>
+            <div class="space-y-3" data-testid="area-blocks">
+              <Index each={areas()}>
+                {(entry, i) => (
+                  <div
+                    ref={(el) => (areaEls[i] = el)}
+                    data-testid={`area-block-${i + 1}`}
+                    class="rounded-xl border border-ui-border bg-white p-3 shadow-sm transition dark:bg-immich-dark-gray"
+                    classList={{ "ring-2 ring-immich-primary": flashArea() === i + 1 }}
+                  >
+                    <div class="mb-2 flex items-center gap-2">
+                      <span class="inline-flex h-6 w-6 items-center justify-center rounded-full bg-immich-primary text-xs font-semibold text-white">
+                        {i + 1}
+                      </span>
+                      <span class="text-sm font-medium text-immich-fg dark:text-immich-dark-fg">
+                        Area {i + 1}
+                      </span>
+                    </div>
+                    <Suspense fallback={<p class="text-sm text-ui-muted">Loading map…</p>}>
+                      <MapPicker
+                        center={entry().leaf.center}
+                        radiusKm={entry().leaf.radius_km}
+                        onChange={(center, radiusKm) =>
+                          setAreaLocation(entry().ref, center, radiusKm)
+                        }
+                      />
+                    </Suspense>
+                  </div>
+                )}
+              </Index>
+            </div>
+          </Show>
         </div>
       )}
     </Show>

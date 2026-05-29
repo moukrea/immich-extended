@@ -48,16 +48,42 @@ export function emptySentence(): SentenceModel {
   return { fill: "include", primary: { mode: "all", pills: [] }, excepts: [] };
 }
 
-/** Every `Location` leaf in document order (primary clause, then each except). */
-export function locationPills(model: SentenceModel): LocationLeaf[] {
-  const out: LocationLeaf[] = [];
-  const scan = (clause: Clause) => {
-    for (const pill of clause.pills) {
-      if (pill.leaf === "location") out.push(pill);
+// --------------------------------------------------------------------------
+// Geo areas (L3) — a derived view. A `Location` leaf renders inline as "taken
+// in Area N", numbered by document order, and edited in a numbered `MapPicker`
+// block below the sentence. The number and the linked block are computed from
+// the model each render — there is no stored `areas` field.
+// --------------------------------------------------------------------------
+
+/** A stable handle to a `Location` pill so its map block can edit that leaf. */
+export type AreaRef =
+  | { clause: "primary"; pill: number }
+  | { clause: "except"; except: number; pill: number };
+
+export interface AreaEntry {
+  ref: AreaRef;
+  leaf: LocationLeaf;
+}
+
+/**
+ * Every `Location` leaf with its position, in document order: the primary
+ * clause first, then each except clause. The index in the returned array (+1)
+ * is the displayed "Area N" — so adding/removing a location renumbers the rest.
+ */
+export function locationAreas(model: SentenceModel): AreaEntry[] {
+  const out: AreaEntry[] = [];
+  model.primary.pills.forEach((pill, pillIndex) => {
+    if (pill.leaf === "location") {
+      out.push({ ref: { clause: "primary", pill: pillIndex }, leaf: pill });
     }
-  };
-  scan(model.primary);
-  for (const clause of model.excepts) scan(clause);
+  });
+  model.excepts.forEach((clause, exceptIndex) => {
+    clause.pills.forEach((pill, pillIndex) => {
+      if (pill.leaf === "location") {
+        out.push({ ref: { clause: "except", except: exceptIndex, pill: pillIndex }, leaf: pill });
+      }
+    });
+  });
   return out;
 }
 

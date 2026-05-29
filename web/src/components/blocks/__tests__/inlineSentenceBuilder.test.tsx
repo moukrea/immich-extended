@@ -31,6 +31,24 @@ vi.mock("../../PeopleContext", () => {
   return { usePeople, PeopleProvider: (p: { children: unknown }) => p.children };
 });
 
+// Stub the lazy MapPicker so the geo Area blocks mount without maplibre-gl; its
+// button fires onChange with a sentinel 123 km radius so a map edit is testable.
+vi.mock("../../MapPicker", () => ({
+  default: (props: {
+    center: [number, number];
+    radiusKm: number;
+    onChange: (center: [number, number], radiusKm: number) => void;
+  }) => (
+    <button
+      data-testid="mock-map"
+      data-radius={props.radiusKm}
+      onClick={() => props.onChange(props.center, 123)}
+    >
+      map {props.radiusKm}
+    </button>
+  ),
+}));
+
 import InlineSentenceBuilder from "../InlineSentenceBuilder";
 import { and, emptyMatch, not, type MatchExpr, type MatchLeaf } from "../../../lib/matchTree";
 import {
@@ -89,6 +107,14 @@ const count = (op: "eq" | "gte", value: number): MatchLeaf => ({
   leaf: "people_count",
   op,
   value,
+});
+
+// Default location center is Paris (defaults.ts DEFAULT_LOCATION_CENTER).
+const loc = (radiusKm: number): MatchLeaf => ({
+  kind: "leaf",
+  leaf: "location",
+  center: [48.8566, 2.3522],
+  radius_km: radiusKm,
 });
 
 describe("InlineSentenceBuilder", () => {
@@ -222,11 +248,54 @@ describe("InlineSentenceBuilder", () => {
     expect(getByRole("button", { name: "is a photo or video" })).toBeTruthy();
   });
 
-  it("location stays read-only until the map blocks (T50)", () => {
-    const { getByRole } = mountBuilder();
+  it("renders a location pill as 'taken in Area 1' with a numbered map block below", async () => {
+    const { getByRole, getByTestId, findByTestId } = mountBuilder();
     addLeaf(getByRole, "Location");
-    const pill = getByRole("button", { name: "taken in an area" }) as HTMLButtonElement;
-    expect(pill.disabled).toBe(true);
+
+    const pill = getByRole("button", { name: "taken in Area 1" }) as HTMLButtonElement;
+    expect(pill.disabled).toBe(false);
+    expect(getByTestId("area-block-1")).toBeTruthy();
+    expect(await findByTestId("mock-map")).toBeTruthy();
+    expect(getByTestId("sentence-readout").textContent).toBe(
+      "Include to album if taken in Area 1. Areas: 1 = within 60 km of (48.8566, 2.3522).",
+    );
+  });
+
+  it("numbers multiple areas, edits a radius via the map, and renumbers on removal", async () => {
+    const {
+      getByRole,
+      getAllByRole,
+      getByTestId,
+      getAllByTestId,
+      findAllByTestId,
+      queryByRole,
+      queryByTestId,
+      getCaptured,
+    } = mountBuilder();
+
+    addLeafToClause(getAllByRole, getByRole, 0, "Location");
+    addLeafToClause(getAllByRole, getByRole, 0, "Location");
+
+    expect(getByRole("button", { name: "taken in Area 1" })).toBeTruthy();
+    expect(getByRole("button", { name: "taken in Area 2" })).toBeTruthy();
+
+    const maps = await findAllByTestId("mock-map");
+    expect(maps).toHaveLength(2);
+
+    // Edit Area 2's radius (the mock sets 123 km); Area 1 keeps its default 60.
+    fireEvent.click(maps[1]!);
+    expect(getCaptured()).toEqual(and([loc(60), loc(123)]));
+
+    // Remove Area 1 → the survivor (123 km) renumbers to Area 1.
+    fireEvent.click(getByRole("button", { name: "Remove condition: taken in Area 1" }));
+    expect(getByRole("button", { name: "taken in Area 1" })).toBeTruthy();
+    expect(queryByRole("button", { name: "taken in Area 2" })).toBeNull();
+    expect(queryByTestId("area-block-2")).toBeNull();
+    expect(getCaptured()).toEqual(loc(123));
+    expect(getAllByTestId("mock-map")).toHaveLength(1);
+    expect(getByTestId("sentence-readout").textContent).toBe(
+      "Include to album if taken in Area 1. Areas: 1 = within 123 km of (48.8566, 2.3522).",
+    );
   });
 
   it("a single-condition primary serializes as a bare leaf (never And[leaf])", () => {
