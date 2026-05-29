@@ -43,6 +43,9 @@ import { normalizeTree } from "../../lib/treeOps";
 import { leafSentence, type PersonNameLookup } from "../../lib/phrases";
 import {
   locationAreas,
+  movePill,
+  movePillStep,
+  pillLocKey,
   sentenceReadout,
   sentenceToTree,
   treeToSentence,
@@ -50,6 +53,7 @@ import {
   type Clause,
   type ClauseMode,
   type Fill,
+  type PillLoc,
   type SentenceModel,
 } from "../../lib/sentenceModel";
 import { defaultLeaf, type AddableLeafKind } from "./defaults";
@@ -176,15 +180,76 @@ const ConditionPill: Component<{
   onChange: (next: MatchLeaf) => void;
   onRemove: () => void;
   onFocusArea?: () => void;
+  // Drag-and-drop (T51) — provided whenever the pill lives in a clause.
+  isDragSource?: boolean;
+  dragActive?: boolean;
+  hovered?: boolean;
+  onDragStart?: () => void;
+  onDragEnd?: () => void;
+  onDragEnter?: () => void;
+  onDrop?: () => void;
+  onMoveEarlier?: () => void;
+  onMoveLater?: () => void;
 }> = (props) => {
   const [open, setOpen] = createSignal(false);
+  // `draggable` is toggled on only while the grip is held, so dragging never
+  // starts from inside the inline editor popup (canonical handle-drag trick).
+  const [grabReady, setGrabReady] = createSignal(false);
+  const dnd = () => !!props.onDragStart;
   const editable = () => isEditableLeaf(props.leaf);
   const isLocation = () => props.leaf.leaf === "location";
   const atRest = createMemo(() => leafSentence(props.leaf, props.lookup, props.areaNumber));
 
   return (
-    <span class="relative inline-flex items-center" data-testid={`pill-${props.leaf.leaf}`}>
-      <span class="inline-flex items-center rounded-full border border-ui-border bg-white py-1 pl-3 pr-1 text-sm shadow-sm dark:bg-immich-dark-gray">
+    <span
+      class="group relative inline-flex items-center"
+      data-testid={`pill-${props.leaf.leaf}`}
+      draggable={dnd() && grabReady() ? true : undefined}
+      onDragStart={(e) => {
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+        props.onDragStart?.();
+      }}
+      onDragEnd={() => {
+        setGrabReady(false);
+        props.onDragEnd?.();
+      }}
+      onDragEnter={() => props.onDragEnter?.()}
+      onDragOver={(e) => {
+        if (props.dragActive) e.preventDefault();
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        props.onDrop?.();
+      }}
+      classList={{
+        "opacity-50": props.isDragSource,
+        "rounded-full ring-2 ring-immich-primary":
+          props.dragActive && props.hovered && !props.isDragSource,
+      }}
+    >
+      <span class="inline-flex items-center rounded-full border border-ui-border bg-white py-1 pl-1.5 pr-1 text-sm shadow-sm dark:bg-immich-dark-gray">
+        <Show when={dnd()}>
+          <button
+            type="button"
+            data-drag-handle
+            aria-label={`Reorder ${atRest()}; use arrow keys to move`}
+            title="Drag to reorder, or focus and use arrow keys"
+            onMouseDown={() => setGrabReady(true)}
+            onMouseUp={() => setGrabReady(false)}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                e.preventDefault();
+                props.onMoveEarlier?.();
+              } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                e.preventDefault();
+                props.onMoveLater?.();
+              }
+            }}
+            class="mr-1 cursor-grab select-none rounded px-1 text-ui-muted opacity-30 transition-opacity hover:bg-slate-100 group-hover:opacity-100 focus-visible:opacity-100 dark:hover:bg-gray-700"
+          >
+            ⠿
+          </button>
+        </Show>
         <button
           type="button"
           aria-haspopup={editable() ? "true" : undefined}
@@ -425,6 +490,16 @@ const ClauseView: Component<{
   onPillRemove: (index: number) => void;
   onAdd: (kind: AddableLeafKind) => void;
   onFocusArea: (areaNumber: number) => void;
+  // Drag-and-drop (T51).
+  locOf: (pillIndex: number) => PillLoc;
+  dragActive: boolean;
+  srcKey: string | null;
+  hoverKey: string | null;
+  onPillDragStart: (loc: PillLoc) => void;
+  onPillDragEnd: () => void;
+  onPillDragEnter: (loc: PillLoc) => void;
+  onPillDrop: (loc: PillLoc) => void;
+  onPillStep: (loc: PillLoc, dir: "earlier" | "later") => void;
 }> = (props) => {
   // The "Area N" shown on a location pill = locations in earlier clauses
   // (areaBase) + locations in this clause up to and including this pill.
@@ -437,6 +512,9 @@ const ClauseView: Component<{
     }
     return n;
   };
+
+  // The "+ condition" affordance doubles as the drop zone for the clause end.
+  const endLoc = (): PillLoc => props.locOf(props.clause.pills.length);
 
   return (
     <div class="flex flex-wrap items-center gap-x-2 gap-y-2">
@@ -452,34 +530,62 @@ const ClauseView: Component<{
         />
       </Show>
       <Index each={props.clause.pills}>
-        {(leaf, i) => (
-          <>
-            <Show when={i > 0}>
-              <span class="text-sm font-semibold text-immich-primary">
-                {props.clause.mode === "all" ? "and" : "or"}
-              </span>
-            </Show>
-            <ConditionPill
-              leaf={leaf()}
-              lookup={props.lookup}
-              areaNumber={areaNumberAt(i)}
-              onChange={(next) => props.onPillChange(i, next)}
-              onRemove={() => props.onPillRemove(i)}
-              onFocusArea={() => {
-                const n = areaNumberAt(i);
-                if (n !== undefined) props.onFocusArea(n);
-              }}
-            />
-          </>
-        )}
+        {(leaf, i) => {
+          const loc = (): PillLoc => props.locOf(i);
+          const key = (): string => pillLocKey(loc());
+          return (
+            <>
+              <Show when={i > 0}>
+                <span class="text-sm font-semibold text-immich-primary">
+                  {props.clause.mode === "all" ? "and" : "or"}
+                </span>
+              </Show>
+              <ConditionPill
+                leaf={leaf()}
+                lookup={props.lookup}
+                areaNumber={areaNumberAt(i)}
+                onChange={(next) => props.onPillChange(i, next)}
+                onRemove={() => props.onPillRemove(i)}
+                onFocusArea={() => {
+                  const n = areaNumberAt(i);
+                  if (n !== undefined) props.onFocusArea(n);
+                }}
+                isDragSource={props.srcKey === key()}
+                dragActive={props.dragActive}
+                hovered={props.hoverKey === key()}
+                onDragStart={() => props.onPillDragStart(loc())}
+                onDragEnd={props.onPillDragEnd}
+                onDragEnter={() => props.onPillDragEnter(loc())}
+                onDrop={() => props.onPillDrop(loc())}
+                onMoveEarlier={() => props.onPillStep(loc(), "earlier")}
+                onMoveLater={() => props.onPillStep(loc(), "later")}
+              />
+            </>
+          );
+        }}
       </Index>
-      <AddBlockDropdown
-        label="+ condition"
-        groupKinds={[]}
-        triggerClass="inline-flex items-center gap-1 rounded-full border border-dashed border-ui-border px-2.5 py-1 text-sm text-ui-muted hover:border-immich-primary hover:text-immich-primary"
-        onAddLeaf={(kind) => props.onAdd(kind)}
-        onAddGroup={() => {}}
-      />
+      <span
+        classList={{
+          "rounded-full ring-2 ring-immich-primary":
+            props.dragActive && props.hoverKey === pillLocKey(endLoc()),
+        }}
+        onDragEnter={() => props.onPillDragEnter(endLoc())}
+        onDragOver={(e) => {
+          if (props.dragActive) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          props.onPillDrop(endLoc());
+        }}
+      >
+        <AddBlockDropdown
+          label="+ condition"
+          groupKinds={[]}
+          triggerClass="inline-flex items-center gap-1 rounded-full border border-dashed border-ui-border px-2.5 py-1 text-sm text-ui-muted hover:border-immich-primary hover:text-immich-primary"
+          onAddLeaf={(kind) => props.onAdd(kind)}
+          onAddGroup={() => {}}
+        />
+      </span>
     </div>
   );
 };
@@ -636,6 +742,36 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
     if (flashTimer) clearTimeout(flashTimer);
   });
 
+  // --- Drag-and-drop (L?/T51) ----------------------------------------------
+  // The dragged pill's source location and the hovered drop target (a single
+  // key, so only one target highlights at a time and it follows the cursor with
+  // no dragleave flicker — set on dragenter, cleared only at drag end / drop).
+  const [dragSrc, setDragSrc] = createSignal<PillLoc | null>(null);
+  const [hoverKey, setHoverKey] = createSignal<string | null>(null);
+  const endDrag = () => {
+    setDragSrc(null);
+    setHoverKey(null);
+  };
+  const onPillDragEnter = (loc: PillLoc) => {
+    if (dragSrc()) setHoverKey(pillLocKey(loc));
+  };
+  const onPillDrop = (to: PillLoc) => {
+    const from = dragSrc();
+    const m = model();
+    if (from && m && pillLocKey(from) !== pillLocKey(to)) {
+      commit(movePill(m, from, to));
+    }
+    endDrag();
+  };
+  const onPillStep = (loc: PillLoc, dir: "earlier" | "later") => {
+    const m = model();
+    if (m) commit(movePillStep(m, loc, dir));
+  };
+  const srcKey = (): string | null => {
+    const s = dragSrc();
+    return s ? pillLocKey(s) : null;
+  };
+
   return (
     <Show
       when={model()}
@@ -673,6 +809,15 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
               onPillRemove={removePrimaryPill}
               onAdd={addPrimaryPill}
               onFocusArea={focusArea}
+              locOf={(pill) => ({ clause: "primary", pill })}
+              dragActive={dragSrc() !== null}
+              srcKey={srcKey()}
+              hoverKey={hoverKey()}
+              onPillDragStart={(loc) => setDragSrc(loc)}
+              onPillDragEnd={endDrag}
+              onPillDragEnter={onPillDragEnter}
+              onPillDrop={onPillDrop}
+              onPillStep={onPillStep}
             />
           </div>
 
@@ -691,6 +836,15 @@ const InlineSentenceBuilder: Component<Props> = (props) => {
                   onPillRemove={(j) => removeExceptPill(i, j)}
                   onAdd={(kind) => addExceptPill(i, kind)}
                   onFocusArea={focusArea}
+                  locOf={(pill) => ({ clause: "except", except: i, pill })}
+                  dragActive={dragSrc() !== null}
+                  srcKey={srcKey()}
+                  hoverKey={hoverKey()}
+                  onPillDragStart={(loc) => setDragSrc(loc)}
+                  onPillDragEnd={endDrag}
+                  onPillDragEnter={onPillDragEnter}
+                  onPillDrop={onPillDrop}
+                  onPillStep={onPillStep}
                 />
                 <button
                   type="button"

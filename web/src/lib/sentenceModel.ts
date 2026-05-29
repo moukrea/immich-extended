@@ -88,6 +88,110 @@ export function locationAreas(model: SentenceModel): AreaEntry[] {
 }
 
 // --------------------------------------------------------------------------
+// Drag-and-drop (T51) — pure clause-array moves. The SentenceModel is the
+// source of truth (design §8), so reordering operates on the clause `pills`
+// arrays DIRECTLY rather than the path-addressed tree `treeOps`.
+//
+// A pill's location reuses `AreaRef`'s primary/except discriminator: a clause
+// locator plus a pill index. Within-clause reorder is cosmetic (AND/OR commute)
+// but preserves the operator's reading order; a cross-clause move CHANGES
+// semantics (a pill moving primary→except is now negated) which the readout +
+// serialized tree reflect immediately.
+// --------------------------------------------------------------------------
+
+/** Where a pill lives in the sentence — same shape as a geo `AreaRef`. */
+export type PillLoc = AreaRef;
+
+/** Stable string identity for a pill location (drag source / hover target). */
+export function pillLocKey(loc: PillLoc): string {
+  return loc.clause === "primary" ? `primary:${loc.pill}` : `except:${loc.except}:${loc.pill}`;
+}
+
+function sameClauseLoc(a: PillLoc, b: PillLoc): boolean {
+  if (a.clause === "primary") return b.clause === "primary";
+  return b.clause === "except" && a.except === b.except;
+}
+
+/**
+ * Move the pill at `from` to the insertion gap `to.pill` of `to`'s clause.
+ * `to.pill` is the gap before that index (so `pills.length` appends). Returns a
+ * new model; an out-of-range `from` is a no-op. Never mutates the input.
+ */
+export function movePill(model: SentenceModel, from: PillLoc, to: PillLoc): SentenceModel {
+  const primary: Clause = { ...model.primary, pills: model.primary.pills.slice() };
+  const excepts: Clause[] = model.excepts.map((c) => ({ ...c, pills: c.pills.slice() }));
+  const pillsOf = (loc: PillLoc): MatchLeaf[] =>
+    loc.clause === "primary" ? primary.pills : excepts[loc.except]!.pills;
+
+  const src = pillsOf(from);
+  const moving = src[from.pill];
+  if (moving === undefined) return model;
+  src.splice(from.pill, 1);
+
+  // Within the same clause, removing an earlier pill shifts the target gap down.
+  let insertAt = to.pill;
+  if (sameClauseLoc(from, to) && from.pill < to.pill) insertAt -= 1;
+  const dst = pillsOf(to);
+  insertAt = Math.max(0, Math.min(insertAt, dst.length));
+  dst.splice(insertAt, 0, moving);
+
+  return { ...model, primary, excepts };
+}
+
+type ClauseId = { clause: "primary" } | { clause: "except"; except: number };
+
+function nextClauseId(model: SentenceModel, loc: PillLoc): ClauseId | null {
+  if (loc.clause === "primary") {
+    return model.excepts.length > 0 ? { clause: "except", except: 0 } : null;
+  }
+  return loc.except + 1 < model.excepts.length
+    ? { clause: "except", except: loc.except + 1 }
+    : null;
+}
+
+function prevClauseId(loc: PillLoc): ClauseId | null {
+  if (loc.clause === "primary") return null;
+  return loc.except === 0 ? { clause: "primary" } : { clause: "except", except: loc.except - 1 };
+}
+
+function clauseGap(c: ClauseId, gap: number): PillLoc {
+  return c.clause === "primary"
+    ? { clause: "primary", pill: gap }
+    : { clause: "except", except: c.except, pill: gap };
+}
+
+function clauseLen(model: SentenceModel, c: ClauseId): number {
+  return c.clause === "primary" ? model.primary.pills.length : model.excepts[c.except]!.pills.length;
+}
+
+/**
+ * Keyboard move (a11y fallback): nudge a pill one step `earlier`/`later` in the
+ * document-order pill sequence. Steps cross clause boundaries — moving past the
+ * end of a clause lands at the head of the next clause (and vice-versa) — so the
+ * grip's arrow keys cover both "move within" and "move to clause".
+ */
+export function movePillStep(
+  model: SentenceModel,
+  loc: PillLoc,
+  dir: "earlier" | "later",
+): SentenceModel {
+  const here = loc.clause === "primary" ? model.primary.pills : model.excepts[loc.except]!.pills;
+  const at = (gap: number): PillLoc =>
+    loc.clause === "primary"
+      ? { clause: "primary", pill: gap }
+      : { clause: "except", except: loc.except, pill: gap };
+
+  if (dir === "later") {
+    if (loc.pill < here.length - 1) return movePill(model, loc, at(loc.pill + 2));
+    const next = nextClauseId(model, loc);
+    return next ? movePill(model, loc, clauseGap(next, 0)) : model;
+  }
+  if (loc.pill > 0) return movePill(model, loc, at(loc.pill - 1));
+  const prev = prevClauseId(loc);
+  return prev ? movePill(model, loc, clauseGap(prev, clauseLen(model, prev))) : model;
+}
+
+// --------------------------------------------------------------------------
 // sentence → tree (§6.1).
 // --------------------------------------------------------------------------
 

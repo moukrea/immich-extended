@@ -405,4 +405,60 @@ describe("InlineSentenceBuilder", () => {
     expect(queryByRole("button", { name: "Remove except clause 1" })).toBeNull();
     expect(getCaptured()).toEqual(count("gte", 1));
   });
+
+  it("drag-and-drop reorders pills within a clause (cosmetic, round-trips)", () => {
+    const { getAllByTestId, getByTestId, getCaptured } = mountBuilder(
+      and([person("must_include", "paloma"), person("must_include", "emeric")]),
+    );
+    const pills = getAllByTestId("pill-person"); // [Paloma, Emeric]
+    // Drag the 2nd pill (Emeric) and drop it on the 1st (insert before Paloma).
+    fireEvent.dragStart(pills[1]!);
+    fireEvent.drop(pills[0]!);
+
+    expect(getCaptured()).toEqual(
+      and([person("must_include", "emeric"), person("must_include", "paloma")]),
+    );
+    expect(getByTestId("sentence-readout").textContent).toBe(
+      "Include to album if Emeric is present and Paloma is present.",
+    );
+  });
+
+  it("dragging a primary pill onto an except clause negates it (cross-clause)", () => {
+    const { getAllByTestId, getAllByRole, getByTestId, getCaptured } = mountBuilder(
+      and([
+        person("must_include", "paloma"),
+        person("must_include", "emeric"),
+        not(count("gte", 1)),
+      ]),
+    );
+    // Loader → primary {all: [Paloma, Emeric]}, except {all: [count ≥ 1]}.
+    const personPills = getAllByTestId("pill-person"); // [Paloma, Emeric]
+    const addButtons = getAllByRole("button", { name: /\+ condition/ }); // [primary, except]
+    // Drag Emeric out of the primary AND-list, dropping on the except's end zone.
+    fireEvent.dragStart(personPills[1]!);
+    fireEvent.drop(addButtons[1]!);
+
+    expect(getCaptured()).toEqual(
+      and([
+        person("must_include", "paloma"),
+        not(and([count("gte", 1), person("must_include", "emeric")])),
+      ]),
+    );
+    expect(getByTestId("sentence-readout").textContent).toBe(
+      "Include to album if Paloma is present. Except if people count ≥ 1 and Emeric is present.",
+    );
+  });
+
+  it("keyboard arrows on the grip reorder a pill within its clause (a11y)", () => {
+    const { getAllByLabelText, getCaptured } = mountBuilder(
+      and([person("must_include", "paloma"), person("must_include", "emeric")]),
+    );
+    const grips = getAllByLabelText(/^Reorder /); // [Paloma grip, Emeric grip]
+    // ArrowRight nudges Paloma one step later → [Emeric, Paloma].
+    fireEvent.keyDown(grips[0]!, { key: "ArrowRight" });
+
+    expect(getCaptured()).toEqual(
+      and([person("must_include", "emeric"), person("must_include", "paloma")]),
+    );
+  });
 });

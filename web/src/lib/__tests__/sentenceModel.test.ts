@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { and, isEmpty, not, or, type MatchLeaf } from "../matchTree";
 import {
   emptySentence,
+  movePill,
+  movePillStep,
   sentenceReadout,
   sentenceToTree,
   treeToSentence,
@@ -208,6 +210,125 @@ describe("round-trip treeToSentence(sentenceToTree(m)) ≅ m", () => {
 
   it.each(canonical.map((m, i) => [i, m] as const))("shape %i", (_i, m) => {
     expect(treeToSentence(sentenceToTree(m))).toEqual(m);
+  });
+});
+
+describe("movePill (drag-and-drop, T51)", () => {
+  const A = person("must_include", "a");
+  const B = person("must_include", "b");
+  const C = person("must_include", "c");
+
+  it("reorders within a clause and round-trips through the tree", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B, C] },
+      excepts: [],
+    };
+    const moved = movePill(m, { clause: "primary", pill: 2 }, { clause: "primary", pill: 0 });
+    expect(moved.primary.pills).toEqual([C, A, B]);
+    // Order changes but AND/OR commute, so the model still round-trips.
+    expect(treeToSentence(sentenceToTree(moved))).toEqual(moved);
+  });
+
+  it("does not mutate the input model", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B] },
+      excepts: [],
+    };
+    movePill(m, { clause: "primary", pill: 1 }, { clause: "primary", pill: 0 });
+    expect(m.primary.pills).toEqual([A, B]);
+  });
+
+  it("dropping a pill onto its own gap is a no-op", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B, C] },
+      excepts: [],
+    };
+    expect(
+      movePill(m, { clause: "primary", pill: 1 }, { clause: "primary", pill: 1 }).primary.pills,
+    ).toEqual([A, B, C]);
+  });
+
+  it("moves a primary pill into an except clause, negating it in the tree", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B] },
+      excepts: [{ mode: "all", pills: [] }],
+    };
+    const moved = movePill(m, { clause: "primary", pill: 1 }, { clause: "except", except: 0, pill: 0 });
+    expect(moved.primary.pills).toEqual([A]);
+    expect(moved.excepts[0]!.pills).toEqual([B]);
+    // B left the primary AND-list and now sits under the except's Not(...).
+    expect(sentenceToTree(moved)).toEqual(and([A, not(B)]));
+  });
+
+  it("appends to a clause when the target gap is the clause length", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B] },
+      excepts: [{ mode: "all", pills: [C] }],
+    };
+    const moved = movePill(m, { clause: "primary", pill: 0 }, { clause: "except", except: 0, pill: 1 });
+    expect(moved.primary.pills).toEqual([B]);
+    expect(moved.excepts[0]!.pills).toEqual([C, A]);
+  });
+});
+
+describe("movePillStep (keyboard, T51)", () => {
+  const A = person("must_include", "a");
+  const B = person("must_include", "b");
+  const C = person("must_include", "c");
+
+  it("nudges later within a clause", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B, C] },
+      excepts: [],
+    };
+    expect(movePillStep(m, { clause: "primary", pill: 0 }, "later").primary.pills).toEqual([B, A, C]);
+  });
+
+  it("nudges earlier within a clause", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B, C] },
+      excepts: [],
+    };
+    expect(movePillStep(m, { clause: "primary", pill: 2 }, "earlier").primary.pills).toEqual([A, C, B]);
+  });
+
+  it("steps the last primary pill into the head of the next except clause", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B] },
+      excepts: [{ mode: "all", pills: [C] }],
+    };
+    const moved = movePillStep(m, { clause: "primary", pill: 1 }, "later");
+    expect(moved.primary.pills).toEqual([A]);
+    expect(moved.excepts[0]!.pills).toEqual([B, C]);
+  });
+
+  it("steps the first except pill back to the tail of the primary clause", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A] },
+      excepts: [{ mode: "all", pills: [B, C] }],
+    };
+    const moved = movePillStep(m, { clause: "except", except: 0, pill: 0 }, "earlier");
+    expect(moved.primary.pills).toEqual([A, B]);
+    expect(moved.excepts[0]!.pills).toEqual([C]);
+  });
+
+  it("is a no-op at the very start and very end of the sentence", () => {
+    const m: SentenceModel = {
+      fill: "include",
+      primary: { mode: "all", pills: [A, B] },
+      excepts: [],
+    };
+    expect(movePillStep(m, { clause: "primary", pill: 0 }, "earlier")).toEqual(m);
+    expect(movePillStep(m, { clause: "primary", pill: 1 }, "later")).toEqual(m);
   });
 });
 
